@@ -31,6 +31,15 @@ def send_message(chat_id, text, reply_markup=None):
         data["reply_markup"] = reply_markup
 
     return telegram("sendMessage", data)
+    def copy_channel_message(chat_id, message_id):
+    return telegram(
+        "copyMessage",
+        {
+            "chat_id": chat_id,
+            "from_chat_id": CHANNEL_USERNAME,
+            "message_id": message_id
+        }
+    )
 
 
 def answer_callback(callback_id, text=""):
@@ -41,7 +50,27 @@ def answer_callback(callback_id, text=""):
             "text": text
         }
     )
+if data in MOOD_GENRES:
 
+    answer_callback(
+        callback_id,
+        "🎧 Finding your music..."
+    )
+
+    # TEST SONG
+    result = copy_channel_message(
+        chat_id,
+        2065
+    )
+
+    print("COPY RESULT:", result)
+
+    if not result.get("ok"):
+        send_message(
+            chat_id,
+            "❌ ဒီသီချင်းကို ပြန်ပို့လို့မရသေးပါ။\n\n"
+            f"Telegram error: {result.get('description')}"
+)
 
 def mood_menu():
     return {
