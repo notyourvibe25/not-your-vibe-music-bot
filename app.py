@@ -4,10 +4,11 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.environ.get("8529418251AAEKmfORfiQo5Ia9G8uTTZehm7kgpoarung")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
-TELEGRAM_API = f"https://api.telegram.org/bot{8529418251AAEKmfORfiQo5Ia9G8uTTZehm7kgpoarung}
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 
 def send_message(chat_id, text, reply_markup=None):
     data = {
