@@ -1,4 +1,5 @@
 import os
+import random
 import requests
 from flask import Flask, request
 
@@ -9,16 +10,15 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-CHANNEL = "@notyourvibemp3collection"
+CHANNEL_USERNAME = "@notyourvibemp3collection"
 
 
 def telegram(method, data):
-    response = requests.post(
+    return requests.post(
         f"{TELEGRAM_API}/{method}",
         json=data,
         timeout=20
-    )
-    return response.json()
+    ).json()
 
 
 def send_message(chat_id, text, reply_markup=None):
@@ -47,23 +47,95 @@ def mood_menu():
     return {
         "inline_keyboard": [
             [
-                {"text": "😢 Sad", "callback_data": "mood_sad"},
-                {"text": "❤️ Love", "callback_data": "mood_love"}
+                {"text": "😢 Sad", "callback_data": "sad"},
+                {"text": "❤️ Love", "callback_data": "love"}
             ],
             [
-                {"text": "🌙 Chill", "callback_data": "mood_chill"},
-                {"text": "🔥 Hype", "callback_data": "mood_hype"}
+                {"text": "🌙 Chill", "callback_data": "chill"},
+                {"text": "🔥 Hype", "callback_data": "hype"}
             ],
             [
-                {"text": "🖤 Dark", "callback_data": "mood_dark"},
-                {"text": "⚡ Energetic", "callback_data": "mood_energetic"}
+                {"text": "🖤 Dark", "callback_data": "dark"},
+                {"text": "⚡ Energetic", "callback_data": "energetic"}
             ],
             [
-                {"text": "🚗 Night Drive", "callback_data": "mood_night"},
-                {"text": "🌌 Melodic", "callback_data": "mood_melodic"}
+                {"text": "🚗 Night Drive", "callback_data": "night"},
+                {"text": "🌌 Melodic", "callback_data": "melodic"}
             ]
         ]
     }
+
+
+# Genre groups
+MOOD_GENRES = {
+
+    "sad": [
+        "Melodic Dubstep",
+        "Future Bass",
+        "Emotional",
+        "Melodic Bass",
+        "Future Garage"
+    ],
+
+    "love": [
+        "Future Bass",
+        "Melodic House",
+        "Future Pop",
+        "Chill",
+        "Deep House"
+    ],
+
+    "chill": [
+        "Future Garage",
+        "Chill",
+        "Lo-Fi",
+        "Ambient",
+        "Downtempo",
+        "Melodic"
+    ],
+
+    "hype": [
+        "Festival Trap",
+        "Trap",
+        "Hardtrap",
+        "Future Riddim",
+        "Dubstep",
+        "Bass House"
+    ],
+
+    "dark": [
+        "Dark Trap",
+        "Hardtrap",
+        "Terror Bass",
+        "Dark Bass",
+        "Dubstep"
+    ],
+
+    "energetic": [
+        "Future Riddim",
+        "Hardtrap",
+        "Festival Trap",
+        "Dubstep",
+        "Bass House",
+        "EDM"
+    ],
+
+    "night": [
+        "Future Garage",
+        "Melodic House",
+        "Deep House",
+        "Chill",
+        "Synthwave"
+    ],
+
+    "melodic": [
+        "Melodic Dubstep",
+        "Melodic Future Bass",
+        "Future Bass",
+        "Melodic House",
+        "Future Garage"
+    ]
+}
 
 
 @app.route("/", methods=["GET"])
@@ -85,7 +157,7 @@ def webhook():
         return "OK"
 
     # =========================
-    # NORMAL MESSAGE
+    # MESSAGE
     # =========================
 
     message = update.get("message")
@@ -124,7 +196,7 @@ def webhook():
             )
 
     # =========================
-    # MOOD BUTTON
+    # BUTTON
     # =========================
 
     callback = update.get("callback_query")
@@ -133,33 +205,28 @@ def webhook():
 
         callback_id = callback["id"]
         chat_id = callback["message"]["chat"]["id"]
-        data = callback.get("data", "")
+        mood = callback.get("data")
 
-        moods = {
-            "mood_sad": "😢 SAD",
-            "mood_love": "❤️ LOVE",
-            "mood_chill": "🌙 CHILL",
-            "mood_hype": "🔥 HYPE",
-            "mood_dark": "🖤 DARK",
-            "mood_energetic": "⚡ ENERGETIC",
-            "mood_night": "🚗 NIGHT DRIVE",
-            "mood_melodic": "🌌 MELODIC"
-        }
-
-        if data in moods:
-
-            mood_name = moods[data]
+        if mood in MOOD_GENRES:
 
             answer_callback(
                 callback_id,
-                f"{mood_name} selected!"
+                "Searching..."
+            )
+
+            genres = MOOD_GENRES[mood]
+
+            genre_text = "\n".join(
+                f"• {genre}" for genre in genres
             )
 
             send_message(
                 chat_id,
-                f"🎧 {mood_name}\n\n"
-                "Searching for music...\n\n"
-                "⏳ Music database ကို ချိတ်နေပါတယ်..."
+                f"🎧 MOOD: {mood.upper()}\n\n"
+                f"🔎 Searching these music styles:\n\n"
+                f"{genre_text}\n\n"
+                f"📡 Channel: {CHANNEL_USERNAME}\n\n"
+                f"⏳ Music database is being connected..."
             )
 
     return "OK"
@@ -191,4 +258,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=port
-                )
+        )
