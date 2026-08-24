@@ -27,7 +27,7 @@ CHANNEL_USERNAME = "@notyourvibemp3collection"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-DB_FILE = "music.db"
+DB_FILE = "music_catalog.db"
 
 
 # =========================================================
@@ -44,14 +44,11 @@ if OPENAI_API_KEY:
             api_key=OPENAI_API_KEY
         )
 
-        print("OpenAI: CONNECTED")
+        print("OPENAI: CONNECTED")
 
     except Exception as e:
 
-        print(
-            "OpenAI init error:",
-            e
-        )
+        print("OPENAI ERROR:", e)
 
 
 # =========================================================
@@ -59,7 +56,6 @@ if OPENAI_API_KEY:
 # =========================================================
 
 MOODS = [
-
     "sad",
     "love",
     "chill",
@@ -68,7 +64,6 @@ MOODS = [
     "energetic",
     "night",
     "melodic"
-
 ]
 
 
@@ -94,135 +89,33 @@ MOOD_NAMES = {
 
 
 # =========================================================
-# YOUR CHANNEL MUSIC IDS
+# YOUR EXISTING CHANNEL MESSAGE IDS
 # =========================================================
 
 MUSIC_IDS = [
 
-    2045,
-    1995,
-    1834,
-    2075,
-    2105,
-    2125,
-    2115,
-    1864,
-    1874,
-    1844,
-    2095,
-    1905,
-    1975,
-    1925,
-    1935,
-    1945,
-    1965,
-    2035,
-    1985,
-    2005,
-    1955,
-    2025,
-    1915,
-    2015,
-    2055,
-    1895,
-    1885,
-    2065,
+    2045, 1995, 1834, 2075, 2105, 2125, 2115,
+    1864, 1874, 1844, 2095, 1905, 1975, 1925,
+    1935, 1945, 1965, 2035, 1985, 2005, 1955,
+    2025, 1915, 2015, 2055, 1895, 1885, 2065,
 
-    1824,
-    1814,
-    1802,
-    1782,
-    1772,
-    1762,
-    1752,
-    1739,
-    1729,
-    1711,
-    1701,
-    1692,
-    1643,
-    1632,
-    1622,
-    1612,
-    1603,
-    1594,
-    1585,
-    1560,
-    1570,
-    1549,
-    1544,
-    1539,
-    1534,
-    1529,
-    1524,
-    1514,
-    1503,
-    1495,
-    1485,
-    1476,
-    1457,
-    1452,
-    1441,
-    1391,
-    1379,
-    1369,
-    1359,
-    1348,
-    1336,
-    1326,
-    1306,
-    1291,
-    1281,
-    1276,
-    1266,
-    1262,
-    1252,
-    1251,
-    1241,
-    1237,
-    1231,
-    1221,
-    1217,
-    1207,
-    1205,
-    1202,
-    1192,
-    1183,
-    1173,
-    1165,
-    1155,
-    1150,
-    1140,
-    1130,
-    1119,
-    1117,
-    1093,
-    1017,
-    985,
-    943,
-    948,
-    892,
-    855,
-    826,
-    784,
-    794,
-    762,
-    696,
-    685,
-    675,
-    661,
-    650,
-    643
-
+    1824, 1814, 1802, 1782, 1772, 1762, 1752,
+    1739, 1729, 1711, 1701, 1692, 1643, 1632,
+    1622, 1612, 1603, 1594, 1585, 1560, 1570,
+    1549, 1544, 1539, 1534, 1529, 1524, 1514,
+    1503, 1495, 1485, 1476, 1457, 1452, 1441,
+    1391, 1379, 1369, 1359, 1348, 1336, 1326,
+    1306, 1291, 1281, 1276, 1266, 1262, 1252,
+    1251, 1241, 1237, 1231, 1221, 1217, 1207,
+    1205, 1202, 1192, 1183, 1173, 1165, 1155,
+    1150, 1140, 1130, 1119, 1117, 1093, 1017,
+    985, 943, 948, 892, 855, 826, 784, 794, 762,
+    696, 685, 675, 661, 650, 643
 ]
 
 
-# Remove duplicates
-
 MUSIC_IDS = list(
-    dict.fromkeys(
-        MUSIC_IDS
-    )
+    dict.fromkeys(MUSIC_IDS)
 )
 
 
@@ -230,7 +123,7 @@ MUSIC_IDS = list(
 # DATABASE
 # =========================================================
 
-def get_db():
+def db():
 
     return sqlite3.connect(
         DB_FILE,
@@ -238,217 +131,71 @@ def get_db():
     )
 
 
-def init_database():
+def init_db():
 
-    db = get_db()
+    connection = db()
 
-    cursor = db.cursor()
+    cursor = connection.cursor()
 
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS songs (
 
             message_id INTEGER PRIMARY KEY,
 
+            title TEXT DEFAULT '',
+
             caption TEXT DEFAULT '',
 
-            moods TEXT DEFAULT '[]',
-
-            submoods TEXT DEFAULT '[]',
+            performer TEXT DEFAULT '',
 
             genre TEXT DEFAULT '',
+
+            moods TEXT DEFAULT '[]',
 
             analyzed INTEGER DEFAULT 0
 
         )
-        """
-    )
+    """)
 
-    db.commit()
+    connection.commit()
 
-    db.close()
+    connection.close()
 
 
-init_database()
+init_db()
 
 
 # =========================================================
-# ADD OLD SONG IDS TO DATABASE
+# ADD OLD IDS TO DATABASE
 # =========================================================
 
-def ensure_old_ids():
+def register_old_songs():
 
-    db = get_db()
+    connection = db()
 
-    cursor = db.cursor()
+    cursor = connection.cursor()
 
     for message_id in MUSIC_IDS:
 
         cursor.execute(
-
             """
             INSERT OR IGNORE INTO songs
             (
-                message_id,
-                caption,
-                moods,
-                submoods,
-                genre,
-                analyzed
+                message_id
             )
-            VALUES (?, '', '[]', '[]', '', 0)
+            VALUES (?)
             """,
-
             (
                 message_id,
             )
-
         )
 
-    db.commit()
+    connection.commit()
 
-    db.close()
-
-
-ensure_old_ids()
+    connection.close()
 
 
-# =========================================================
-# SAVE SONG
-# =========================================================
-
-def save_song(
-    message_id,
-    caption,
-    moods,
-    submoods,
-    genre
-):
-
-    db = get_db()
-
-    cursor = db.cursor()
-
-    cursor.execute(
-
-        """
-        INSERT OR REPLACE INTO songs
-        (
-            message_id,
-            caption,
-            moods,
-            submoods,
-            genre,
-            analyzed
-        )
-        VALUES (?, ?, ?, ?, ?, 1)
-        """,
-
-        (
-            message_id,
-
-            caption,
-
-            json.dumps(
-                moods,
-                ensure_ascii=False
-            ),
-
-            json.dumps(
-                submoods,
-                ensure_ascii=False
-            ),
-
-            genre
-
-        )
-
-    )
-
-    db.commit()
-
-    db.close()
-
-
-# =========================================================
-# GET ALL SONGS
-# =========================================================
-
-def get_songs():
-
-    db = get_db()
-
-    cursor = db.cursor()
-
-    cursor.execute(
-
-        """
-        SELECT
-            message_id,
-            caption,
-            moods,
-            submoods,
-            genre,
-            analyzed
-        FROM songs
-        """
-
-    )
-
-    rows = cursor.fetchall()
-
-    db.close()
-
-
-    songs = []
-
-
-    for row in rows:
-
-        try:
-
-            moods = json.loads(
-                row[2]
-            )
-
-        except:
-
-            moods = []
-
-
-        try:
-
-            submoods = json.loads(
-                row[3]
-            )
-
-        except:
-
-            submoods = []
-
-
-        songs.append(
-
-            {
-
-                "id": row[0],
-
-                "caption": row[1] or "",
-
-                "moods": moods,
-
-                "submoods": submoods,
-
-                "genre": row[4] or "",
-
-                "analyzed": row[5]
-
-            }
-
-        )
-
-
-    return songs
+register_old_songs()
 
 
 # =========================================================
@@ -475,27 +222,22 @@ def telegram(
         result = response.json()
 
         print(
-            "Telegram:",
             method,
             result
         )
 
         return result
 
-
     except Exception as e:
 
         print(
-            "Telegram error:",
+            "Telegram ERROR:",
             e
         )
 
         return {
-
             "ok": False,
-
             "description": str(e)
-
         }
 
 
@@ -517,25 +259,18 @@ def send_message(
 
     }
 
-
     if reply_markup:
 
-        data[
-            "reply_markup"
-        ] = reply_markup
-
+        data["reply_markup"] = reply_markup
 
     return telegram(
-
         "sendMessage",
-
         data
-
     )
 
 
 # =========================================================
-# ANSWER CALLBACK
+# CALLBACK ANSWER
 # =========================================================
 
 def answer_callback(
@@ -548,20 +283,15 @@ def answer_callback(
         "answerCallbackQuery",
 
         {
-
-            "callback_query_id":
-                callback_id,
-
-            "text":
-                text
-
+            "callback_query_id": callback_id,
+            "text": text
         }
 
     )
 
 
 # =========================================================
-# COPY CHANNEL MUSIC
+# COPY MUSIC FROM YOUR CHANNEL
 # =========================================================
 
 def copy_music(
@@ -574,16 +304,13 @@ def copy_music(
         "copyMessage",
 
         {
-
-            "chat_id":
-                chat_id,
+            "chat_id": chat_id,
 
             "from_chat_id":
                 CHANNEL_USERNAME,
 
             "message_id":
                 message_id
-
         }
 
     )
@@ -600,95 +327,54 @@ def mood_menu():
         "inline_keyboard": [
 
             [
-
                 {
-                    "text":
-                        "😢 Sad",
-
-                    "callback_data":
-                        "mood_sad"
+                    "text": "😢 Sad",
+                    "callback_data": "mood_sad"
                 },
-
                 {
-                    "text":
-                        "❤️ Love",
-
-                    "callback_data":
-                        "mood_love"
+                    "text": "❤️ Love",
+                    "callback_data": "mood_love"
                 }
-
             ],
 
             [
-
                 {
-                    "text":
-                        "🌙 Chill",
-
-                    "callback_data":
-                        "mood_chill"
+                    "text": "🌙 Chill",
+                    "callback_data": "mood_chill"
                 },
-
                 {
-                    "text":
-                        "🔥 Hype",
-
-                    "callback_data":
-                        "mood_hype"
+                    "text": "🔥 Hype",
+                    "callback_data": "mood_hype"
                 }
-
             ],
 
             [
-
                 {
-                    "text":
-                        "🖤 Dark",
-
-                    "callback_data":
-                        "mood_dark"
+                    "text": "🖤 Dark",
+                    "callback_data": "mood_dark"
                 },
-
                 {
-                    "text":
-                        "⚡ Energetic",
-
-                    "callback_data":
-                        "mood_energetic"
+                    "text": "⚡ Energetic",
+                    "callback_data": "mood_energetic"
                 }
-
             ],
 
             [
-
                 {
-                    "text":
-                        "🚗 Night Drive",
-
-                    "callback_data":
-                        "mood_night"
+                    "text": "🚗 Night Drive",
+                    "callback_data": "mood_night"
                 },
-
                 {
-                    "text":
-                        "🌌 Melodic",
-
-                    "callback_data":
-                        "mood_melodic"
+                    "text": "🌌 Melodic",
+                    "callback_data": "mood_melodic"
                 }
-
             ],
 
             [
-
                 {
-                    "text":
-                        "🤖 AI Suggestion",
-
-                    "callback_data":
-                        "ai_help"
+                    "text": "🤖 AI Suggestion",
+                    "callback_data": "ai_help"
                 }
-
             ]
 
         ]
@@ -697,7 +383,7 @@ def mood_menu():
 
 
 # =========================================================
-# MUSIC BUTTONS
+# AFTER MUSIC BUTTONS
 # =========================================================
 
 def music_buttons():
@@ -707,39 +393,24 @@ def music_buttons():
         "inline_keyboard": [
 
             [
-
                 {
-                    "text":
-                        "🔀 Next",
-
-                    "callback_data":
-                        "next_music"
+                    "text": "🔀 Next",
+                    "callback_data": "next_music"
                 }
-
             ],
 
             [
-
                 {
-                    "text":
-                        "🤖 Better Suggestion",
-
-                    "callback_data":
-                        "ai_help"
+                    "text": "🎧 Change Mood",
+                    "callback_data": "change_mood"
                 }
-
             ],
 
             [
-
                 {
-                    "text":
-                        "🎧 Change Mood",
-
-                    "callback_data":
-                        "change_mood"
+                    "text": "🤖 AI Suggestion",
+                    "callback_data": "ai_help"
                 }
-
             ]
 
         ]
@@ -748,36 +419,166 @@ def music_buttons():
 
 
 # =========================================================
-# AI CLASSIFY SONG
+# SAVE SONG
+# =========================================================
+
+def save_song(
+    message_id,
+    title,
+    caption,
+    performer,
+    genre,
+    moods
+):
+
+    connection = db()
+
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO songs
+        (
+            message_id,
+            title,
+            caption,
+            performer,
+            genre,
+            moods,
+            analyzed
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        """,
+
+        (
+            message_id,
+
+            title,
+
+            caption,
+
+            performer,
+
+            genre,
+
+            json.dumps(
+                moods,
+                ensure_ascii=False
+            )
+
+        )
+    )
+
+    connection.commit()
+
+    connection.close()
+
+
+# =========================================================
+# GET SONGS
+# =========================================================
+
+def get_songs():
+
+    connection = db()
+
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            message_id,
+            title,
+            caption,
+            performer,
+            genre,
+            moods,
+            analyzed
+        FROM songs
+        """
+    )
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    songs = []
+
+    for row in rows:
+
+        try:
+
+            moods = json.loads(
+                row[5]
+            )
+
+        except:
+
+            moods = []
+
+
+        songs.append({
+
+            "id": row[0],
+
+            "title": row[1] or "",
+
+            "caption": row[2] or "",
+
+            "performer": row[3] or "",
+
+            "genre": row[4] or "",
+
+            "moods": moods,
+
+            "analyzed": row[6]
+
+        })
+
+    return songs
+
+
+# =========================================================
+# AI CLASSIFY
 # =========================================================
 
 def classify_song(
-    caption
+    title,
+    caption,
+    performer
 ):
 
     if not ai_client:
 
-        return [], [], ""
+        return [], ""
 
 
-    if not caption:
+    information = (
 
-        return [], [], ""
+        "TITLE: "
+        + title
+
+        + "\nPERFORMER: "
+        + performer
+
+        + "\nCAPTION: "
+        + caption
+
+    )
 
 
     try:
 
         response = ai_client.responses.create(
 
-            model="gpt-5-mini",
+            model="gpt-5.6-luna",
 
             instructions="""
 
-You are an EDM music mood classifier.
+You are the music classifier for
+NOT YOUR VIBE.
 
-Analyze the provided song title/caption.
-
-Choose ONLY moods that genuinely match.
+Classify ONLY from the information supplied.
 
 Available moods:
 
@@ -790,68 +591,54 @@ energetic
 night
 melodic
 
-Submoods can include:
-
-emotional
-heartbreak
-melancholic
-lonely
-deep
-romantic
-dreamy
-relaxing
-smooth
-late_night
-night_drive
-festival
-party
-bass
-aggressive
-dark_bass
-moody
-atmospheric
-cinematic
-uplifting
-nostalgic
-
-Genre can include:
-
-Future Bass
-Melodic Dubstep
-Future Riddim
-Trap
-House
-Future Garage
-Dubstep
-EDM
-Melodic House
-etc.
-
 IMPORTANT:
 
-Do NOT assign every mood.
+Do NOT put every mood.
 
-Sad music should actually feel emotional,
-melancholic, heartbreaking, lonely, deep
-or nostalgic.
+SAD means:
+emotional, heartbreak, melancholic,
+lonely, nostalgic, deep sadness.
 
-Hype music should actually be energetic,
-festival, powerful or party-oriented.
+LOVE means:
+romantic, relationship, affection,
+dreamy love.
 
-Dark music should actually be dark,
-moody, aggressive or dark-bass oriented.
+CHILL means:
+relaxed, smooth, calm, laid-back.
+
+HYPE means:
+festival, party, powerful,
+high-energy, aggressive.
+
+DARK means:
+dark, sinister, moody,
+dark bass, heavy atmosphere.
+
+ENERGETIC means:
+energetic, uplifting, powerful,
+dance/festival energy.
+
+NIGHT means:
+night drive, late night,
+urban night, atmospheric,
+deep nighttime feeling.
+
+MELODIC means:
+strong melody, emotional melody,
+dreamy, atmospheric.
 
 Return ONLY JSON:
 
 {
   "moods": [],
-  "submoods": [],
   "genre": ""
 }
 
+Never invent information.
+
 """,
 
-            input=caption
+            input=information
 
         )
 
@@ -865,7 +652,6 @@ Return ONLY JSON:
 
         moods = []
 
-
         for mood in result.get(
             "moods",
             []
@@ -878,24 +664,6 @@ Return ONLY JSON:
                     moods.append(
                         mood
                     )
-
-
-        submoods = []
-
-
-        for item in result.get(
-            "submoods",
-            []
-        ):
-
-            if isinstance(
-                item,
-                str
-            ):
-
-                submoods.append(
-                    item.lower()
-                )
 
 
         genre = result.get(
@@ -912,90 +680,197 @@ Return ONLY JSON:
             genre = ""
 
 
-        return (
-            moods,
-            submoods,
-            genre
-        )
+        return moods, genre
 
 
     except Exception as e:
 
         print(
-            "AI classify error:",
+            "CLASSIFY ERROR:",
             e
         )
 
-        return [], [], ""
+        return [], ""
 
 
 # =========================================================
-# PROCESS NEW CHANNEL SONG
+# PROCESS NEW CHANNEL POST
 # =========================================================
 
-def process_channel_song(
-    message_id,
-    caption
+def process_channel_post(
+    post
 ):
 
+    message_id = post.get(
+        "message_id"
+    )
+
+
+    if not message_id:
+
+        return
+
+
+    caption = (
+        post.get("caption")
+        or
+        post.get("text")
+        or
+        ""
+    )
+
+
+    title = ""
+
+    performer = ""
+
+    genre = ""
+
+
+    # MP3 / AUDIO
+
+    audio = post.get(
+        "audio"
+    )
+
+
+    if audio:
+
+        title = (
+            audio.get(
+                "title"
+            )
+            or
+            ""
+        )
+
+
+        performer = (
+            audio.get(
+                "performer"
+            )
+            or
+            ""
+        )
+
+
+    # DOCUMENT fallback
+
+    document = post.get(
+        "document"
+    )
+
+
+    if document and not title:
+
+        file_name = document.get(
+            "file_name",
+            ""
+        )
+
+        title = file_name
+
+
+    combined = (
+
+        title
+        + " "
+        + performer
+        + " "
+        + caption
+
+    ).strip()
+
+
     print(
-        "Analyzing channel song:",
+        "NEW CHANNEL SONG:",
         message_id
     )
 
-
-    moods, submoods, genre = classify_song(
-        caption
+    print(
+        "INFO:",
+        combined
     )
 
 
-    if ai_client and caption:
+    # AI classify
 
-        save_song(
+    moods, genre = classify_song(
 
-            message_id,
+        title,
 
-            caption,
+        caption,
 
-            moods,
+        performer
 
-            submoods,
-
-            genre
-
-        )
+    )
 
 
-        print(
-            "AI MOODS:",
-            moods
-        )
+    save_song(
 
-        print(
-            "SUBMOODS:",
-            submoods
-        )
+        message_id,
 
-        print(
-            "GENRE:",
-            genre
-        )
+        title,
 
-    else:
+        caption,
 
-        print(
-            "AI unavailable. "
-            "Song saved without analysis."
-        )
+        performer,
+
+        genre,
+
+        moods
+
+    )
+
+
+    print(
+        "AI MOODS:",
+        moods
+    )
+
+    print(
+        "GENRE:",
+        genre
+    )
 
 
 # =========================================================
-# AI RECOMMENDATION
+# GET MOOD SONGS
 # =========================================================
 
-def ai_recommend(
-    user_text,
-    preferred_mood=None
+def get_mood_songs(
+    mood
+):
+
+    songs = get_songs()
+
+    matching = []
+
+
+    for song in songs:
+
+        if song["analyzed"] != 1:
+
+            continue
+
+
+        if mood in song["moods"]:
+
+            matching.append(
+                song
+            )
+
+
+    return matching
+
+
+# =========================================================
+# AI SELECT SONG
+# =========================================================
+
+def ai_select_song(
+    mood,
+    user_text=""
 ):
 
     if not ai_client:
@@ -1014,7 +889,7 @@ def ai_recommend(
 
         if song["analyzed"] == 1
 
-        and len(song["moods"]) > 0
+        and song["moods"]
 
     ]
 
@@ -1029,123 +904,79 @@ def ai_recommend(
 
     for song in analyzed:
 
-        catalog.append(
+        catalog.append({
 
-            {
+            "message_id":
+                song["id"],
 
-                "message_id":
-                    song["id"],
+            "title":
+                song["title"],
 
-                "caption":
-                    song["caption"],
+            "performer":
+                song["performer"],
 
-                "moods":
-                    song["moods"],
+            "caption":
+                song["caption"],
 
-                "submoods":
-                    song["submoods"],
+            "genre":
+                song["genre"],
 
-                "genre":
-                    song["genre"]
+            "moods":
+                song["moods"]
 
-            }
-
-        )
+        })
 
 
     try:
 
         response = ai_client.responses.create(
 
-            model="gpt-5-mini",
+            model="gpt-5.6-luna",
 
             instructions="""
 
-You are the NOT YOUR VIBE AI music recommender.
+You recommend ONE track from
+the supplied NOT YOUR VIBE catalog.
 
-You can ONLY select a song from the supplied
-CHANNEL CATALOG.
+You MUST select an existing message_id.
 
-NEVER invent a song.
-NEVER invent a message_id.
+Never invent a message_id.
 
-The recommendation must match the requested
-mood.
+Mood rules:
 
 SAD:
-
-Prefer:
-emotional
-heartbreak
-melancholic
-lonely
-deep
-nostalgic
-
-Avoid:
-hype
-party
-festival
-aggressive
+strong preference for emotional,
+heartbreak, melancholic, lonely,
+nostalgic, deep.
 
 LOVE:
-
-Prefer:
-romantic
-love
-dreamy
-emotional
-missing
+romantic, love, dreamy, emotional.
 
 CHILL:
-
-Prefer:
-relaxing
-smooth
-dreamy
-atmospheric
+relaxed, smooth, calm, dreamy.
 
 HYPE:
-
-Prefer:
-festival
-party
-energetic
-bass
-powerful
+festival, party, energetic,
+powerful, bass.
 
 DARK:
-
-Prefer:
-dark
-dark_bass
-moody
-aggressive
+dark, moody, aggressive,
+dark_bass.
 
 ENERGETIC:
+energetic, festival, uplifting,
+powerful.
 
-Prefer:
-energetic
-festival
-bass
-powerful
-
-NIGHT DRIVE:
-
-Prefer:
-night_drive
-late_night
-atmospheric
-deep
-melodic
+NIGHT:
+night_drive, late_night,
+atmospheric, deep.
 
 MELODIC:
+melodic, emotional, dreamy,
+atmospheric.
 
-Prefer:
-melodic
-dreamy
-emotional
-atmospheric
+Do NOT recommend a Hype track
+for Sad just because it is EDM.
 
 Return ONLY:
 
@@ -1154,27 +985,17 @@ Return ONLY:
   "reason": "short reason"
 }
 
-The message_id MUST exist in the catalog.
-
 """,
 
             input=(
 
-                "USER:\n"
+                "REQUESTED MOOD: "
+                + mood
 
+                + "\nUSER REQUEST: "
                 + user_text
 
-                + "\n\n"
-
-                + "PREFERRED MOOD:\n"
-
-                + str(
-                    preferred_mood
-                )
-
-                + "\n\n"
-
-                + "CHANNEL CATALOG:\n"
+                + "\n\nCATALOG:\n"
 
                 + json.dumps(
                     catalog,
@@ -1194,15 +1015,11 @@ The message_id MUST exist in the catalog.
 
 
         message_id = int(
-
-            result[
-                "message_id"
-            ]
-
+            result["message_id"]
         )
 
 
-        valid_ids = [
+        allowed = [
 
             song["id"]
 
@@ -1211,24 +1028,7 @@ The message_id MUST exist in the catalog.
         ]
 
 
-        if message_id not in valid_ids:
-
-            return None
-
-
-        selected = None
-
-
-        for song in analyzed:
-
-            if song["id"] == message_id:
-
-                selected = song
-
-                break
-
-
-        if not selected:
+        if message_id not in allowed:
 
             return None
 
@@ -1242,10 +1042,7 @@ The message_id MUST exist in the catalog.
                 result.get(
                     "reason",
                     "This track matches your mood."
-                ),
-
-            "song":
-                selected
+                )
 
         }
 
@@ -1253,7 +1050,7 @@ The message_id MUST exist in the catalog.
     except Exception as e:
 
         print(
-            "AI recommend error:",
+            "AI SELECT ERROR:",
             e
         )
 
@@ -1261,117 +1058,65 @@ The message_id MUST exist in the catalog.
 
 
 # =========================================================
-# GET ANALYZED MOOD SONGS
+# SEND MOOD MUSIC
 # =========================================================
 
-def get_mood_songs(
-    mood
-):
-
-    songs = get_songs()
-
-
-    result = []
-
-
-    for song in songs:
-
-        if song["analyzed"] != 1:
-
-            continue
-
-
-        if mood in song["moods"]:
-
-            result.append(
-                song
-            )
-
-
-    return result
-
-
-# =========================================================
-# FALLBACK MUSIC
-# =========================================================
-
-def fallback_music(
-    mood
-):
-
-    # First try AI analyzed songs
-    mood_songs = get_mood_songs(
-        mood
-    )
-
-
-    if mood_songs:
-
-        return random.choice(
-            mood_songs
-        )
-
-
-    # If no AI analyzed song yet,
-    # use your existing channel IDs.
-    #
-    # This guarantees that pressing
-    # a mode still sends music.
-
-    if MUSIC_IDS:
-
-        message_id = random.choice(
-            MUSIC_IDS
-        )
-
-
-        return {
-
-            "id":
-                message_id,
-
-            "caption":
-                "",
-
-            "moods":
-                [],
-
-            "submoods":
-                [],
-
-            "genre":
-                "",
-
-            "analyzed":
-                0
-
-        }
-
-
-    return None
-
-
-# =========================================================
-# SEND RECOMMENDATION
-# =========================================================
-
-def send_recommendation(
+def send_mood_music(
     chat_id,
     mood
 ):
 
-    # =====================================================
-    # TRY AI
-    # =====================================================
+    # -----------------------------------------------------
+    # FIRST:
+    # Exact AI analyzed mood songs
+    # -----------------------------------------------------
 
-    recommendation = ai_recommend(
+    matching = get_mood_songs(
+        mood
+    )
 
-        user_text=
-            MOOD_NAMES[mood],
 
-        preferred_mood=
-            mood
+    if matching:
 
+        song = random.choice(
+            matching
+        )
+
+
+        result = copy_music(
+
+            chat_id,
+
+            song["id"]
+
+        )
+
+
+        if result.get("ok"):
+
+            send_message(
+
+                chat_id,
+
+                MOOD_NAMES[mood]
+                + "\n\n"
+                + "🎧 Recommended from "
+                  "your collection.",
+
+                music_buttons()
+
+            )
+
+            return
+
+
+    # -----------------------------------------------------
+    # SECOND:
+    # AI chooses from analyzed catalog
+    # -----------------------------------------------------
+
+    recommendation = ai_select_song(
+        mood
     )
 
 
@@ -1400,12 +1145,7 @@ def send_recommendation(
 
                 + recommendation[
                     "reason"
-                ]
-
-                + "\n\n"
-
-                + "🎧 From NOT YOUR VIBE "
-                  "MP3 Collection",
+                ],
 
                 music_buttons()
 
@@ -1414,84 +1154,56 @@ def send_recommendation(
             return
 
 
-    # =====================================================
-    # FALLBACK
-    # =====================================================
+    # -----------------------------------------------------
+    # THIRD:
+    # IMPORTANT FALLBACK
+    #
+    # Never show "not enough AI analyzed"
+    # Never leave the button dead.
+    # -----------------------------------------------------
 
-    song = fallback_music(
-        mood
-    )
+    if MUSIC_IDS:
+
+        message_id = random.choice(
+            MUSIC_IDS
+        )
 
 
-    if not song:
-
-        send_message(
+        result = copy_music(
 
             chat_id,
 
-            "❌ No music found.",
-
-            mood_menu()
+            message_id
 
         )
 
-        return
 
+        if result.get("ok"):
 
-    result = copy_music(
+            send_message(
 
-        chat_id,
-
-        song["id"]
-
-    )
-
-
-    if result.get("ok"):
-
-        if song["analyzed"] == 1:
-
-            text = (
+                chat_id,
 
                 MOOD_NAMES[mood]
 
                 + "\n\n"
 
-                + "🎧 Here's a matching track "
-                  "from the collection."
+                + "🎧 From NOT YOUR VIBE "
+                  "MP3 Collection.",
+
+                music_buttons()
 
             )
 
         else:
 
-            text = (
+            send_message(
 
-                MOOD_NAMES[mood]
+                chat_id,
 
-                + "\n\n"
-
-                + "🎧 Here's a track from "
-                  "NOT YOUR VIBE Collection.\n\n"
-
-                + "🤖 AI is still learning "
-                  "the collection, so "
-                  "recommendations will "
-                  "become more accurate "
-                  "as new songs are analyzed."
+                "❌ Couldn't send the music."
 
             )
-
-
-        send_message(
-
-            chat_id,
-
-            text,
-
-            music_buttons()
-
-        )
-
 
     else:
 
@@ -1499,9 +1211,78 @@ def send_recommendation(
 
             chat_id,
 
-            "❌ Couldn't send the music."
+            "❌ No music available."
 
         )
+
+
+# =========================================================
+# AI USER SUGGESTION
+# =========================================================
+
+def user_ai_suggestion(
+    chat_id,
+    text
+):
+
+    recommendation = ai_select_song(
+
+        "user request",
+
+        text
+
+    )
+
+
+    if recommendation:
+
+        result = copy_music(
+
+            chat_id,
+
+            recommendation[
+                "message_id"
+            ]
+
+        )
+
+
+        if result.get("ok"):
+
+            send_message(
+
+                chat_id,
+
+                "🤖 AI SUGGESTION\n\n"
+
+                + recommendation[
+                    "reason"
+                ]
+
+                + "\n\n"
+
+                + "🎧 From NOT YOUR VIBE "
+                  "MP3 Collection.",
+
+                music_buttons()
+
+            )
+
+            return
+
+
+    send_message(
+
+        chat_id,
+
+        "🤖 I don't have enough analyzed "
+        "tracks for that exact request yet.\n\n"
+
+        "Try one of the moods below 👇",
+
+        mood_menu()
+
+    )
 
 
 # =========================================================
@@ -1569,10 +1350,14 @@ def webhook():
         )
 
 
-        username = chat.get(
-            "username",
+        username = (
+            chat.get(
+                "username",
+                ""
+            )
+            or
             ""
-        )
+        ).lower()
 
 
         expected = CHANNEL_USERNAME.replace(
@@ -1581,41 +1366,20 @@ def webhook():
         ).lower()
 
 
-        if username.lower() == expected:
+        if username == expected:
 
-            message_id = channel_post.get(
-                "message_id"
-            )
+            try:
 
-
-            caption = (
-
-                channel_post.get(
-                    "caption",
-                    ""
+                process_channel_post(
+                    channel_post
                 )
 
-                or
+            except Exception as e:
 
-                channel_post.get(
-                    "text",
-                    ""
+                print(
+                    "CHANNEL PROCESS ERROR:",
+                    e
                 )
-
-                or
-
-                "New music"
-
-            )
-
-
-            process_channel_song(
-
-                message_id,
-
-                caption
-
-            )
 
 
         return "OK"
@@ -1639,15 +1403,19 @@ def webhook():
         ]
 
 
-        text = message.get(
-            "text",
+        text = (
+            message.get(
+                "text",
+                ""
+            )
+            or
             ""
         ).strip()
 
 
-        # =================================================
+        # -------------------------------------------------
         # START
-        # =================================================
+        # -------------------------------------------------
 
         if text == "/start":
 
@@ -1659,17 +1427,16 @@ def webhook():
 
                 "Welcome! 🔥\n\n"
 
-                "Choose your mood below "
-                "or ask AI for a suggestion. 👇",
+                "Choose your mood below. 👇",
 
                 mood_menu()
 
             )
 
 
-        # =================================================
+        # -------------------------------------------------
         # MOOD
-        # =================================================
+        # -------------------------------------------------
 
         elif text == "/mood":
 
@@ -1684,9 +1451,9 @@ def webhook():
             )
 
 
-        # =================================================
+        # -------------------------------------------------
         # AI
-        # =================================================
+        # -------------------------------------------------
 
         elif text == "/ai":
 
@@ -1696,31 +1463,27 @@ def webhook():
 
                 "🤖 AI MUSIC SUGGESTION\n\n"
 
-                "Tell me what you're feeling.\n\n"
+                "Tell me how you're feeling.\n\n"
 
                 "Examples:\n\n"
 
                 "💔 I'm heartbroken\n"
+                "🌧 I want something emotional\n"
+                "🚗 I need music for a night drive\n"
+                "🔥 Give me festival energy\n"
+                "🖤 I want dark bass\n\n"
 
-                "🌧️ I want something emotional\n"
+                "I'll recommend music from "
+                "NOT YOUR VIBE Collection.",
 
-                "🚗 Music for a night drive\n"
-
-                "🔥 I need festival energy\n"
-
-                "🖤 I want dark bass\n"
-
-                "🌌 Emotional future bass\n\n"
-
-                "I'll recommend ONLY music "
-                "from NOT YOUR VIBE Collection."
+                mood_menu()
 
             )
 
 
-        # =================================================
+        # -------------------------------------------------
         # HELP
-        # =================================================
+        # -------------------------------------------------
 
         elif text == "/help":
 
@@ -1738,85 +1501,19 @@ def webhook():
             )
 
 
-        # =================================================
-        # AI CHAT / SUGGESTION
-        # =================================================
+        # -------------------------------------------------
+        # NORMAL AI REQUEST
+        # -------------------------------------------------
 
         elif text:
 
-            recommendation = ai_recommend(
+            user_ai_suggestion(
+
+                chat_id,
+
                 text
+
             )
-
-
-            if recommendation:
-
-                result = copy_music(
-
-                    chat_id,
-
-                    recommendation[
-                        "message_id"
-                    ]
-
-                )
-
-
-                if result.get("ok"):
-
-                    send_message(
-
-                        chat_id,
-
-                        "🤖 AI SUGGESTION\n\n"
-
-                        + recommendation[
-                            "reason"
-                        ]
-
-                        + "\n\n"
-
-                        + "🎧 From NOT YOUR VIBE "
-                          "MP3 Collection",
-
-                        music_buttons()
-
-                    )
-
-                else:
-
-                    send_message(
-
-                        chat_id,
-
-                        "❌ I found the track, "
-                        "but Telegram couldn't "
-                        "send it."
-
-                    )
-
-
-            else:
-
-                send_message(
-
-                    chat_id,
-
-                    "🤖 I couldn't find a strong "
-                    "AI match yet.\n\n"
-
-                    "Try describing your feeling "
-                    "more specifically.\n\n"
-
-                    "Example:\n"
-                    "💔 heartbreak\n"
-                    "🌧️ emotional night\n"
-                    "🚗 late night drive\n"
-                    "🖤 dark bass",
-
-                    mood_menu()
-
-                )
 
 
     # =====================================================
@@ -1833,6 +1530,12 @@ def webhook():
         callback_id = callback[
             "id"
         ]
+
+
+        data = callback.get(
+            "data",
+            ""
+        )
 
 
         callback_message = callback.get(
@@ -1855,15 +1558,9 @@ def webhook():
         )
 
 
-        data = callback.get(
-            "data",
-            ""
-        )
-
-
-        # =================================================
-        # AI HELP
-        # =================================================
+        # -------------------------------------------------
+        # AI
+        # -------------------------------------------------
 
         if data == "ai_help":
 
@@ -1884,24 +1581,23 @@ def webhook():
 
                 "Tell me what you're feeling.\n\n"
 
-                "Examples:\n\n"
+                "For example:\n"
 
-                "💔 I'm heartbroken\n"
-                "🌧️ Something emotional\n"
-                "🚗 Night drive music\n"
-                "🔥 Festival hype\n"
-                "🖤 Dark bass\n"
-                "🌌 Emotional future bass\n\n"
+                "💔 heartbreak\n"
+                "🌧 emotional\n"
+                "🚗 night drive\n"
+                "🔥 festival\n"
+                "🖤 dark bass\n\n"
 
-                "I'll search ONLY your "
+                "I'll search your "
                 "NOT YOUR VIBE collection."
 
             )
 
 
-        # =================================================
+        # -------------------------------------------------
         # CHANGE MOOD
-        # =================================================
+        # -------------------------------------------------
 
         elif data == "change_mood":
 
@@ -1909,7 +1605,7 @@ def webhook():
 
                 callback_id,
 
-                "Choose your mood"
+                "Choose another mood"
 
             )
 
@@ -1925,9 +1621,9 @@ def webhook():
             )
 
 
-        # =================================================
-        # NEXT MUSIC
-        # =================================================
+        # -------------------------------------------------
+        # NEXT
+        # -------------------------------------------------
 
         elif data == "next_music":
 
@@ -1940,37 +1636,7 @@ def webhook():
             )
 
 
-            songs = get_songs()
-
-
-            analyzed = [
-
-                song
-
-                for song in songs
-
-                if song["analyzed"] == 1
-
-            ]
-
-
-            if analyzed:
-
-                song = random.choice(
-                    analyzed
-                )
-
-
-                result = copy_music(
-
-                    chat_id,
-
-                    song["id"]
-
-                )
-
-
-            else:
+            if MUSIC_IDS:
 
                 message_id = random.choice(
                     MUSIC_IDS
@@ -1986,17 +1652,27 @@ def webhook():
                 )
 
 
-            if result.get("ok"):
+                if result.get("ok"):
 
-                send_message(
+                    send_message(
 
-                    chat_id,
+                        chat_id,
 
-                    "🔀 Next track 👇",
+                        "🔀 Next track 👇",
 
-                    music_buttons()
+                        music_buttons()
 
-                )
+                    )
+
+                else:
+
+                    send_message(
+
+                        chat_id,
+
+                        "❌ Couldn't send the track."
+
+                    )
 
             else:
 
@@ -2004,14 +1680,14 @@ def webhook():
 
                     chat_id,
 
-                    "❌ Couldn't send the track."
+                    "❌ No music available."
 
                 )
 
 
-        # =================================================
-        # MOOD BUTTONS
-        # =================================================
+        # -------------------------------------------------
+        # MOOD
+        # -------------------------------------------------
 
         elif data.startswith(
             "mood_"
@@ -2045,16 +1721,14 @@ def webhook():
             )
 
 
-            # This is the important part:
+            # IMPORTANT:
             #
-            # 1. AI matching first
-            # 2. If AI has no analyzed song,
-            #    fallback to channel music
+            # This NEVER blocks because AI analysis
+            # is missing.
             #
-            # Therefore the mode will ALWAYS
-            # try to send music.
+            # AI -> analyzed mood -> fallback channel.
 
-            send_recommendation(
+            send_mood_music(
 
                 chat_id,
 
@@ -2067,15 +1741,13 @@ def webhook():
 
 
 # =========================================================
-# WEBHOOK SETUP
+# SET WEBHOOK
 # =========================================================
 
 if BOT_TOKEN and RENDER_URL:
 
     webhook_url = (
-
         f"{RENDER_URL}/webhook"
-
     )
 
 
@@ -2093,9 +1765,7 @@ if BOT_TOKEN and RENDER_URL:
                 "allowed_updates": [
 
                     "message",
-
                     "callback_query",
-
                     "channel_post"
 
                 ]
@@ -2108,20 +1778,16 @@ if BOT_TOKEN and RENDER_URL:
 
 
         print(
-
-            "Webhook:",
+            "WEBHOOK:",
             response.text
-
         )
 
 
     except Exception as e:
 
         print(
-
-            "Webhook Error:",
+            "WEBHOOK ERROR:",
             e
-
         )
 
 
@@ -2134,18 +1800,27 @@ if __name__ == "__main__":
     port = int(
 
         os.environ.get(
-
             "PORT",
-
             10000
-
         )
 
     )
 
 
     print(
-        "Starting NOT YOUR VIBE Music Bot..."
+        "================================"
+    )
+
+    print(
+        "NOT YOUR VIBE MUSIC BOT"
+    )
+
+    print(
+        "SERVER STARTING..."
+    )
+
+    print(
+        "================================"
     )
 
 
