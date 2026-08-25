@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 
 # =========================================================
-# ENVIRONMENT
+# ENV
 # =========================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -28,20 +28,17 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # OPENAI
 # =========================================================
 
-ai_client = None
+ai = None
 
 if OPENAI_API_KEY:
-
     try:
-
-        ai_client = OpenAI(
+        ai = OpenAI(
             api_key=OPENAI_API_KEY
         )
 
-        print("OPENAI: CONNECTED")
+        print("OPENAI CONNECTED")
 
     except Exception as e:
-
         print("OPENAI ERROR:", e)
 
 
@@ -78,11 +75,12 @@ MOOD_NAMES = {
     "night": "🚗 NIGHT DRIVE",
 
     "melodic": "🌌 MELODIC"
+
 }
 
 
 # =========================================================
-# YOUR EXISTING CHANNEL MESSAGE IDS
+# OLD MESSAGE IDS
 # =========================================================
 
 MUSIC_IDS = [
@@ -120,49 +118,638 @@ MUSIC_IDS = list(
 SONGS = {}
 
 
-for message_id in MUSIC_IDS:
-
-    SONGS[message_id] = {
-
-        "caption": "",
-
-        "genre": "",
-
-        "moods": []
-
-    }
-
-
 # =========================================================
-# MOOD DATABASE
+# MOOD POOLS
 # =========================================================
 
 MOOD_MUSIC = {
 
     "sad": [],
-
     "love": [],
-
     "chill": [],
-
     "hype": [],
-
     "dark": [],
-
     "energetic": [],
-
     "night": [],
-
     "melodic": []
 
 }
 
 
 # =========================================================
-# TELEGRAM
+# TEXT NORMALIZER
 # =========================================================
 
-def telegram(method, data):
+def normalize(text):
+
+    if not text:
+        return ""
+
+    text = text.lower()
+
+    text = text.replace(
+        "\n",
+        " "
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# =========================================================
+# GENRE KEYWORDS
+# =========================================================
+
+GENRE_KEYWORDS = {
+
+    "melodic_dubstep": [
+        "melodic dubstep",
+        "melodic-dubstep",
+        "melodicdubstep",
+        "emotional dubstep"
+    ],
+
+    "psytrance": [
+        "psytrance",
+        "psy trance"
+    ],
+
+    "hardstyle": [
+        "hardstyle"
+    ],
+
+    "hardtechno": [
+        "hard techno",
+        "hardtechno"
+    ],
+
+    "drum_and_bass": [
+        "drum and bass",
+        "drum & bass",
+        "drum n bass",
+        "dnb"
+    ],
+
+    "riddim": [
+        "riddim"
+    ],
+
+    "jersey_club": [
+        "jersey club",
+        "jerseyclub"
+    ],
+
+    "jungle_terror": [
+        "jungle terror",
+        "jungleterror"
+    ],
+
+    "melodic_techno": [
+        "melodic techno"
+    ],
+
+    "hardcore": [
+        "hardcore"
+    ],
+
+    "tech_house": [
+        "tech house"
+    ],
+
+    "breakbeats": [
+        "breakbeat",
+        "breakbeats"
+    ],
+
+    "rawtrap": [
+        "rawtrap",
+        "raw trap"
+    ],
+
+    "sub_bass": [
+        "sub bass",
+        "subbass"
+    ],
+
+    "tearout": [
+        "tearout",
+        "tear out"
+    ],
+
+    "dubstep": [
+        "dubstep"
+    ],
+
+    "future_rave": [
+        "future rave"
+    ],
+
+    "afro_house": [
+        "afro house"
+    ],
+
+    "midtempo": [
+        "midtempo",
+        "mid tempo"
+    ],
+
+    "liquid_dnb": [
+        "liquid drum and bass",
+        "liquid dnb",
+        "liquid d&b"
+    ]
+
+}
+
+
+# =========================================================
+# DETECT GENRE
+# =========================================================
+
+def detect_genre(caption):
+
+    text = normalize(
+        caption
+    )
+
+    for genre, keywords in GENRE_KEYWORDS.items():
+
+        for keyword in keywords:
+
+            if keyword in text:
+
+                return genre
+
+    return ""
+
+
+# =========================================================
+# SAD KEYWORDS
+# =========================================================
+
+SAD_KEYWORDS = [
+
+    "sad",
+    "emotional",
+    "emotion",
+    "melancholic",
+    "melancholy",
+    "heartbreak",
+    "heartbroken",
+    "broken heart",
+    "lonely",
+    "loneliness",
+    "nostalgic",
+    "nostalgia",
+    "tears",
+    "cry",
+    "crying",
+    "pain",
+    "lost",
+    "missing",
+    "goodbye",
+    "memories",
+    "regret",
+    "sorrow"
+
+]
+
+
+# =========================================================
+# CHECK SAD
+# =========================================================
+
+def is_sad(text):
+
+    text = normalize(
+        text
+    )
+
+    for word in SAD_KEYWORDS:
+
+        if word in text:
+
+            return True
+
+    return False
+
+
+# =========================================================
+# KEYWORD MOOD DETECTION
+# =========================================================
+#
+# This means the bot can work WITHOUT AI.
+# =========================================================
+
+MOOD_KEYWORDS = {
+
+    "love": [
+
+        "love",
+        "romantic",
+        "romance",
+        "lover",
+        "loving",
+        "kiss",
+        "relationship",
+        "couple",
+        "passion",
+        "heart"
+
+    ],
+
+    "chill": [
+
+        "chill",
+        "relax",
+        "relaxing",
+        "calm",
+        "smooth",
+        "dreamy",
+        "peaceful",
+        "laid back",
+        "ambient"
+
+    ],
+
+    "hype": [
+
+        "hype",
+        "festival",
+        "party",
+        "big drop",
+        "mainstage",
+        "crowd",
+        "anthem",
+        "massive",
+        "banger"
+
+    ],
+
+    "dark": [
+
+        "dark",
+        "evil",
+        "sinister",
+        "aggressive",
+        "industrial",
+        "heavy",
+        "ominous",
+        "distorted"
+
+    ],
+
+    "energetic": [
+
+        "energetic",
+        "energy",
+        "powerful",
+        "high energy",
+        "fast",
+        "intense",
+        "hard hitting",
+        "power"
+
+    ],
+
+    "night": [
+
+        "night",
+        "night drive",
+        "driving",
+        "drive",
+        "neon",
+        "midnight",
+        "late night",
+        "city lights"
+
+    ],
+
+    "melodic": [
+
+        "melodic",
+        "melody",
+        "euphoric",
+        "atmospheric",
+        "beautiful",
+        "emotional",
+        "uplifting",
+        "harmonic"
+
+    ]
+
+}
+
+
+# =========================================================
+# AI MOOD ANALYSIS
+# =========================================================
+
+def ai_analyze(caption):
+
+    if not ai:
+
+        return []
+
+    if not caption:
+
+        return []
+
+
+    try:
+
+        response = ai.responses.create(
+
+            model="gpt-5-mini",
+
+            instructions="""
+
+You are the mood classifier for
+NOT YOUR VIBE EDM MUSIC BOT.
+
+Analyze ONLY the music caption.
+
+Choose zero or more from:
+
+sad
+love
+chill
+hype
+dark
+energetic
+night
+melodic
+
+IMPORTANT:
+
+Do not guess randomly.
+
+Use:
+Genre
+Mood
+Vibe
+Energy
+Description
+
+Return ONLY JSON array.
+
+Examples:
+
+"Heartbreak / Lonely / Melancholic"
+=> ["sad"]
+
+"Romantic / Love / Warm"
+=> ["love"]
+
+"Relaxing / Dreamy / Calm"
+=> ["chill"]
+
+"Festival / Massive Drop / Party"
+=> ["hype","energetic"]
+
+"Dark / Aggressive / Heavy"
+=> ["dark","energetic"]
+
+"Night Drive / Neon / Midnight"
+=> ["night"]
+
+"Melodic / Euphoric / Atmospheric"
+=> ["melodic"]
+
+""",
+
+            input=caption
+
+        )
+
+
+        raw = response.output_text.strip()
+
+        moods = json.loads(
+            raw
+        )
+
+
+        if not isinstance(
+            moods,
+            list
+        ):
+
+            return []
+
+
+        valid = []
+
+
+        for mood in moods:
+
+            if mood in MOODS:
+
+                if mood not in valid:
+
+                    valid.append(
+                        mood
+                    )
+
+
+        return valid
+
+
+    except Exception as e:
+
+        print(
+            "AI ERROR:",
+            e
+        )
+
+        return []
+
+
+# =========================================================
+# ADD SONG TO MOOD POOL
+# =========================================================
+
+def analyze_song(
+    message_id,
+    caption
+):
+
+    genre = detect_genre(
+        caption
+    )
+
+
+    SONGS[message_id] = {
+
+        "caption":
+            caption,
+
+        "genre":
+            genre,
+
+        "moods":
+            []
+
+    }
+
+
+    # =====================================================
+    # SAD
+    #
+    # STRICT:
+    # MELODIC DUBSTEP ONLY
+    # =====================================================
+
+    if genre == "melodic_dubstep":
+
+        if is_sad(caption):
+
+            if message_id not in MOOD_MUSIC["sad"]:
+
+                MOOD_MUSIC["sad"].append(
+                    message_id
+                )
+
+
+            SONGS[message_id]["moods"].append(
+                "sad"
+            )
+
+
+    # =====================================================
+    # OTHER MOODS
+    # =====================================================
+
+    text = normalize(
+        caption
+    )
+
+
+    for mood, keywords in MOOD_KEYWORDS.items():
+
+        if mood == "sad":
+
+            continue
+
+
+        matched = False
+
+
+        for keyword in keywords:
+
+            if keyword in text:
+
+                matched = True
+
+                break
+
+
+        if matched:
+
+            if message_id not in MOOD_MUSIC[mood]:
+
+                MOOD_MUSIC[mood].append(
+                    message_id
+                )
+
+
+            if mood not in SONGS[message_id]["moods"]:
+
+                SONGS[message_id]["moods"].append(
+                    mood
+                )
+
+
+    # =====================================================
+    # AI ADDITIONAL ANALYSIS
+    # =====================================================
+
+    ai_moods = ai_analyze(
+        caption
+    )
+
+
+    for mood in ai_moods:
+
+        # Sad remains STRICT
+        if mood == "sad":
+
+            if genre == "melodic_dubstep":
+
+                if is_sad(caption):
+
+                    if message_id not in MOOD_MUSIC["sad"]:
+
+                        MOOD_MUSIC["sad"].append(
+                            message_id
+                        )
+
+                    if "sad" not in SONGS[message_id]["moods"]:
+
+                        SONGS[message_id]["moods"].append(
+                            "sad"
+                        )
+
+            continue
+
+
+        if message_id not in MOOD_MUSIC[mood]:
+
+            MOOD_MUSIC[mood].append(
+                message_id
+            )
+
+
+        if mood not in SONGS[message_id]["moods"]:
+
+            SONGS[message_id]["moods"].append(
+                mood
+            )
+
+
+    print(
+        "ANALYZED:",
+        message_id,
+        genre,
+        SONGS[message_id]["moods"]
+    )
+
+
+# =========================================================
+# ADD NEW CHANNEL SONG
+# =========================================================
+
+def add_song(
+    message_id,
+    caption
+):
+
+    if message_id not in MUSIC_IDS:
+
+        MUSIC_IDS.append(
+            message_id
+        )
+
+
+    analyze_song(
+        message_id,
+        caption
+    )
+
+
+# =========================================================
+# TELEGRAM REQUEST
+# =========================================================
+
+def telegram(
+    method,
+    data
+):
 
     try:
 
@@ -176,15 +763,7 @@ def telegram(method, data):
 
         )
 
-        result = response.json()
-
-        print(
-            "TELEGRAM:",
-            method,
-            result
-        )
-
-        return result
+        return response.json()
 
     except Exception as e:
 
@@ -200,13 +779,13 @@ def telegram(method, data):
 
 
 # =========================================================
-# SEND MESSAGE
+# SEND TEXT
 # =========================================================
 
 def send_message(
     chat_id,
     text,
-    reply_markup=None
+    keyboard=None
 ):
 
     data = {
@@ -219,9 +798,11 @@ def send_message(
 
     }
 
-    if reply_markup:
 
-        data["reply_markup"] = reply_markup
+    if keyboard:
+
+        data["reply_markup"] = keyboard
+
 
     return telegram(
         "sendMessage",
@@ -230,33 +811,7 @@ def send_message(
 
 
 # =========================================================
-# ANSWER CALLBACK
-# =========================================================
-
-def answer_callback(
-    callback_id,
-    text=""
-):
-
-    return telegram(
-
-        "answerCallbackQuery",
-
-        {
-
-            "callback_query_id":
-                callback_id,
-
-            "text":
-                text
-
-        }
-
-    )
-
-
-# =========================================================
-# COPY CHANNEL MUSIC
+# COPY MUSIC
 # =========================================================
 
 def copy_music(
@@ -285,499 +840,28 @@ def copy_music(
 
 
 # =========================================================
-# NORMALIZE TEXT
+# CALLBACK ANSWER
 # =========================================================
 
-def normalize(text):
-
-    if not text:
-
-        return ""
-
-    text = text.lower()
-
-    text = text.replace(
-        "\n",
-        " "
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
-
-
-# =========================================================
-# GENRE DETECTION
-# =========================================================
-
-def detect_genre(caption):
-
-    text = normalize(caption)
-
-    genres = {
-
-        "melodic_dubstep": [
-            "melodic dubstep",
-            "melodic-dubstep",
-            "melodicdubstep",
-            "emotional dubstep"
-        ],
-
-        "psytrance": [
-            "psytrance",
-            "psy trance"
-        ],
-
-        "hardstyle": [
-            "hardstyle"
-        ],
-
-        "hardtechno": [
-            "hard techno",
-            "hardtechno"
-        ],
-
-        "drum_and_bass": [
-            "drum and bass",
-            "drum & bass",
-            "dnb",
-            "drum n bass"
-        ],
-
-        "riddim": [
-            "riddim"
-        ],
-
-        "jersey_club": [
-            "jersey club",
-            "jerseyclub"
-        ],
-
-        "terror": [
-            "jungle terror",
-            "jungleterror"
-        ],
-
-        "melodic_techno": [
-            "melodic techno"
-        ],
-
-        "hardcore": [
-            "hardcore"
-        ],
-
-        "tech_house": [
-            "tech house"
-        ],
-
-        "breakbeats": [
-            "breakbeats",
-            "breakbeat"
-        ],
-
-        "rawtrap": [
-            "rawtrap",
-            "raw trap"
-        ],
-
-        "sub_bass": [
-            "sub bass",
-            "subbass"
-        ],
-
-        "tearout": [
-            "tearout",
-            "tear out"
-        ],
-
-        "dubstep": [
-            "dubstep"
-        ],
-
-        "future_rave": [
-            "future rave"
-        ],
-
-        "afro_house": [
-            "afro house"
-        ],
-
-        "midtempo": [
-            "midtempo",
-            "mid tempo"
-        ],
-
-        "liquid_dnb": [
-            "liquid drum and bass",
-            "liquid dnb",
-            "liquid d&b"
-        ]
-
-    }
-
-
-    for genre, keywords in genres.items():
-
-        for keyword in keywords:
-
-            if keyword in text:
-
-                return genre
-
-
-    return ""
-
-
-# =========================================================
-# SAD KEYWORDS
-# =========================================================
-
-SAD_WORDS = [
-
-    "sad",
-    "emotional",
-    "melancholic",
-    "melancholy",
-    "heartbreak",
-    "heartbroken",
-    "broken heart",
-    "lonely",
-    "loneliness",
-    "nostalgic",
-    "nostalgia",
-    "tears",
-    "cry",
-    "crying",
-    "pain",
-    "lost",
-    "goodbye",
-    "memories",
-    "emotional vocal",
-    "emotional vocals"
-
-]
-
-
-# =========================================================
-# CHECK SAD
-# =========================================================
-
-def is_sad_caption(caption):
-
-    text = normalize(caption)
-
-    for word in SAD_WORDS:
-
-        if word in text:
-
-            return True
-
-    return False
-
-
-# =========================================================
-# AI CLASSIFIER
-#
-# SAD IS ALSO ALLOWED HERE,
-# BUT THE GENRE RULE BELOW HAS PRIORITY.
-# =========================================================
-
-def ai_classify(caption):
-
-    if not ai_client:
-
-        return []
-
-
-    if not caption:
-
-        return []
-
-
-    try:
-
-        response = ai_client.responses.create(
-
-            model="gpt-5-mini",
-
-            instructions="""
-
-You are the music classifier for
-NOT YOUR VIBE.
-
-Analyze the provided EDM music caption.
-
-Choose ONLY from:
-
-sad
-love
-chill
-hype
-dark
-energetic
-night
-melodic
-
-You may return multiple moods.
-
-Important:
-
-Do not classify only from the genre.
-
-Look at:
-- Mood
-- Vibe
-- Energy
-- Description
-- Emotional words
-- Atmosphere
-
-Examples:
-
-Emotional / Heartbreak / Lonely
-=> ["sad"]
-
-Love / Romantic / Warm
-=> ["love"]
-
-Chill / Relaxing / Dreamy
-=> ["chill"]
-
-Festival / Party / Big Drop
-=> ["hype","energetic"]
-
-Dark / Aggressive / Industrial
-=> ["dark","energetic"]
-
-Night Drive / Neon / Late Night
-=> ["night","melodic"]
-
-Melodic / Euphoric / Atmospheric
-=> ["melodic"]
-
-Return ONLY JSON.
-
-Example:
-["dark","energetic"]
-
-""",
-
-            input=caption
-
-        )
-
-
-        raw = response.output_text.strip()
-
-        print(
-            "AI RAW:",
-            raw
-        )
-
-
-        moods = json.loads(raw)
-
-
-        if not isinstance(
-            moods,
-            list
-        ):
-
-            return []
-
-
-        valid = []
-
-
-        for mood in moods:
-
-            if mood in MOODS:
-
-                if mood not in valid:
-
-                    valid.append(mood)
-
-
-        return valid
-
-
-    except Exception as e:
-
-        print(
-            "AI CLASSIFY ERROR:",
-            e
-        )
-
-        return []
-
-
-# =========================================================
-# ANALYZE SONG
-# =========================================================
-
-def analyze_song(
-    message_id,
-    caption
+def answer_callback(
+    callback_id,
+    text=""
 ):
 
-    if not message_id:
+    return telegram(
 
-        return
+        "answerCallbackQuery",
 
+        {
 
-    genre = detect_genre(
-        caption
-    )
+            "callback_query_id":
+                callback_id,
 
+            "text":
+                text
 
-    SONGS[message_id] = {
+        }
 
-        "caption":
-            caption,
-
-        "genre":
-            genre,
-
-        "moods":
-            []
-
-    }
-
-
-    # =====================================================
-    # SAD HARD RULE
-    #
-    # MUST BE MELODIC DUBSTEP
-    #
-    # AND MUST HAVE SAD/EMOTIONAL VIBE
-    # =====================================================
-
-    if genre == "melodic_dubstep":
-
-        if is_sad_caption(caption):
-
-            if message_id not in MOOD_MUSIC["sad"]:
-
-                MOOD_MUSIC["sad"].append(
-                    message_id
-                )
-
-
-            SONGS[message_id]["moods"].append(
-                "sad"
-            )
-
-
-    # =====================================================
-    # AI FOR ALL OTHER MOODS
-    # =====================================================
-
-    ai_moods = ai_classify(
-        caption
-    )
-
-
-    for mood in ai_moods:
-
-        # Never allow AI to override
-        # the special Sad genre rule.
-
-        if mood == "sad":
-
-            if genre == "melodic_dubstep":
-
-                if is_sad_caption(caption):
-
-                    if message_id not in MOOD_MUSIC["sad"]:
-
-                        MOOD_MUSIC["sad"].append(
-                            message_id
-                        )
-
-            continue
-
-
-        if mood not in MOODS:
-
-            continue
-
-
-        if message_id not in MOOD_MUSIC[mood]:
-
-            MOOD_MUSIC[mood].append(
-                message_id
-            )
-
-
-        if mood not in SONGS[message_id]["moods"]:
-
-            SONGS[message_id]["moods"].append(
-                mood
-            )
-
-
-    print(
-        "SONG ANALYZED:",
-        message_id
-    )
-
-    print(
-        "GENRE:",
-        genre
-    )
-
-    print(
-        "MOODS:",
-        SONGS[message_id]["moods"]
-    )
-
-
-# =========================================================
-# ADD NEW SONG
-# =========================================================
-
-def add_new_song(
-    message_id,
-    caption
-):
-
-    if not message_id:
-
-        return
-
-
-    if message_id not in MUSIC_IDS:
-
-        MUSIC_IDS.append(
-            message_id
-        )
-
-
-    analyze_song(
-        message_id,
-        caption
-    )
-
-
-# =========================================================
-# REBUILD OLD SONG DATABASE
-#
-# IMPORTANT:
-# Existing IDs without captions cannot be AI-classified.
-# They remain available as general fallback.
-# New channel posts are automatically analyzed.
-# =========================================================
-
-def rebuild_database():
-
-    print(
-        "DATABASE READY:",
-        len(MUSIC_IDS),
-        "songs"
     )
 
 
@@ -884,6 +968,7 @@ def mood_menu():
             ]
 
         ]
+
     }
 
 
@@ -934,125 +1019,207 @@ def music_buttons():
             ]
 
         ]
+
     }
 
 
 # =========================================================
-# SEND MUSIC
+# GET MUSIC FOR MOOD
 # =========================================================
 
-def send_music(
+def get_mood_songs(mood):
+
+    songs = list(
+        dict.fromkeys(
+            MOOD_MUSIC.get(
+                mood,
+                []
+            )
+        )
+    )
+
+
+    return songs
+
+
+# =========================================================
+# SEND MOOD MUSIC
+# =========================================================
+
+def send_mood_music(
     chat_id,
     mood
 ):
 
-    # =====================================================
-    # SAD
-    #
-    # STRICT:
-    # MELODIC DUBSTEP + SAD CAPTION
-    # =====================================================
-
-    if mood == "sad":
-
-        songs = list(
-            dict.fromkeys(
-                MOOD_MUSIC["sad"]
-            )
-        )
-
-
-    # =====================================================
-    # OTHER MOODS
-    # =====================================================
-
-    else:
-
-        songs = list(
-            dict.fromkeys(
-                MOOD_MUSIC.get(
-                    mood,
-                    []
-                )
-            )
-        )
-
-
-    # =====================================================
-    # NO MATCH
-    # =====================================================
-
-    if not songs:
-
-        send_message(
-
-            chat_id,
-
-            f"{MOOD_NAMES[mood]}\n\n"
-            "⚠️ I couldn't find a matching track "
-            "in the analyzed collection yet.\n\n"
-            "Try another mood or add more "
-            "caption-tagged songs."
-
-        )
-
-        return False
-
-
-    # =====================================================
-    # RANDOM
-    # =====================================================
-
-    random.shuffle(
-        songs
+    songs = get_mood_songs(
+        mood
     )
 
 
     # =====================================================
-    # TRY UP TO 15
+    # IF MOOD POOL EXISTS
     # =====================================================
 
-    for message_id in songs[:15]:
+    if songs:
 
-        result = copy_music(
-
-            chat_id,
-
-            message_id
+        random.shuffle(
+            songs
         )
 
 
-        if result.get("ok"):
+        # Try several messages in case
+        # one message cannot be copied.
 
-            print(
+        for message_id in songs[:20]:
 
-                "SENT:",
-                message_id,
+            result = copy_music(
 
-                "MOOD:",
-                mood
+                chat_id,
+
+                message_id
 
             )
 
-            return True
+
+            if result.get("ok"):
+
+                send_message(
+
+                    chat_id,
+
+                    f"{MOOD_NAMES[mood]}\n\n"
+                    "🎧 Here's your track.",
+
+                    music_buttons()
+
+                )
+
+                return True
 
 
-        print(
+    # =====================================================
+    # SAD FALLBACK
+    #
+    # STRICTLY MELODIC DUBSTEP
+    #
+    # We NEVER send random genres for Sad.
+    # =====================================================
 
-            "COPY FAILED:",
-            message_id,
+    if mood == "sad":
 
-            result
+        melodic_songs = []
 
+
+        for message_id in MUSIC_IDS:
+
+            song = SONGS.get(
+                message_id,
+                {}
+            )
+
+
+            genre = song.get(
+                "genre",
+                ""
+            )
+
+
+            if genre == "melodic_dubstep":
+
+                melodic_songs.append(
+                    message_id
+                )
+
+
+        if melodic_songs:
+
+            random.shuffle(
+                melodic_songs
+            )
+
+
+            for message_id in melodic_songs[:20]:
+
+                result = copy_music(
+
+                    chat_id,
+
+                    message_id
+
+                )
+
+
+                if result.get("ok"):
+
+                    send_message(
+
+                        chat_id,
+
+                        "😢 SAD\n\n"
+                        "🎧 Melodic Dubstep for you.",
+
+                        music_buttons()
+
+                    )
+
+                    return True
+
+
+    # =====================================================
+    # LAST FALLBACK
+    #
+    # For OTHER moods only.
+    # =====================================================
+
+    if mood != "sad":
+
+        fallback = list(
+            MUSIC_IDS
         )
 
+
+        random.shuffle(
+            fallback
+        )
+
+
+        for message_id in fallback[:20]:
+
+            result = copy_music(
+
+                chat_id,
+
+                message_id
+
+            )
+
+
+            if result.get("ok"):
+
+                send_message(
+
+                    chat_id,
+
+                    f"{MOOD_NAMES[mood]}\n\n"
+                    "🎧 Here's a track from the collection.",
+
+                    music_buttons()
+
+                )
+
+                return True
+
+
+    # =====================================================
+    # NOTHING AVAILABLE
+    # =====================================================
 
     send_message(
 
         chat_id,
 
-        "❌ Couldn't send the music.\n"
-        "Please try again."
+        f"{MOOD_NAMES[mood]}\n\n"
+        "⚠️ No track is available yet."
 
     )
 
@@ -1061,7 +1228,7 @@ def send_music(
 
 
 # =========================================================
-# NEXT MUSIC
+# NEXT
 # =========================================================
 
 def send_next(
@@ -1085,10 +1252,21 @@ def send_next(
             chat_id,
 
             message_id
+
         )
 
 
         if result.get("ok"):
+
+            send_message(
+
+                chat_id,
+
+                "🔀 Next track 👇",
+
+                music_buttons()
+
+            )
 
             return True
 
@@ -1101,7 +1279,6 @@ def send_next(
 
     )
 
-
     return False
 
 
@@ -1111,29 +1288,27 @@ def send_next(
 
 def ask_ai(text):
 
-    if not ai_client:
+    if not ai:
 
         return (
-
-            "⚠️ AI is not connected.\n\n"
-            "You can still use the mood buttons."
-
+            "⚠️ AI is not connected.\n"
+            "Mood buttons are still available."
         )
 
 
     try:
 
-        response = ai_client.responses.create(
+        response = ai.responses.create(
 
             model="gpt-5-mini",
 
             instructions="""
 
-You are NOT YOUR VIBE MUSIC AI.
+You are NOT YOUR VIBE Music Assistant.
 
-Help users choose EDM music moods.
+Help users choose EDM moods.
 
-Moods:
+Available:
 
 😢 Sad
 ❤️ Love
@@ -1144,18 +1319,16 @@ Moods:
 🚗 Night Drive
 🌌 Melodic
 
-Important:
-
-Sad means:
+Sad specifically means:
 Melodic Dubstep + Emotional /
 Sad / Melancholic / Heartbreak /
 Lonely / Nostalgic.
 
 Understand Burmese and English.
 
-Keep answers concise.
+Be concise.
 
-Do not invent specific songs.
+Do not invent song names.
 
 """,
 
@@ -1174,9 +1347,8 @@ Do not invent specific songs.
             e
         )
 
-
         return (
-            "⚠️ AI is temporarily unavailable."
+            "⚠️ AI temporarily unavailable."
         )
 
 
@@ -1294,10 +1466,9 @@ def webhook():
 
 
             print(
-                "NEW CHANNEL POST:",
+                "NEW SONG:",
                 message_id
             )
-
 
             print(
                 "CAPTION:",
@@ -1305,7 +1476,7 @@ def webhook():
             )
 
 
-            add_new_song(
+            add_song(
 
                 message_id,
 
@@ -1344,10 +1515,6 @@ def webhook():
         ).strip()
 
 
-        # =================================================
-        # START
-        # =================================================
-
         if text == "/start":
 
             send_message(
@@ -1355,17 +1522,13 @@ def webhook():
                 chat_id,
 
                 "🎧 NOT YOUR VIBE MUSIC\n\n"
-                "Welcome! 🔥\n\n"
-                "Choose your mood below 👇",
+                "Welcome 🔥\n\n"
+                "Choose your mood 👇",
 
                 mood_menu()
 
             )
 
-
-        # =================================================
-        # MOOD
-        # =================================================
 
         elif text == "/mood":
 
@@ -1380,10 +1543,6 @@ def webhook():
             )
 
 
-        # =================================================
-        # AI
-        # =================================================
-
         elif text == "/ai":
 
             send_message(
@@ -1393,15 +1552,10 @@ def webhook():
                 "🤖 AI MUSIC ASSISTANT\n\n"
                 "Tell me what you're feeling.\n\n"
                 "Example:\n"
-                "I'm lonely tonight and want "
-                "emotional music."
+                "I'm lonely tonight."
 
             )
 
-
-        # =================================================
-        # HELP
-        # =================================================
 
         elif text == "/help":
 
@@ -1410,21 +1564,17 @@ def webhook():
                 chat_id,
 
                 "🎧 NOT YOUR VIBE MUSIC BOT\n\n"
-                "/start — Start\n"
-                "/mood — Choose Mood\n"
-                "/ai — AI Assistant\n"
-                "/help — Help"
+                "/start - Start\n"
+                "/mood - Mood\n"
+                "/ai - AI\n"
+                "/help - Help"
 
             )
 
 
-        # =================================================
-        # NORMAL TEXT
-        # =================================================
-
         elif text:
 
-            response = ask_ai(
+            answer = ask_ai(
                 text
             )
 
@@ -1434,7 +1584,7 @@ def webhook():
                 chat_id,
 
                 "🤖 AI Music Assistant\n\n"
-                + response,
+                + answer,
 
                 mood_menu()
 
@@ -1488,7 +1638,7 @@ def webhook():
 
 
         # =================================================
-        # AI HELP
+        # AI
         # =================================================
 
         if data == "ai_help":
@@ -1509,8 +1659,7 @@ def webhook():
                 "🤖 AI MUSIC ASSISTANT\n\n"
                 "Tell me what you're feeling.\n\n"
                 "Example:\n"
-                "I want emotional music "
-                "for a night drive."
+                "I want emotional music."
 
             )
 
@@ -1525,7 +1674,7 @@ def webhook():
 
                 callback_id,
 
-                "🎧 Choose another mood"
+                "🎧 Choose mood"
 
             )
 
@@ -1551,24 +1700,14 @@ def webhook():
 
                 callback_id,
 
-                "🔀 Finding another track..."
+                "🔀 Finding next..."
 
             )
 
 
-            if send_next(
+            send_next(
                 chat_id
-            ):
-
-                send_message(
-
-                    chat_id,
-
-                    "🔀 Next track 👇",
-
-                    music_buttons()
-
-                )
+            )
 
 
         # =================================================
@@ -1608,31 +1747,20 @@ def webhook():
             )
 
 
-            if send_music(
+            send_mood_music(
 
                 chat_id,
 
                 mood
 
-            ):
-
-                send_message(
-
-                    chat_id,
-
-                    f"{MOOD_NAMES[mood]}\n\n"
-                    "🎧 Here's your matching track.",
-
-                    music_buttons()
-
-                )
+            )
 
 
     return "OK"
 
 
 # =========================================================
-# WEBHOOK SETUP
+# WEBHOOK
 # =========================================================
 
 if BOT_TOKEN and RENDER_URL:
@@ -1656,11 +1784,8 @@ if BOT_TOKEN and RENDER_URL:
                 "allowed_updates": [
 
                     "message",
-
                     "callback_query",
-
                     "channel_post",
-
                     "edited_channel_post"
 
                 ]
@@ -1687,11 +1812,8 @@ if BOT_TOKEN and RENDER_URL:
 
 
 # =========================================================
-# START
+# RUN
 # =========================================================
-
-rebuild_database()
-
 
 if __name__ == "__main__":
 
