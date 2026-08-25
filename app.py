@@ -1,5 +1,3 @@
-NOT YOUR VIBE Music Bot — Final Version
-
 import os
 import random
 import threading
