@@ -1,10 +1,10 @@
 import os
 import random
 import threading
+import time
 import requests
 
 from flask import Flask, request
-from openai import OpenAI
 
 
 # =========================================================
@@ -18,9 +18,8 @@ app = Flask(__name__)
 # ENVIRONMENT
 # =========================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 CHANNEL_USERNAME = "@notyourvibemp3collection"
 
@@ -29,53 +28,26 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # =========================================================
 # HTTP SESSION
-# Faster than creating a new connection every request
+# Reuse one connection -> faster requests
 # =========================================================
 
-session = requests.Session()
+http = requests.Session()
+
+http.headers.update({
+    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT"
+})
 
 
 # =========================================================
-# OPENAI
-# AI is ONLY for /ai
-# Mood buttons do NOT depend on AI
+# LOCK
 # =========================================================
 
-ai_client = None
-
-if OPENAI_API_KEY:
-
-    try:
-
-        ai_client = OpenAI(
-            api_key=OPENAI_API_KEY
-        )
-
-        print("OPENAI: CONNECTED")
-
-    except Exception as e:
-
-        print(
-            "OPENAI ERROR:",
-            e
-        )
+send_lock = threading.Lock()
 
 
 # =========================================================
 # MOODS
 # =========================================================
-
-MOODS = [
-    "sad",
-    "love",
-    "chill",
-    "hype",
-    "dark",
-    "energetic",
-    "night",
-    "melodic"
-]
-
 
 MOOD_NAMES = {
 
@@ -98,18 +70,62 @@ MOOD_NAMES = {
 }
 
 
+MOODS = [
+    "sad",
+    "love",
+    "chill",
+    "hype",
+    "dark",
+    "energetic",
+    "night",
+    "melodic"
+]
+
+
 # =========================================================
-# MOOD MUSIC DATABASE
+# =========================================================
+# MUSIC DATABASE
+# =========================================================
 #
 # IMPORTANT:
-# These are direct Telegram message IDs.
-# NO AI ANALYSIS.
+#
+# ဒီ database က AI မဟုတ်ပါ။
+#
+# မင်းပေးထားတဲ့ list အတိုင်း manual mood database ဖြစ်ပါတယ်။
+#
+# ဒါကြောင့်
+#
+# "Sad collection is still being analyzed"
+#
+# ဆိုတာ မရှိတော့ပါ။
 # =========================================================
+
 
 MOOD_MUSIC = {
 
     # =====================================================
-    # SAD + CHILL + MELODIC
+    # 😢 SAD
+    # =====================================================
+    #
+    # Sad mood
+    # Chill mood
+    # Melodic
+    #
+    # User supplied:
+    #
+    # 543
+    # 1594
+    # 1844
+    # 2105
+    # 2621
+    # 2406
+    # 2316
+    # 2286
+    # 2713
+    # 2553
+    # 553
+    # 557
+    #
     # =====================================================
 
     "sad": [
@@ -130,6 +146,10 @@ MOOD_MUSIC = {
     ],
 
 
+    # =====================================================
+    # ❤️ LOVE
+    # =====================================================
+
     "love": [
 
         2366,
@@ -143,20 +163,11 @@ MOOD_MUSIC = {
     ],
 
 
-    "chill": [
+    # =====================================================
+    # 🌙 CHILL
+    # =====================================================
 
-        543,
-        1594,
-        1844,
-        2105,
-        2621,
-        2406,
-        2316,
-        2286,
-        2713,
-        2553,
-        553,
-        557,
+    "chill": [
 
         2849,
         2859,
@@ -169,7 +180,7 @@ MOOD_MUSIC = {
 
 
     # =====================================================
-    # HYPE + ENERGETIC
+    # 🔥 HYPE
     # =====================================================
 
     "hype": [
@@ -203,6 +214,38 @@ MOOD_MUSIC = {
 
     ],
 
+
+    # =====================================================
+    # 🖤 DARK
+    # =====================================================
+
+    "dark": [
+
+        1603,
+        2752,
+        2742,
+        2732,
+        2722,
+        2693,
+        2675,
+        2602,
+        2592,
+        2516,
+        2486,
+        2476,
+        2396,
+        2376,
+        2336,
+        2186,
+        2176,
+        2156
+
+    ],
+
+
+    # =====================================================
+    # ⚡ ENERGETIC
+    # =====================================================
 
     "energetic": [
 
@@ -256,35 +299,7 @@ MOOD_MUSIC = {
 
 
     # =====================================================
-    # DARK + ENERGETIC
-    # =====================================================
-
-    "dark": [
-
-        1603,
-        2752,
-        2742,
-        2732,
-        2722,
-        2693,
-        2675,
-        2602,
-        2592,
-        2516,
-        2486,
-        2476,
-        2396,
-        2376,
-        2336,
-        2186,
-        2176,
-        2156
-
-    ],
-
-
-    # =====================================================
-    # NIGHT DRIVE + MELODIC
+    # 🚗 NIGHT DRIVE
     # =====================================================
 
     "night": [
@@ -297,6 +312,10 @@ MOOD_MUSIC = {
 
     ],
 
+
+    # =====================================================
+    # 🌌 MELODIC
+    # =====================================================
 
     "melodic": [
 
@@ -339,7 +358,6 @@ for mood in MOODS:
 
 # =========================================================
 # ALL MUSIC
-# Used ONLY for Next button
 # =========================================================
 
 ALL_MUSIC = []
@@ -359,6 +377,17 @@ ALL_MUSIC = list(
 
 
 # =========================================================
+# USER STATE
+#
+# User တစ်ယောက်ချင်းစီ ဘယ် mood ရွေးထားလဲ မှတ်ထားမယ်။
+#
+# Next နှိပ်ရင် အဲဒီ mood ထဲကပဲ ဆက်ရွေးမယ်။
+# =========================================================
+
+USER_STATE = {}
+
+
+# =========================================================
 # TELEGRAM API
 # =========================================================
 
@@ -368,9 +397,21 @@ def telegram(
     timeout=10
 ):
 
+    if not BOT_TOKEN:
+
+        print(
+            "ERROR: BOT_TOKEN is missing"
+        )
+
+        return {
+            "ok": False,
+            "description": "BOT_TOKEN missing"
+        }
+
+
     try:
 
-        response = session.post(
+        response = http.post(
 
             f"{TELEGRAM_API}/{method}",
 
@@ -380,21 +421,18 @@ def telegram(
 
         )
 
+
         result = response.json()
 
-        print(
-            method,
-            result.get(
-                "ok"
-            )
-        )
 
         if not result.get("ok"):
 
             print(
-                "TELEGRAM ERROR:",
+                "Telegram API error:",
+                method,
                 result
             )
+
 
         return result
 
@@ -402,15 +440,15 @@ def telegram(
     except Exception as e:
 
         print(
-            "TELEGRAM REQUEST ERROR:",
+            "Telegram request error:",
             method,
             e
         )
 
+
         return {
 
-            "ok":
-                False,
+            "ok": False,
 
             "description":
                 str(e)
@@ -425,7 +463,7 @@ def telegram(
 def send_message(
     chat_id,
     text,
-    reply_markup=None
+    keyboard=None
 ):
 
     data = {
@@ -439,23 +477,24 @@ def send_message(
     }
 
 
-    if reply_markup:
+    if keyboard is not None:
 
-        data[
-            "reply_markup"
-        ] = reply_markup
+        data["reply_markup"] = keyboard
 
 
     return telegram(
+
         "sendMessage",
-        data
+
+        data,
+
+        timeout=10
+
     )
 
 
 # =========================================================
-# CALLBACK ANSWER
-#
-# Must be called quickly
+# ANSWER CALLBACK
 # =========================================================
 
 def answer_callback(
@@ -483,7 +522,7 @@ def answer_callback(
 
 
 # =========================================================
-# COPY MUSIC
+# COPY MUSIC FROM CHANNEL
 # =========================================================
 
 def copy_music(
@@ -601,22 +640,9 @@ def mood_menu():
                         "mood_melodic"
                 }
 
-            ],
-
-            [
-
-                {
-                    "text":
-                        "🤖 Ask AI",
-
-                    "callback_data":
-                        "ai_help"
-                }
-
             ]
 
         ]
-
     }
 
 
@@ -658,37 +684,311 @@ def music_buttons():
 
                 {
                     "text":
-                        "🤖 Ask AI",
+                        "🏠 Mood Menu",
 
                     "callback_data":
-                        "ai_help"
+                        "change_mood"
                 }
 
             ]
 
         ]
-
     }
 
 
 # =========================================================
-# SEND MOOD MUSIC
-#
-# NO AI
-# NO ANALYSIS
-# DIRECT MESSAGE ID
+# GET SONGS FOR MOOD
 # =========================================================
 
-def send_mood_music(
-    chat_id,
+def get_mood_songs(
     mood
 ):
 
-    songs = list(
+    return list(
         MOOD_MUSIC.get(
             mood,
             []
         )
+    )
+
+
+# =========================================================
+# PICK SONG
+#
+# same song immediately repeat မဖြစ်အောင်
+# last song ကို exclude လုပ်ထားမယ်။
+# =========================================================
+
+def pick_song(
+    chat_id,
+    mood
+):
+
+    songs = get_mood_songs(
+        mood
+    )
+
+
+    if not songs:
+
+        return None
+
+
+    previous = (
+        USER_STATE
+        .get(
+            chat_id,
+            {}
+        )
+        .get(
+            "last_song"
+        )
+    )
+
+
+    if len(songs) > 1:
+
+        candidates = [
+
+            song
+
+            for song in songs
+
+            if song != previous
+
+        ]
+
+    else:
+
+        candidates = songs
+
+
+    if not candidates:
+
+        candidates = songs
+
+
+    return random.choice(
+        candidates
+    )
+
+
+# =========================================================
+# SEND MOOD TRACK
+# =========================================================
+
+def send_mood_track(
+    chat_id,
+    mood
+):
+
+    songs = get_mood_songs(
+        mood
+    )
+
+
+    # =====================================================
+    # NO SONG
+    # =====================================================
+
+    if not songs:
+
+        send_message(
+
+            chat_id,
+
+            f"{MOOD_NAMES[mood]}\n\n"
+            "⚠️ ဒီ mood အတွက် track မရှိသေးပါ။",
+
+            mood_menu()
+
+        )
+
+        return
+
+
+    # =====================================================
+    # PICK
+    # =====================================================
+
+    message_id = pick_song(
+
+        chat_id,
+
+        mood
+
+    )
+
+
+    if message_id is None:
+
+        send_message(
+
+            chat_id,
+
+            "❌ Track ရွေးလို့မရပါ။",
+
+            mood_menu()
+
+        )
+
+        return
+
+
+    # =====================================================
+    # COPY
+    # =====================================================
+
+    result = copy_music(
+
+        chat_id,
+
+        message_id
+
+    )
+
+
+    # =====================================================
+    # SUCCESS
+    # =====================================================
+
+    if result.get("ok"):
+
+        USER_STATE[chat_id] = {
+
+            "mood":
+                mood,
+
+            "last_song":
+                message_id
+
+        }
+
+
+        print(
+
+            "MUSIC SENT",
+
+            "| chat:",
+            chat_id,
+
+            "| mood:",
+            mood,
+
+            "| message:",
+            message_id
+
+        )
+
+
+        send_message(
+
+            chat_id,
+
+            f"{MOOD_NAMES[mood]}\n\n"
+            "🎧 Enjoy your music! 🔥",
+
+            music_buttons()
+
+        )
+
+
+        return
+
+
+    # =====================================================
+    # FAILURE
+    # =====================================================
+
+    print(
+
+        "COPY FAILED",
+
+        "| mood:",
+        mood,
+
+        "| message:",
+        message_id,
+
+        "| result:",
+        result
+
+    )
+
+
+    send_message(
+
+        chat_id,
+
+        f"{MOOD_NAMES[mood]}\n\n"
+        "❌ ဒီ track ကို channel ကနေ "
+        "copy လုပ်လို့မရပါ။\n\n"
+        "Bot ရဲ့ channel permission / "
+        "Message ID ကိုစစ်ပါ။",
+
+        mood_menu()
+
+    )
+
+
+# =========================================================
+# NEXT TRACK
+#
+# IMPORTANT:
+#
+# Next = လက်ရှိရွေးထားတဲ့ mood ထဲကပဲ
+# =========================================================
+
+def send_next_track(
+    chat_id
+):
+
+    state = USER_STATE.get(
+        chat_id
+    )
+
+
+    # =====================================================
+    # User hasn't selected mood
+    # =====================================================
+
+    if not state:
+
+        send_message(
+
+            chat_id,
+
+            "🎧 အရင်ဆုံး Mood တစ်ခုရွေးပါ 👇",
+
+            mood_menu()
+
+        )
+
+        return
+
+
+    mood = state.get(
+        "mood"
+    )
+
+
+    if mood not in MOODS:
+
+        send_message(
+
+            chat_id,
+
+            "🎧 Mood ရွေးပါ 👇",
+
+            mood_menu()
+
+        )
+
+        return
+
+
+    songs = get_mood_songs(
+        mood
     )
 
 
@@ -698,34 +998,59 @@ def send_mood_music(
 
             chat_id,
 
-            f"{MOOD_NAMES.get(mood, mood)}\n\n"
-            "⚠️ ဒီ mood collection ထဲမှာ "
-            "သီချင်းမရှိသေးပါ။"
+            f"{MOOD_NAMES[mood]}\n\n"
+            "⚠️ ဒီ mood မှာ track မရှိသေးပါ။",
+
+            mood_menu()
 
         )
 
         return
 
 
-    # Random order
+    previous = state.get(
+        "last_song"
+    )
+
+
+    # =====================================================
+    # Don't immediately repeat
+    # =====================================================
+
+    if len(songs) > 1:
+
+        candidates = [
+
+            song
+
+            for song in songs
+
+            if song != previous
+
+        ]
+
+    else:
+
+        candidates = songs
+
+
+    # =====================================================
+    # Randomize
+    # =====================================================
+
     random.shuffle(
-        songs
-    )
-
-
-    print(
-        "MOOD:",
-        mood,
-        "SONGS:",
-        songs
+        candidates
     )
 
 
     # =====================================================
-    # Try songs until one works
+    # Try songs until successful
+    #
+    # Channel မှာ deleted / inaccessible ID ရှိနေရင်
+    # နောက် ID ကိုဆက်စမ်းမယ်။
     # =====================================================
 
-    for message_id in songs:
+    for message_id in candidates:
 
         result = copy_music(
 
@@ -738,10 +1063,30 @@ def send_mood_music(
 
         if result.get("ok"):
 
+            USER_STATE[chat_id] = {
+
+                "mood":
+                    mood,
+
+                "last_song":
+                    message_id
+
+            }
+
+
             print(
-                "MUSIC SENT:",
+
+                "NEXT SENT",
+
+                "| chat:",
+                chat_id,
+
+                "| mood:",
                 mood,
+
+                "| message:",
                 message_id
+
             )
 
 
@@ -750,7 +1095,7 @@ def send_mood_music(
                 chat_id,
 
                 f"{MOOD_NAMES[mood]}\n\n"
-                "🎧 Enjoy your music! 🔥",
+                "🔀 Next track 👇",
 
                 music_buttons()
 
@@ -762,17 +1107,19 @@ def send_mood_music(
 
         print(
 
-            "COPY FAILED:",
-            message_id,
-            result.get(
-                "description"
-            )
+            "NEXT FAILED",
+
+            "| mood:",
+            mood,
+
+            "| message:",
+            message_id
 
         )
 
 
     # =====================================================
-    # Nothing worked
+    # NOTHING WORKED
     # =====================================================
 
     send_message(
@@ -780,159 +1127,16 @@ def send_mood_music(
         chat_id,
 
         f"{MOOD_NAMES[mood]}\n\n"
-        "❌ ဒီ collection ထဲက "
-        "သီချင်းတွေကို copy မလုပ်နိုင်ပါ။\n\n"
-        "Bot က channel ကို access လုပ်နိုင်/မလုပ်နိုင် "
-        "စစ်ပေးပါ။"
+        "❌ ဒီ mood ထဲက track တွေကို "
+        "channel ကနေ copy မလုပ်နိုင်ပါ။",
+
+        mood_menu()
 
     )
 
 
 # =========================================================
-# NEXT MUSIC
-# =========================================================
-
-def send_next_music(
-    chat_id
-):
-
-    songs = list(
-        ALL_MUSIC
-    )
-
-
-    if not songs:
-
-        send_message(
-
-            chat_id,
-
-            "❌ Music collection empty."
-
-        )
-
-        return
-
-
-    random.shuffle(
-        songs
-    )
-
-
-    for message_id in songs:
-
-        result = copy_music(
-
-            chat_id,
-
-            message_id
-
-        )
-
-
-        if result.get("ok"):
-
-            send_message(
-
-                chat_id,
-
-                "🔀 Next track 👇",
-
-                music_buttons()
-
-            )
-
-            return
-
-
-    send_message(
-
-        chat_id,
-
-        "❌ Couldn't send next track."
-
-    )
-
-
-# =========================================================
-# AI CHAT
-#
-# AI is completely separate from mood buttons.
-# =========================================================
-
-def ask_ai(
-    text
-):
-
-    if not ai_client:
-
-        return (
-
-            "⚠️ AI is not connected.\n\n"
-            "You can still use all mood buttons."
-
-        )
-
-
-    try:
-
-        response = ai_client.responses.create(
-
-            model="gpt-5-mini",
-
-            instructions="""
-
-You are NOT YOUR VIBE Music Assistant.
-
-Understand Burmese and English.
-
-Available moods:
-
-😢 Sad
-❤️ Love
-🌙 Chill
-🔥 Hype
-🖤 Dark
-⚡ Energetic
-🚗 Night Drive
-🌌 Melodic
-
-SAD means emotional,
-melancholic, heartbreak,
-lonely, nostalgic music.
-
-Give short useful answers.
-
-Do not invent songs.
-
-""",
-
-            input=text
-
-        )
-
-
-        return response.output_text
-
-
-    except Exception as e:
-
-        print(
-            "AI ERROR:",
-            e
-        )
-
-
-        return (
-            "⚠️ AI temporarily unavailable."
-        )
-
-
-# =========================================================
-# BACKGROUND TASK
-#
-# Webhook responds immediately.
-# Music sending happens separately.
+# BACKGROUND MOOD
 # =========================================================
 
 def background_mood(
@@ -942,9 +1146,12 @@ def background_mood(
 
     try:
 
-        send_mood_music(
+        send_mood_track(
+
             chat_id,
+
             mood
+
         )
 
     except Exception as e:
@@ -955,14 +1162,20 @@ def background_mood(
         )
 
 
+# =========================================================
+# BACKGROUND NEXT
+# =========================================================
+
 def background_next(
     chat_id
 ):
 
     try:
 
-        send_next_music(
+        send_next_track(
+
             chat_id
+
         )
 
     except Exception as e:
@@ -984,7 +1197,7 @@ def background_next(
 def home():
 
     return (
-        "NOT YOUR VIBE MUSIC BOT - ONLINE"
+        "NOT YOUR VIBE MUSIC BOT ONLINE"
     )
 
 
@@ -1022,91 +1235,6 @@ def webhook():
 
 
     # =====================================================
-    # CHANNEL POST
-    #
-    # We receive it only to log new songs.
-    # Mood database is manually controlled above.
-    # =====================================================
-
-    channel_post = update.get(
-        "channel_post"
-    )
-
-
-    if channel_post:
-
-        chat = channel_post.get(
-            "chat",
-            {}
-        )
-
-
-        username = (
-
-            chat.get(
-                "username",
-                ""
-            )
-
-            or ""
-
-        ).lower()
-
-
-        expected = (
-
-            CHANNEL_USERNAME
-            .replace(
-                "@",
-                ""
-            )
-            .lower()
-
-        )
-
-
-        if username == expected:
-
-            message_id = (
-                channel_post.get(
-                    "message_id"
-                )
-            )
-
-
-            caption = (
-
-                channel_post.get(
-                    "caption",
-                    ""
-                )
-
-                or channel_post.get(
-                    "text",
-                    ""
-                )
-
-                or ""
-
-            )
-
-
-            print(
-                "NEW CHANNEL POST:",
-                message_id
-            )
-
-
-            print(
-                "CAPTION:",
-                caption
-            )
-
-
-        return "OK"
-
-
-    # =====================================================
     # CALLBACK QUERY
     # =====================================================
 
@@ -1117,55 +1245,63 @@ def webhook():
 
     if callback:
 
-        callback_id = (
-            callback.get(
-                "id"
-            )
+        callback_id = callback.get(
+            "id"
+        )
+
+
+        data = callback.get(
+            "data",
+            ""
         )
 
 
         callback_message = (
             callback.get(
-                "message",
-                {}
+                "message"
             )
+            or {}
         )
 
 
-        chat = (
-            callback_message.get(
-                "chat",
-                {}
+        callback_chat = (
+            callback_message
+            .get(
+                "chat"
             )
+            or {}
         )
 
 
-        chat_id = chat.get(
+        chat_id = callback_chat.get(
             "id"
         )
 
 
-        data = (
-            callback.get(
-                "data",
-                ""
+        if not chat_id:
+
+            answer_callback(
+
+                callback_id,
+
+                "Chat not found"
+
             )
-        )
+
+            return "OK"
 
 
         # =================================================
-        # MOOD BUTTON
+        # MOOD
         # =================================================
 
         if data.startswith(
             "mood_"
         ):
 
-            mood = data.replace(
-                "mood_",
-                "",
-                1
-            )
+            mood = data[
+                len("mood_"):
+            ]
 
 
             if mood not in MOODS:
@@ -1182,21 +1318,38 @@ def webhook():
 
 
             # =================================================
-            # IMPORTANT:
-            # Answer button immediately.
+            # SAVE MOOD IMMEDIATELY
+            # =================================================
+
+            USER_STATE.setdefault(
+
+                chat_id,
+
+                {}
+
+            )
+
+
+            USER_STATE[chat_id][
+                "mood"
+            ] = mood
+
+
+            # =================================================
+            # FAST CALLBACK
             # =================================================
 
             answer_callback(
 
                 callback_id,
 
-                f"{MOOD_NAMES[mood]} selected!"
+                f"{MOOD_NAMES[mood]} ✓"
 
             )
 
 
             # =================================================
-            # Send music in background
+            # MUSIC IN BACKGROUND
             # =================================================
 
             threading.Thread(
@@ -1204,8 +1357,11 @@ def webhook():
                 target=background_mood,
 
                 args=(
+
                     chat_id,
+
                     mood
+
                 ),
 
                 daemon=True
@@ -1226,7 +1382,7 @@ def webhook():
 
                 callback_id,
 
-                "🔀 Finding next track..."
+                "🔀 Finding next..."
 
             )
 
@@ -1236,7 +1392,9 @@ def webhook():
                 target=background_next,
 
                 args=(
+
                     chat_id,
+
                 ),
 
                 daemon=True
@@ -1257,7 +1415,7 @@ def webhook():
 
                 callback_id,
 
-                "🎧 Choose a mood"
+                "🎧 Choose mood"
 
             )
 
@@ -1269,39 +1427,6 @@ def webhook():
                 "🎧 Choose your mood 👇",
 
                 mood_menu()
-
-            )
-
-
-            return "OK"
-
-
-        # =================================================
-        # AI HELP
-        # =================================================
-
-        if data == "ai_help":
-
-            answer_callback(
-
-                callback_id,
-
-                "🤖 Ask AI"
-
-            )
-
-
-            send_message(
-
-                chat_id,
-
-                "🤖 AI MUSIC ASSISTANT\n\n"
-                "Tell me what you're feeling.\n\n"
-                "Examples:\n"
-                "• I'm sad tonight\n"
-                "• I want emotional music\n"
-                "• Give me night drive music\n"
-                "• I want dark bass"
 
             )
 
@@ -1323,21 +1448,21 @@ def webhook():
 
     if message:
 
-        chat_id = (
-            message
-            .get(
-                "chat",
-                {}
-            )
-            .get(
-                "id"
-            )
+        chat = message.get(
+            "chat",
+            {}
+        )
+
+
+        chat_id = chat.get(
+            "id"
         )
 
 
         text = (
 
-            message.get(
+            message
+            .get(
                 "text",
                 ""
             )
@@ -1359,7 +1484,7 @@ def webhook():
 
                 "🎧 NOT YOUR VIBE MUSIC\n\n"
                 "Welcome! 🔥\n\n"
-                "Choose your mood 👇",
+                "Choose your mood below 👇",
 
                 mood_menu()
 
@@ -1388,27 +1513,6 @@ def webhook():
 
 
         # =================================================
-        # AI
-        # =================================================
-
-        if text == "/ai":
-
-            send_message(
-
-                chat_id,
-
-                "🤖 AI MUSIC ASSISTANT\n\n"
-                "Tell me what you're feeling.\n\n"
-                "Example:\n"
-                "I want emotional music for a "
-                "night drive."
-
-            )
-
-            return "OK"
-
-
-        # =================================================
         # HELP
         # =================================================
 
@@ -1419,10 +1523,12 @@ def webhook():
                 chat_id,
 
                 "🎧 NOT YOUR VIBE MUSIC BOT\n\n"
-                "/start - Start\n"
-                "/mood - Choose mood\n"
-                "/ai - AI Assistant\n"
-                "/help - Help"
+
+                "/start - Start bot\n"
+                "/mood - Mood menu\n"
+                "/help - Help\n\n"
+
+                "🎵 Select a mood to receive music."
 
             )
 
@@ -1430,33 +1536,34 @@ def webhook():
 
 
         # =================================================
-        # AI CHAT
+        # NEXT COMMAND
         # =================================================
 
-        if text:
+        if text == "/next":
 
-            answer = ask_ai(
-                text
-            )
+            threading.Thread(
+
+                target=background_next,
+
+                args=(
+
+                    chat_id,
+
+                ),
+
+                daemon=True
+
+            ).start()
 
 
-            send_message(
-
-                chat_id,
-
-                "🤖 AI Music Assistant\n\n"
-                + answer,
-
-                mood_menu()
-
-            )
+            return "OK"
 
 
     return "OK"
 
 
 # =========================================================
-# WEBHOOK SETUP
+# SET WEBHOOK
 # =========================================================
 
 def setup_webhook():
@@ -1464,7 +1571,7 @@ def setup_webhook():
     if not BOT_TOKEN:
 
         print(
-            "ERROR: BOT_TOKEN missing"
+            "❌ BOT_TOKEN is missing"
         )
 
         return
@@ -1473,7 +1580,7 @@ def setup_webhook():
     if not RENDER_URL:
 
         print(
-            "ERROR: RENDER_EXTERNAL_URL missing"
+            "❌ RENDER_EXTERNAL_URL is missing"
         )
 
         return
@@ -1484,134 +1591,116 @@ def setup_webhook():
     )
 
 
-    try:
+    result = telegram(
 
-        result = telegram(
+        "setWebhook",
 
-            "setWebhook",
+        {
 
-            {
+            "url":
+                webhook_url,
 
-                "url":
-                    webhook_url,
+            "allowed_updates": [
 
-                "allowed_updates": [
+                "message",
 
-                    "message",
+                "callback_query"
 
-                    "callback_query",
+            ],
 
-                    "channel_post"
+            "max_connections":
+                40,
 
-                ],
+            "drop_pending_updates":
+                True
 
-                "max_connections":
-                    40,
+        },
 
-                "drop_pending_updates":
-                    False
+        timeout=15
 
-            },
-
-            timeout=15
-
-        )
+    )
 
 
-        print(
-            "WEBHOOK:",
-            result
-        )
-
-
-    except Exception as e:
-
-        print(
-            "WEBHOOK SETUP ERROR:",
-            e
-        )
+    print(
+        "WEBHOOK:",
+        result
+    )
 
 
 # =========================================================
-# RUN
+# START
 # =========================================================
 
 if __name__ == "__main__":
 
+    print(
+        "=========================================="
+    )
+
+    print(
+        "🎧 NOT YOUR VIBE MUSIC BOT"
+    )
+
+    print(
+        "=========================================="
+    )
+
+
+    print(
+        "Channel:",
+        CHANNEL_USERNAME
+    )
+
+
+    print(
+        "Total unique tracks:",
+        len(ALL_MUSIC)
+    )
+
+
+    for mood in MOODS:
+
+        print(
+
+            MOOD_NAMES[mood],
+            "=",
+            len(
+                MOOD_MUSIC[mood]
+            ),
+            "tracks"
+
+        )
+
+
+    print(
+        "=========================================="
+    )
+
+
+    # =====================================================
+    # WEBHOOK
+    # =====================================================
+
     setup_webhook()
 
 
+    # =====================================================
+    # PORT
+    # =====================================================
+
     port = int(
 
-        os.environ.get(
+        os.getenv(
             "PORT",
-            10000
+            "10000"
         )
 
     )
 
 
-    print(
-        "================================="
-    )
-
-    print(
-        "NOT YOUR VIBE MUSIC BOT"
-    )
-
-    print(
-        "STATUS: ONLINE"
-    )
-
-    print(
-        "MUSIC COUNT:",
-        len(ALL_MUSIC)
-    )
-
-    print(
-        "SAD COUNT:",
-        len(MOOD_MUSIC["sad"])
-    )
-
-    print(
-        "LOVE COUNT:",
-        len(MOOD_MUSIC["love"])
-    )
-
-    print(
-        "CHILL COUNT:",
-        len(MOOD_MUSIC["chill"])
-    )
-
-    print(
-        "HYPE COUNT:",
-        len(MOOD_MUSIC["hype"])
-    )
-
-    print(
-        "DARK COUNT:",
-        len(MOOD_MUSIC["dark"])
-    )
-
-    print(
-        "ENERGETIC COUNT:",
-        len(MOOD_MUSIC["energetic"])
-    )
-
-    print(
-        "NIGHT COUNT:",
-        len(MOOD_MUSIC["night"])
-    )
-
-    print(
-        "MELODIC COUNT:",
-        len(MOOD_MUSIC["melodic"])
-    )
-
-    print(
-        "================================="
-    )
-
+    # =====================================================
+    # RUN
+    # =====================================================
 
     app.run(
 
@@ -1621,4 +1710,4 @@ if __name__ == "__main__":
 
         threaded=True
 
-    )
+)
