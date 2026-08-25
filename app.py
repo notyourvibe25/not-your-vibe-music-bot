@@ -1,7 +1,8 @@
+NOT YOUR VIBE Music Bot — Final Version
+
 import os
 import random
 import threading
-import time
 import requests
 
 from flask import Flask, request
@@ -23,31 +24,47 @@ RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 CHANNEL_USERNAME = "@notyourvibemp3collection"
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}"
+)
 
 
 # =========================================================
 # HTTP SESSION
-# Reuse one connection -> faster requests
 # =========================================================
 
 http = requests.Session()
 
 http.headers.update({
-    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT"
+    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT/1.0"
 })
 
 
 # =========================================================
-# LOCK
+# STATE LOCK
+#
+# လူအများသုံးတဲ့အချိန် user state ကို
+# တစ်ချိန်တည်း update လုပ်ပြီး conflict မဖြစ်အောင်
 # =========================================================
 
-send_lock = threading.Lock()
+STATE_LOCK = threading.RLock()
 
 
 # =========================================================
 # MOODS
 # =========================================================
+
+MOODS = [
+    "sad",
+    "love",
+    "chill",
+    "hype",
+    "dark",
+    "energetic",
+    "night",
+    "melodic"
+]
+
 
 MOOD_NAMES = {
 
@@ -70,34 +87,16 @@ MOOD_NAMES = {
 }
 
 
-MOODS = [
-    "sad",
-    "love",
-    "chill",
-    "hype",
-    "dark",
-    "energetic",
-    "night",
-    "melodic"
-]
-
-
 # =========================================================
 # =========================================================
-# MUSIC DATABASE
+# MANUAL MOOD DATABASE
 # =========================================================
 #
-# IMPORTANT:
+# ဒီနေရာမှာ AI မပါပါ။
 #
-# ဒီ database က AI မဟုတ်ပါ။
+# မင်းပေးထားတဲ့ Message ID တွေကို
+# Mood အလိုက် တိတိကျကျ သတ်မှတ်ထားပါတယ်။
 #
-# မင်းပေးထားတဲ့ list အတိုင်း manual mood database ဖြစ်ပါတယ်။
-#
-# ဒါကြောင့်
-#
-# "Sad collection is still being analyzed"
-#
-# ဆိုတာ မရှိတော့ပါ။
 # =========================================================
 
 
@@ -105,27 +104,7 @@ MOOD_MUSIC = {
 
     # =====================================================
     # 😢 SAD
-    # =====================================================
-    #
-    # Sad mood
-    # Chill mood
-    # Melodic
-    #
-    # User supplied:
-    #
-    # 543
-    # 1594
-    # 1844
-    # 2105
-    # 2621
-    # 2406
-    # 2316
-    # 2286
-    # 2713
-    # 2553
-    # 553
-    # 557
-    #
+    # Sad + Chill + Melodic collection
     # =====================================================
 
     "sad": [
@@ -148,6 +127,7 @@ MOOD_MUSIC = {
 
     # =====================================================
     # ❤️ LOVE
+    # Love + Chill
     # =====================================================
 
     "love": [
@@ -165,6 +145,10 @@ MOOD_MUSIC = {
 
     # =====================================================
     # 🌙 CHILL
+    #
+    # Chill list ထဲမှာ
+    # Sad collection က songs မထည့်ထားပါ။
+    # မင်းပေးထားတဲ့ Chill list ကိုပဲ သုံးမယ်။
     # =====================================================
 
     "chill": [
@@ -360,18 +344,11 @@ for mood in MOODS:
 # ALL MUSIC
 # =========================================================
 
-ALL_MUSIC = []
-
-for mood in MOODS:
-
-    ALL_MUSIC.extend(
-        MOOD_MUSIC[mood]
-    )
-
-
-ALL_MUSIC = list(
-    dict.fromkeys(
-        ALL_MUSIC
+ALL_MUSIC = sorted(
+    set(
+        song
+        for mood in MOODS
+        for song in MOOD_MUSIC[mood]
     )
 )
 
@@ -379,12 +356,34 @@ ALL_MUSIC = list(
 # =========================================================
 # USER STATE
 #
-# User တစ်ယောက်ချင်းစီ ဘယ် mood ရွေးထားလဲ မှတ်ထားမယ်။
+# {
+#     chat_id: {
 #
-# Next နှိပ်ရင် အဲဒီ mood ထဲကပဲ ဆက်ရွေးမယ်။
+#         "mood": "sad",
+#
+#         "history": [
+#             543,
+#             1594,
+#             ...
+#         ]
+#
+#     }
+# }
+#
+# User တစ်ယောက်ချင်းစီ သီးသန့်။
 # =========================================================
 
 USER_STATE = {}
+
+
+# =========================================================
+# HISTORY LIMIT
+#
+# Memory မကြီးလာအောင် user တစ်ယောက်ရဲ့
+# နောက်ဆုံး 100 songs ပဲ သိမ်းထားမယ်။
+# =========================================================
+
+MAX_HISTORY = 100
 
 
 # =========================================================
@@ -400,7 +399,7 @@ def telegram(
     if not BOT_TOKEN:
 
         print(
-            "ERROR: BOT_TOKEN is missing"
+            "❌ BOT_TOKEN is missing"
         )
 
         return {
@@ -428,7 +427,7 @@ def telegram(
         if not result.get("ok"):
 
             print(
-                "Telegram API error:",
+                "Telegram API ERROR:",
                 method,
                 result
             )
@@ -440,7 +439,7 @@ def telegram(
     except Exception as e:
 
         print(
-            "Telegram request error:",
+            "Telegram REQUEST ERROR:",
             method,
             e
         )
@@ -450,8 +449,7 @@ def telegram(
 
             "ok": False,
 
-            "description":
-                str(e)
+            "description": str(e)
 
         }
 
@@ -488,13 +486,13 @@ def send_message(
 
         data,
 
-        timeout=10
+        timeout=8
 
     )
 
 
 # =========================================================
-# ANSWER CALLBACK
+# CALLBACK ANSWER
 # =========================================================
 
 def answer_callback(
@@ -522,7 +520,7 @@ def answer_callback(
 
 
 # =========================================================
-# COPY MUSIC FROM CHANNEL
+# COPY MUSIC
 # =========================================================
 
 def copy_music(
@@ -565,19 +563,13 @@ def mood_menu():
             [
 
                 {
-                    "text":
-                        "😢 Sad",
-
-                    "callback_data":
-                        "mood_sad"
+                    "text": "😢 Sad",
+                    "callback_data": "mood_sad"
                 },
 
                 {
-                    "text":
-                        "❤️ Love",
-
-                    "callback_data":
-                        "mood_love"
+                    "text": "❤️ Love",
+                    "callback_data": "mood_love"
                 }
 
             ],
@@ -585,19 +577,13 @@ def mood_menu():
             [
 
                 {
-                    "text":
-                        "🌙 Chill",
-
-                    "callback_data":
-                        "mood_chill"
+                    "text": "🌙 Chill",
+                    "callback_data": "mood_chill"
                 },
 
                 {
-                    "text":
-                        "🔥 Hype",
-
-                    "callback_data":
-                        "mood_hype"
+                    "text": "🔥 Hype",
+                    "callback_data": "mood_hype"
                 }
 
             ],
@@ -605,19 +591,13 @@ def mood_menu():
             [
 
                 {
-                    "text":
-                        "🖤 Dark",
-
-                    "callback_data":
-                        "mood_dark"
+                    "text": "🖤 Dark",
+                    "callback_data": "mood_dark"
                 },
 
                 {
-                    "text":
-                        "⚡ Energetic",
-
-                    "callback_data":
-                        "mood_energetic"
+                    "text": "⚡ Energetic",
+                    "callback_data": "mood_energetic"
                 }
 
             ],
@@ -625,19 +605,13 @@ def mood_menu():
             [
 
                 {
-                    "text":
-                        "🚗 Night Drive",
-
-                    "callback_data":
-                        "mood_night"
+                    "text": "🚗 Night Drive",
+                    "callback_data": "mood_night"
                 },
 
                 {
-                    "text":
-                        "🌌 Melodic",
-
-                    "callback_data":
-                        "mood_melodic"
+                    "text": "🌌 Melodic",
+                    "callback_data": "mood_melodic"
                 }
 
             ]
@@ -659,11 +633,8 @@ def music_buttons():
             [
 
                 {
-                    "text":
-                        "🔀 Next",
-
-                    "callback_data":
-                        "next_music"
+                    "text": "🔀 Next",
+                    "callback_data": "next_music"
                 }
 
             ],
@@ -671,23 +642,8 @@ def music_buttons():
             [
 
                 {
-                    "text":
-                        "🎧 Change Mood",
-
-                    "callback_data":
-                        "change_mood"
-                }
-
-            ],
-
-            [
-
-                {
-                    "text":
-                        "🏠 Mood Menu",
-
-                    "callback_data":
-                        "change_mood"
+                    "text": "🎧 Change Mood",
+                    "callback_data": "change_mood"
                 }
 
             ]
@@ -697,35 +653,163 @@ def music_buttons():
 
 
 # =========================================================
-# GET SONGS FOR MOOD
+# GET USER HISTORY
 # =========================================================
 
-def get_mood_songs(
-    mood
+def get_history(chat_id):
+
+    with STATE_LOCK:
+
+        state = USER_STATE.get(
+            chat_id
+        )
+
+        if not state:
+
+            return []
+
+        return list(
+            state.get(
+                "history",
+                []
+            )
+        )
+
+
+# =========================================================
+# SAVE SONG
+# =========================================================
+
+def save_song(
+    chat_id,
+    mood,
+    message_id
 ):
 
-    return list(
-        MOOD_MUSIC.get(
-            mood,
-            []
+    with STATE_LOCK:
+
+        state = USER_STATE.setdefault(
+
+            chat_id,
+
+            {
+
+                "mood":
+                    mood,
+
+                "history":
+                    []
+
+            }
+
         )
-    )
+
+
+        state["mood"] = mood
+
+
+        history = state.setdefault(
+
+            "history",
+
+            []
+
+        )
+
+
+        if message_id in history:
+
+            history.remove(
+                message_id
+            )
+
+
+        history.append(
+            message_id
+        )
+
+
+        if len(history) > MAX_HISTORY:
+
+            del history[
+                :-MAX_HISTORY
+            ]
 
 
 # =========================================================
-# PICK SONG
-#
-# same song immediately repeat မဖြစ်အောင်
-# last song ကို exclude လုပ်ထားမယ်။
+# SET USER MOOD
 # =========================================================
 
-def pick_song(
+def set_user_mood(
     chat_id,
     mood
 ):
 
-    songs = get_mood_songs(
-        mood
+    with STATE_LOCK:
+
+        state = USER_STATE.setdefault(
+
+            chat_id,
+
+            {
+
+                "mood":
+                    mood,
+
+                "history":
+                    []
+
+            }
+
+        )
+
+
+        state["mood"] = mood
+
+
+# =========================================================
+# GET USER MOOD
+# =========================================================
+
+def get_user_mood(
+    chat_id
+):
+
+    with STATE_LOCK:
+
+        state = USER_STATE.get(
+            chat_id
+        )
+
+
+        if not state:
+
+            return None
+
+
+        return state.get(
+            "mood"
+        )
+
+
+# =========================================================
+# PICK NEW SONG
+#
+# User တစ်ယောက်တည်းအတွက်
+# history ထဲရှိပြီးသား song ကို မရွေးဘူး။
+#
+# =========================================================
+
+def pick_new_song(
+    chat_id,
+    mood
+):
+
+    songs = list(
+        MOOD_MUSIC.get(
+            mood,
+            []
+        )
     )
 
 
@@ -734,19 +818,51 @@ def pick_song(
         return None
 
 
-    previous = (
-        USER_STATE
-        .get(
-            chat_id,
-            {}
-        )
-        .get(
-            "last_song"
-        )
+    history = get_history(
+        chat_id
     )
 
 
+    # =====================================================
+    # First try:
+    # User မကြားဖူးသေးတဲ့ songs
+    # =====================================================
+
+    fresh = [
+
+        song
+
+        for song in songs
+
+        if song not in history
+
+    ]
+
+
+    if fresh:
+
+        return random.choice(
+            fresh
+        )
+
+
+    # =====================================================
+    # User က ဒီ mood ထဲက songs အားလုံးနီးပါး
+    # ကြားပြီးသွားပြီ။
+    #
+    # History အကုန်ထပ်မပိတ်တော့ဘဲ
+    # oldest history ကိုဖယ်ပြီး
+    # ပြန်ရွေးခွင့်ပေးမယ်။
+    # =====================================================
+
     if len(songs) > 1:
+
+        last_song = (
+            history[-1]
+            if history
+            else None
+        )
+
 
         candidates = [
 
@@ -754,42 +870,40 @@ def pick_song(
 
             for song in songs
 
-            if song != previous
+            if song != last_song
 
         ]
 
-    else:
 
-        candidates = songs
+        if candidates:
 
-
-    if not candidates:
-
-        candidates = songs
+            return random.choice(
+                candidates
+            )
 
 
-    return random.choice(
-        candidates
-    )
+    return songs[0]
 
 
 # =========================================================
-# SEND MOOD TRACK
+# SEND TRACK WITH RETRY
+#
+# Message ID တစ်ခု error ဖြစ်ရင်
+# အခြား track ကို ဆက်စမ်းမယ်။
 # =========================================================
 
-def send_mood_track(
+def send_track(
     chat_id,
     mood
 ):
 
-    songs = get_mood_songs(
-        mood
+    songs = list(
+        MOOD_MUSIC.get(
+            mood,
+            []
+        )
     )
 
-
-    # =====================================================
-    # NO SONG
-    # =====================================================
 
     if not songs:
 
@@ -807,250 +921,93 @@ def send_mood_track(
         return
 
 
-    # =====================================================
-    # PICK
-    # =====================================================
-
-    message_id = pick_song(
-
-        chat_id,
-
-        mood
-
-    )
-
-
-    if message_id is None:
-
-        send_message(
-
-            chat_id,
-
-            "❌ Track ရွေးလို့မရပါ။",
-
-            mood_menu()
-
-        )
-
-        return
-
-
-    # =====================================================
-    # COPY
-    # =====================================================
-
-    result = copy_music(
-
-        chat_id,
-
-        message_id
-
-    )
-
-
-    # =====================================================
-    # SUCCESS
-    # =====================================================
-
-    if result.get("ok"):
-
-        USER_STATE[chat_id] = {
-
-            "mood":
-                mood,
-
-            "last_song":
-                message_id
-
-        }
-
-
-        print(
-
-            "MUSIC SENT",
-
-            "| chat:",
-            chat_id,
-
-            "| mood:",
-            mood,
-
-            "| message:",
-            message_id
-
-        )
-
-
-        send_message(
-
-            chat_id,
-
-            f"{MOOD_NAMES[mood]}\n\n"
-            "🎧 Enjoy your music! 🔥",
-
-            music_buttons()
-
-        )
-
-
-        return
-
-
-    # =====================================================
-    # FAILURE
-    # =====================================================
-
-    print(
-
-        "COPY FAILED",
-
-        "| mood:",
-        mood,
-
-        "| message:",
-        message_id,
-
-        "| result:",
-        result
-
-    )
-
-
-    send_message(
-
-        chat_id,
-
-        f"{MOOD_NAMES[mood]}\n\n"
-        "❌ ဒီ track ကို channel ကနေ "
-        "copy လုပ်လို့မရပါ။\n\n"
-        "Bot ရဲ့ channel permission / "
-        "Message ID ကိုစစ်ပါ။",
-
-        mood_menu()
-
-    )
-
-
-# =========================================================
-# NEXT TRACK
-#
-# IMPORTANT:
-#
-# Next = လက်ရှိရွေးထားတဲ့ mood ထဲကပဲ
-# =========================================================
-
-def send_next_track(
-    chat_id
-):
-
-    state = USER_STATE.get(
+    history = get_history(
         chat_id
     )
 
 
     # =====================================================
-    # User hasn't selected mood
+    # Fresh tracks first
     # =====================================================
 
-    if not state:
+    fresh = [
 
-        send_message(
+        song
 
-            chat_id,
+        for song in songs
 
-            "🎧 အရင်ဆုံး Mood တစ်ခုရွေးပါ 👇",
+        if song not in history
 
-            mood_menu()
+    ]
 
-        )
-
-        return
-
-
-    mood = state.get(
-        "mood"
-    )
-
-
-    if mood not in MOODS:
-
-        send_message(
-
-            chat_id,
-
-            "🎧 Mood ရွေးပါ 👇",
-
-            mood_menu()
-
-        )
-
-        return
-
-
-    songs = get_mood_songs(
-        mood
-    )
-
-
-    if not songs:
-
-        send_message(
-
-            chat_id,
-
-            f"{MOOD_NAMES[mood]}\n\n"
-            "⚠️ ဒီ mood မှာ track မရှိသေးပါ။",
-
-            mood_menu()
-
-        )
-
-        return
-
-
-    previous = state.get(
-        "last_song"
-    )
-
-
-    # =====================================================
-    # Don't immediately repeat
-    # =====================================================
-
-    if len(songs) > 1:
-
-        candidates = [
-
-            song
-
-            for song in songs
-
-            if song != previous
-
-        ]
-
-    else:
-
-        candidates = songs
-
-
-    # =====================================================
-    # Randomize
-    # =====================================================
 
     random.shuffle(
-        candidates
+        fresh
     )
 
 
     # =====================================================
-    # Try songs until successful
-    #
-    # Channel မှာ deleted / inaccessible ID ရှိနေရင်
-    # နောက် ID ကိုဆက်စမ်းမယ်။
+    # If all were already played,
+    # use non-last songs.
     # =====================================================
 
+    old = [
+
+        song
+
+        for song in songs
+
+        if song in history
+
+    ]
+
+
+    random.shuffle(
+        old
+    )
+
+
+    last_song = (
+        history[-1]
+        if history
+        else None
+    )
+
+
+    candidates = fresh + [
+
+        song
+
+        for song in old
+
+        if song != last_song
+
+    ]
+
+
+    if not candidates:
+
+        candidates = songs[:]
+
+
+    # =====================================================
+    # Try candidates
+    # =====================================================
+
+    tried = set()
+
+
     for message_id in candidates:
+
+        if message_id in tried:
+
+            continue
+
+
+        tried.add(
+            message_id
+        )
+
 
         result = copy_music(
 
@@ -1063,29 +1020,26 @@ def send_next_track(
 
         if result.get("ok"):
 
-            USER_STATE[chat_id] = {
+            save_song(
 
-                "mood":
-                    mood,
+                chat_id,
 
-                "last_song":
-                    message_id
+                mood,
 
-            }
+                message_id
+
+            )
 
 
             print(
 
-                "NEXT SENT",
+                "TRACK SENT",
 
-                "| chat:",
-                chat_id,
+                "| chat =", chat_id,
 
-                "| mood:",
-                mood,
+                "| mood =", mood,
 
-                "| message:",
-                message_id
+                "| message =", message_id
 
             )
 
@@ -1095,7 +1049,7 @@ def send_next_track(
                 chat_id,
 
                 f"{MOOD_NAMES[mood]}\n\n"
-                "🔀 Next track 👇",
+                "🎧 Enjoy your music! 🔥",
 
                 music_buttons()
 
@@ -1107,19 +1061,19 @@ def send_next_track(
 
         print(
 
-            "NEXT FAILED",
+            "TRACK FAILED",
 
-            "| mood:",
-            mood,
+            "| chat =", chat_id,
 
-            "| message:",
-            message_id
+            "| mood =", mood,
+
+            "| message =", message_id
 
         )
 
 
     # =====================================================
-    # NOTHING WORKED
+    # Nothing worked
     # =====================================================
 
     send_message(
@@ -1128,7 +1082,9 @@ def send_next_track(
 
         f"{MOOD_NAMES[mood]}\n\n"
         "❌ ဒီ mood ထဲက track တွေကို "
-        "channel ကနေ copy မလုပ်နိုင်ပါ။",
+        "channel ကနေ copy လုပ်လို့မရပါ။\n\n"
+        "Channel permission / Message ID "
+        "ကို စစ်ပေးပါ။",
 
         mood_menu()
 
@@ -1136,17 +1092,17 @@ def send_next_track(
 
 
 # =========================================================
-# BACKGROUND MOOD
+# BACKGROUND SEND
 # =========================================================
 
-def background_mood(
+def background_send(
     chat_id,
     mood
 ):
 
     try:
 
-        send_mood_track(
+        send_track(
 
             chat_id,
 
@@ -1157,32 +1113,11 @@ def background_mood(
     except Exception as e:
 
         print(
-            "BACKGROUND MOOD ERROR:",
+
+            "BACKGROUND SEND ERROR:",
+
             e
-        )
 
-
-# =========================================================
-# BACKGROUND NEXT
-# =========================================================
-
-def background_next(
-    chat_id
-):
-
-    try:
-
-        send_next_track(
-
-            chat_id
-
-        )
-
-    except Exception as e:
-
-        print(
-            "BACKGROUND NEXT ERROR:",
-            e
         )
 
 
@@ -1256,7 +1191,7 @@ def webhook():
         )
 
 
-        callback_message = (
+        message = (
             callback.get(
                 "message"
             )
@@ -1264,16 +1199,15 @@ def webhook():
         )
 
 
-        callback_chat = (
-            callback_message
-            .get(
+        chat = (
+            message.get(
                 "chat"
             )
             or {}
         )
 
 
-        chat_id = callback_chat.get(
+        chat_id = chat.get(
             "id"
         )
 
@@ -1292,7 +1226,7 @@ def webhook():
 
 
         # =================================================
-        # MOOD
+        # MOOD BUTTON
         # =================================================
 
         if data.startswith(
@@ -1300,7 +1234,7 @@ def webhook():
         ):
 
             mood = data[
-                len("mood_"):
+                5:
             ]
 
 
@@ -1318,25 +1252,20 @@ def webhook():
 
 
             # =================================================
-            # SAVE MOOD IMMEDIATELY
+            # Save mood immediately
             # =================================================
 
-            USER_STATE.setdefault(
+            set_user_mood(
 
                 chat_id,
 
-                {}
+                mood
 
             )
 
 
-            USER_STATE[chat_id][
-                "mood"
-            ] = mood
-
-
             # =================================================
-            # FAST CALLBACK
+            # Answer callback immediately
             # =================================================
 
             answer_callback(
@@ -1349,12 +1278,12 @@ def webhook():
 
 
             # =================================================
-            # MUSIC IN BACKGROUND
+            # Send music in background
             # =================================================
 
             threading.Thread(
 
-                target=background_mood,
+                target=background_send,
 
                 args=(
 
@@ -1378,22 +1307,44 @@ def webhook():
 
         if data == "next_music":
 
+            mood = get_user_mood(
+                chat_id
+            )
+
+
             answer_callback(
 
                 callback_id,
 
-                "🔀 Finding next..."
+                "🔀 Finding next track..."
 
             )
 
 
+            if not mood:
+
+                send_message(
+
+                    chat_id,
+
+                    "🎧 အရင်ဆုံး Mood တစ်ခုရွေးပါ 👇",
+
+                    mood_menu()
+
+                )
+
+                return "OK"
+
+
             threading.Thread(
 
-                target=background_next,
+                target=background_send,
 
                 args=(
 
                     chat_id,
+
+                    mood
 
                 ),
 
@@ -1448,9 +1399,11 @@ def webhook():
 
     if message:
 
-        chat = message.get(
-            "chat",
-            {}
+        chat = (
+            message.get(
+                "chat"
+            )
+            or {}
         )
 
 
@@ -1461,8 +1414,7 @@ def webhook():
 
         text = (
 
-            message
-            .get(
+            message.get(
                 "text",
                 ""
             )
@@ -1470,6 +1422,11 @@ def webhook():
             or ""
 
         ).strip()
+
+
+        if not chat_id:
+
+            return "OK"
 
 
         # =================================================
@@ -1484,7 +1441,8 @@ def webhook():
 
                 "🎧 NOT YOUR VIBE MUSIC\n\n"
                 "Welcome! 🔥\n\n"
-                "Choose your mood below 👇",
+                "Mood တစ်ခုရွေးပြီး "
+                "သီချင်းနားထောင်ပါ 👇",
 
                 mood_menu()
 
@@ -1513,6 +1471,52 @@ def webhook():
 
 
         # =================================================
+        # NEXT
+        # =================================================
+
+        if text == "/next":
+
+            mood = get_user_mood(
+                chat_id
+            )
+
+
+            if not mood:
+
+                send_message(
+
+                    chat_id,
+
+                    "🎧 အရင်ဆုံး Mood တစ်ခုရွေးပါ 👇",
+
+                    mood_menu()
+
+                )
+
+                return "OK"
+
+
+            threading.Thread(
+
+                target=background_send,
+
+                args=(
+
+                    chat_id,
+
+                    mood
+
+                ),
+
+                daemon=True
+
+            ).start()
+
+
+            return "OK"
+
+
+        # =================================================
         # HELP
         # =================================================
 
@@ -1524,37 +1528,16 @@ def webhook():
 
                 "🎧 NOT YOUR VIBE MUSIC BOT\n\n"
 
-                "/start - Start bot\n"
-                "/mood - Mood menu\n"
-                "/help - Help\n\n"
+                "/start — Start\n"
+                "/mood — Mood Menu\n"
+                "/next — Next Track\n"
+                "/help — Help\n\n"
 
-                "🎵 Select a mood to receive music."
+                "🎵 Mood တစ်ခုရွေးပါ။\n"
+                "Bot က အဲဒီ mood ထဲက track ကို "
+                "ရွေးပြီး ပို့ပေးပါမယ်။"
 
             )
-
-            return "OK"
-
-
-        # =================================================
-        # NEXT COMMAND
-        # =================================================
-
-        if text == "/next":
-
-            threading.Thread(
-
-                target=background_next,
-
-                args=(
-
-                    chat_id,
-
-                ),
-
-                daemon=True
-
-            ).start()
-
 
             return "OK"
 
@@ -1587,7 +1570,7 @@ def setup_webhook():
 
 
     webhook_url = (
-        f"{RENDER_URL}/webhook"
+        f"{RENDER_URL.rstrip('/')}/webhook"
     )
 
 
@@ -1622,7 +1605,7 @@ def setup_webhook():
 
 
     print(
-        "WEBHOOK:",
+        "WEBHOOK RESULT:",
         result
     )
 
@@ -1645,12 +1628,10 @@ if __name__ == "__main__":
         "=========================================="
     )
 
-
     print(
         "Channel:",
         CHANNEL_USERNAME
     )
-
 
     print(
         "Total unique tracks:",
@@ -1662,12 +1643,8 @@ if __name__ == "__main__":
 
         print(
 
-            MOOD_NAMES[mood],
-            "=",
-            len(
-                MOOD_MUSIC[mood]
-            ),
-            "tracks"
+            f"{MOOD_NAMES[mood]} = "
+            f"{len(MOOD_MUSIC[mood])} tracks"
 
         )
 
@@ -1677,30 +1654,21 @@ if __name__ == "__main__":
     )
 
 
-    # =====================================================
-    # WEBHOOK
-    # =====================================================
-
     setup_webhook()
 
-
-    # =====================================================
-    # PORT
-    # =====================================================
 
     port = int(
 
         os.getenv(
+
             "PORT",
+
             "10000"
+
         )
 
     )
 
-
-    # =====================================================
-    # RUN
-    # =====================================================
 
     app.run(
 
@@ -1710,4 +1678,4 @@ if __name__ == "__main__":
 
         threaded=True
 
-)
+    )
