@@ -1,10 +1,10 @@
 import os
 import random
+import sqlite3
 import threading
 import time
-from collections import defaultdict, deque
-
 import requests
+
 from flask import Flask, request
 
 
@@ -22,54 +22,49 @@ app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-if not BOT_TOKEN:
-    print("WARNING: BOT_TOKEN is missing")
-
-TELEGRAM_API = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
-    if BOT_TOKEN
-    else ""
-)
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 # =========================================================
-# HTTP SESSION
-# Reuse connections -> faster
+# ADMIN
+# =========================================================
+#
+# Render Environment Variables မှာ
+#
+# ADMIN_ID=123456789
+#
+# ထည့်ပါ။
+#
+# မထည့်ရင် /stats နဲ့ /channels ကို လူတိုင်းသုံးနိုင်ပါတယ်။
+#
+
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+if ADMIN_ID:
+    try:
+        ADMIN_ID = int(ADMIN_ID)
+    except:
+        ADMIN_ID = None
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+DB_FILE = "music_bot.db"
+
+db_lock = threading.RLock()
+
+
+# =========================================================
+# TELEGRAM SESSION
 # =========================================================
 
 http = requests.Session()
 
 http.headers.update({
-    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT/2.0"
+    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT"
 })
-
-
-# =========================================================
-# USER LOCKS
-#
-# User တစ်ယောက်တည်းက button နှစ်ခါမြန်မြန်နှိပ်ရင်
-# သီချင်းနှစ်ပုဒ်တစ်ပြိုင်တည်းထွက်မသွားအောင်
-# user တစ်ယောက်ချင်းစီ lock ခွဲထားတယ်။
-# =========================================================
-
-USER_LOCKS = defaultdict(threading.Lock)
-
-
-# =========================================================
-# USER STATE
-#
-# user တစ်ယောက်ချင်းစီမှာ
-#
-# mood
-# history
-# last_song
-#
-# သီးခြားရှိမယ်။
-# =========================================================
-
-USER_STATE = {}
-
-STATE_LOCK = threading.Lock()
 
 
 # =========================================================
@@ -79,20 +74,14 @@ STATE_LOCK = threading.Lock()
 MOOD_NAMES = {
 
     "sad": "😢 SAD",
-
     "love": "❤️ LOVE",
-
     "chill": "🌙 CHILL",
-
     "hype": "🔥 HYPE",
-
-    "energetic": "⚡ ENERGETIC",
-
     "dark": "🖤 DARK",
-
+    "energetic": "⚡ ENERGETIC",
     "night": "🚗 NIGHT DRIVE",
-
     "melodic": "🌌 MELODIC"
+
 }
 
 
@@ -101,63 +90,25 @@ MOODS = [
     "love",
     "chill",
     "hype",
-    "energetic",
     "dark",
+    "energetic",
     "night",
     "melodic"
 ]
 
 
 # =========================================================
-# CHANNEL CONFIGURATION
-#
-# ---------------------------------------------------------
-# ဒီနေရာမှာ channel ID တွေထည့်ရမယ်။
-#
-# Public channel ဖြစ်ရင် username သုံးလို့ရတယ်။
-#
-# Private channel ဖြစ်ရင်
-# -100xxxxxxxxxx
-# လို ID သုံးရမယ်။
-#
-# ID မသိသေးရင် ""
-# ထားပါ။
-#
-# Bot ကို channel တစ်ခုချင်းစီမှာ ADMIN ထည့်ထားရမယ်။
+# MOOD -> CHANNEL
 # =========================================================
-
-CHANNELS = {
-
-    "sad": "",
-
-    "love": "",
-
-    "chill": "",
-
-    "hype": "",
-
-    "energetic": "",
-
-    "dark": "",
-
-    "night": "",
-
-    "melodic": ""
-}
-
-
-# =========================================================
-# CHANNEL USERNAME FALLBACK
 #
-# Public channel username ရှိတဲ့ channel တွေမှာ
-# ID မထည့်သေးလည်း username နဲ့ copy လုပ်နိုင်တယ်။
+# Username ရှိတဲ့ public channels
+# username ကိုတိုက်ရိုက်သုံးနိုင်တယ်။
 #
-# Private invite link (+xxxx) ကို Bot API
-# from_chat_id အနေနဲ့ တိုက်ရိုက်မသုံးနိုင်ပါ။
-# အဲဒီ channel ရဲ့ -100... ID လိုပါတယ်။
-# =========================================================
+# ID ရှိပြီးသား channels
+# ID ကိုသုံးထားတယ်။
+#
 
-PUBLIC_CHANNELS = {
+MOOD_CHANNELS = {
 
     "sad": "@sadmooddatabase",
 
@@ -169,127 +120,165 @@ PUBLIC_CHANNELS = {
 
     "dark": "@darkmooddatabase",
 
-    "night": "@nightdrivemooddatabase"
+    "night": "@nightdrivemooddatabase",
+
+    "melodic": -1004446996297,
+
+    "hype": -1004427220481
 
 }
 
 
 # =========================================================
-# TRACK DATABASE
-#
-# ---------------------------------------------------------
-# Private mood channel ထဲမှာရှိတဲ့ track တွေရဲ့
-# Telegram MESSAGE ID တွေကို ဒီမှာထည့်နိုင်တယ်။
-#
-# ဥပမာ:
-#
-# "sad": [
-#     1,
-#     2,
-#     3,
-#     4
-# ]
-#
-# IMPORTANT:
-# Channel ID နဲ့ Message ID မတူပါ။
-#
-# Channel ID:
-# -1001234567890
-#
-# Message ID:
-# 15
-#
+# DATABASE INIT
 # =========================================================
 
-TRACKS = {
+def db_connect():
 
-    "sad": [],
-
-    "love": [],
-
-    "chill": [],
-
-    "hype": [],
-
-    "energetic": [],
-
-    "dark": [],
-
-    "night": [],
-
-    "melodic": []
-}
-
-
-# =========================================================
-# AUTO-DISCOVERED CHANNELS
-#
-# Bot က channel_post ရတဲ့အခါ
-# Channel ID ကို ဒီ memory database ထဲထည့်မယ်။
-#
-# Render restart ဖြစ်ရင် memory ပျောက်မယ်။
-# ဒါကြောင့် Logs ကနေ ID ကိုယူပြီး CHANNELS ထဲ
-# permanent ထည့်ထားတာက အကောင်းဆုံး။
-# =========================================================
-
-DISCOVERED_CHANNELS = {}
-
-
-# =========================================================
-# AUTO-DISCOVERED TRACKS
-#
-# Bot ကို channel ထဲ admin ထည့်ပြီးနောက်
-# channel ထဲ post အသစ်တင်ရင်
-#
-# message_id
-#
-# ကို ဒီထဲမှာ auto သိမ်းမယ်။
-# =========================================================
-
-DISCOVERED_TRACKS = {
-
-    "sad": set(),
-
-    "love": set(),
-
-    "chill": set(),
-
-    "hype": set(),
-
-    "energetic": set(),
-
-    "dark": set(),
-
-    "night": set(),
-
-    "melodic": set()
-}
-
-
-# =========================================================
-# NORMALIZE DATABASE
-# =========================================================
-
-for mood in MOODS:
-
-    TRACKS[mood] = list(
-        dict.fromkeys(
-            TRACKS.get(mood, [])
-        )
+    conn = sqlite3.connect(
+        DB_FILE,
+        timeout=30,
+        check_same_thread=False
     )
 
+    conn.row_factory = sqlite3.Row
+
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
+    )
+
+    conn.execute(
+        "PRAGMA busy_timeout=30000"
+    )
+
+    return conn
+
+
+def init_database():
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            # ---------------------------------------------
+            # USERS
+            # ---------------------------------------------
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+
+                    user_id INTEGER PRIMARY KEY,
+
+                    username TEXT,
+
+                    first_name TEXT,
+
+                    last_name TEXT,
+
+                    last_mood TEXT,
+
+                    last_song INTEGER,
+
+                    created_at INTEGER,
+
+                    updated_at INTEGER
+
+                )
+            """)
+
+
+            # ---------------------------------------------
+            # TRACKS
+            # ---------------------------------------------
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tracks (
+
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    mood TEXT NOT NULL,
+
+                    channel_id TEXT NOT NULL,
+
+                    message_id INTEGER NOT NULL,
+
+                    active INTEGER DEFAULT 1,
+
+                    created_at INTEGER,
+
+                    UNIQUE(channel_id, message_id)
+
+                )
+            """)
+
+
+            # ---------------------------------------------
+            # USER HISTORY
+            # ---------------------------------------------
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS history (
+
+                    user_id INTEGER NOT NULL,
+
+                    mood TEXT NOT NULL,
+
+                    message_id INTEGER NOT NULL,
+
+                    created_at INTEGER,
+
+                    PRIMARY KEY(
+                        user_id,
+                        mood,
+                        message_id
+                    )
+
+                )
+            """)
+
+
+            # ---------------------------------------------
+            # INDEX
+            # ---------------------------------------------
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_tracks_mood
+                ON tracks(mood)
+            """)
+
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_history_user_mood
+                ON history(user_id, mood)
+            """)
+
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
 
 # =========================================================
-# TELEGRAM REQUEST
+# TELEGRAM API
 # =========================================================
 
 def telegram(
     method,
     data=None,
-    timeout=10
+    timeout=15
 ):
 
-    if not TELEGRAM_API:
+    if not BOT_TOKEN:
+
+        print(
+            "❌ BOT_TOKEN is missing"
+        )
 
         return {
             "ok": False,
@@ -310,13 +299,22 @@ def telegram(
         )
 
 
-        result = response.json()
+        try:
+
+            result = response.json()
+
+        except:
+
+            result = {
+                "ok": False,
+                "description": response.text
+            }
 
 
         if not result.get("ok"):
 
             print(
-                "TELEGRAM ERROR:",
+                "Telegram API error:",
                 method,
                 result
             )
@@ -328,14 +326,18 @@ def telegram(
     except Exception as e:
 
         print(
-            "TELEGRAM REQUEST ERROR:",
+            "Telegram request error:",
             method,
-            e
+            str(e)
         )
 
         return {
+
             "ok": False,
-            "description": str(e)
+
+            "description":
+                str(e)
+
         }
 
 
@@ -351,17 +353,20 @@ def send_message(
 
     data = {
 
-        "chat_id": chat_id,
+        "chat_id":
+            chat_id,
 
-        "text": text,
+        "text":
+            text
 
-        "disable_web_page_preview": True
     }
 
 
-    if keyboard is not None:
+    if keyboard:
 
-        data["reply_markup"] = keyboard
+        data[
+            "reply_markup"
+        ] = keyboard
 
 
     return telegram(
@@ -370,12 +375,13 @@ def send_message(
 
         data,
 
-        timeout=8
+        timeout=10
+
     )
 
 
 # =========================================================
-# ANSWER CALLBACK
+# CALLBACK
 # =========================================================
 
 def answer_callback(
@@ -398,6 +404,7 @@ def answer_callback(
         },
 
         timeout=5
+
     )
 
 
@@ -406,8 +413,8 @@ def answer_callback(
 # =========================================================
 
 def copy_music(
-    target_chat_id,
-    source_chat_id,
+    chat_id,
+    channel_id,
     message_id
 ):
 
@@ -418,403 +425,784 @@ def copy_music(
         {
 
             "chat_id":
-                target_chat_id,
+                chat_id,
 
             "from_chat_id":
-                source_chat_id,
+                channel_id,
 
             "message_id":
                 message_id
 
         },
 
-        timeout=15
+        timeout=20
+
     )
 
 
 # =========================================================
-# GET CHANNEL SOURCE
+# USER
 # =========================================================
 
-def get_channel_source(mood):
-
-    # -----------------------------------------------------
-    # 1. Manually configured ID
-    # -----------------------------------------------------
-
-    channel_id = CHANNELS.get(
-        mood,
-        ""
-    )
-
-    if channel_id:
-
-        return channel_id
-
-
-    # -----------------------------------------------------
-    # 2. Auto discovered ID
-    # -----------------------------------------------------
-
-    discovered = DISCOVERED_CHANNELS.get(
-        mood
-    )
-
-    if discovered:
-
-        return discovered
-
-
-    # -----------------------------------------------------
-    # 3. Public username fallback
-    # -----------------------------------------------------
-
-    public_username = PUBLIC_CHANNELS.get(
-        mood
-    )
-
-    if public_username:
-
-        return public_username
-
-
-    return None
-
-
-# =========================================================
-# IDENTIFY MOOD FROM CHANNEL ID
-# =========================================================
-
-def identify_channel_mood(channel_id):
-
-    # -----------------------------------------------------
-    # First check manual CHANNELS
-    # -----------------------------------------------------
-
-    for mood in MOODS:
-
-        configured = CHANNELS.get(
-            mood,
-            ""
-        )
-
-        if configured and str(configured) == str(channel_id):
-
-            return mood
-
-
-    # -----------------------------------------------------
-    # Then discovered channels
-    # -----------------------------------------------------
-
-    for mood, discovered_id in DISCOVERED_CHANNELS.items():
-
-        if str(discovered_id) == str(channel_id):
-
-            return mood
-
-
-    return None
-
-
-# =========================================================
-# CHANNEL POST DEBUG / AUTO DISCOVERY
-# =========================================================
-
-def process_channel_post(
-    channel_post
+def save_user(
+    user
 ):
 
-    chat = channel_post.get(
-        "chat",
-        {}
-    )
-
-
-    channel_id = chat.get(
-        "id"
-    )
-
-
-    channel_title = chat.get(
-        "title"
-    )
-
-
-    channel_username = chat.get(
-        "username"
-    )
-
-
-    message_id = channel_post.get(
-        "message_id"
-    )
-
-
-    if not channel_id:
+    if not user:
 
         return
 
 
-    print("")
-    print("==============================================")
-    print("📢 CHANNEL POST DETECTED")
-    print("Channel ID       :", channel_id)
-    print("Channel Title    :", channel_title)
-    print("Channel Username :", channel_username)
-    print("Message ID       :", message_id)
-    print("==============================================")
-    print("")
-
-
-    # -----------------------------------------------------
-    # Try to identify mood
-    # -----------------------------------------------------
-
-    mood = identify_channel_mood(
-        channel_id
+    user_id = user.get(
+        "id"
     )
 
 
-    if mood:
+    if not user_id:
 
-        DISCOVERED_CHANNELS[mood] = channel_id
+        return
 
-        if message_id:
 
-            DISCOVERED_TRACKS[mood].add(
-                int(message_id)
+    username = user.get(
+        "username"
+    )
+
+    first_name = user.get(
+        "first_name"
+    )
+
+    last_name = user.get(
+        "last_name"
+    )
+
+
+    now = int(
+        time.time()
+    )
+
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            conn.execute(
+                """
+                INSERT INTO users
+                (
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    created_at,
+                    updated_at
+                )
+
+                VALUES
+                (
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?
+                )
+
+                ON CONFLICT(user_id)
+
+                DO UPDATE SET
+
+                    username=excluded.username,
+
+                    first_name=excluded.first_name,
+
+                    last_name=excluded.last_name,
+
+                    updated_at=excluded.updated_at
+                """,
+
+                (
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    now,
+                    now
+                )
+
             )
 
+            conn.commit()
 
-        print(
-            "AUTO MOOD DETECTED:",
-            mood
-        )
+        finally:
 
-        print(
-            "AUTO TRACK ADDED:",
-            message_id
-        )
-
-        print(
-            "TOTAL DISCOVERED:",
-            len(
-                DISCOVERED_TRACKS[mood]
-            )
-        )
-
-        print("")
-
-
-    else:
-
-        # -------------------------------------------------
-        # If channel not configured yet
-        # -------------------------------------------------
-
-        print(
-            "⚠️ CHANNEL NOT MAPPED"
-        )
-
-        print(
-            "Add this Channel ID to CHANNELS"
-        )
-
-        print(
-            "Channel ID:",
-            channel_id
-        )
-
-        print("")
+            conn.close()
 
 
 # =========================================================
-# GET TRACKS
+# USER MOOD STATE
 # =========================================================
 
-def get_tracks(
+def set_user_mood(
+    user_id,
     mood
 ):
 
-    result = []
-
-
-    # -----------------------------------------------------
-    # Manual tracks
-    # -----------------------------------------------------
-
-    result.extend(
-        TRACKS.get(
-            mood,
-            []
-        )
+    now = int(
+        time.time()
     )
 
 
-    # -----------------------------------------------------
-    # Auto discovered tracks
-    # -----------------------------------------------------
+    with db_lock:
 
-    result.extend(
-        list(
-            DISCOVERED_TRACKS.get(
-                mood,
-                set()
+        conn = db_connect()
+
+        try:
+
+            conn.execute(
+                """
+                UPDATE users
+
+                SET
+
+                    last_mood=?,
+
+                    updated_at=?
+
+                WHERE user_id=?
+                """,
+
+                (
+                    mood,
+                    now,
+                    user_id
+                )
+
             )
-        )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+
+def get_user_state(
+    user_id
+):
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            row = conn.execute(
+                """
+                SELECT
+                    last_mood,
+                    last_song
+                FROM users
+                WHERE user_id=?
+                """,
+
+                (
+                    user_id,
+                )
+
+            ).fetchone()
+
+            if not row:
+
+                return None
+
+
+            return {
+
+                "mood":
+                    row["last_mood"],
+
+                "last_song":
+                    row["last_song"]
+
+            }
+
+        finally:
+
+            conn.close()
+
+
+# =========================================================
+# SAVE LAST SONG
+# =========================================================
+
+def save_last_song(
+    user_id,
+    mood,
+    message_id
+):
+
+    now = int(
+        time.time()
     )
 
 
-    # -----------------------------------------------------
-    # Remove duplicates
-    # -----------------------------------------------------
+    with db_lock:
 
-    result = list(
-        dict.fromkeys(
-            result
-        )
+        conn = db_connect()
+
+        try:
+
+            conn.execute(
+                """
+                UPDATE users
+
+                SET
+
+                    last_mood=?,
+
+                    last_song=?,
+
+                    updated_at=?
+
+                WHERE user_id=?
+                """,
+
+                (
+                    mood,
+                    message_id,
+                    now,
+                    user_id
+                )
+
+            )
+
+
+            # ---------------------------------------------
+            # HISTORY
+            # ---------------------------------------------
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO history
+                (
+                    user_id,
+                    mood,
+                    message_id,
+                    created_at
+                )
+
+                VALUES
+                (
+                    ?,
+                    ?,
+                    ?,
+                    ?
+                )
+                """,
+
+                (
+                    user_id,
+                    mood,
+                    message_id,
+                    now
+                )
+
+            )
+
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+
+# =========================================================
+# GET RANDOM UNUSED TRACK
+# =========================================================
+
+def get_random_track(
+    user_id,
+    mood
+):
+
+    channel_id = str(
+        MOOD_CHANNELS[mood]
     )
+
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            # ---------------------------------------------
+            # First: unused tracks
+            # ---------------------------------------------
+
+            rows = conn.execute(
+                """
+                SELECT
+                    t.message_id
+
+                FROM tracks t
+
+                WHERE
+
+                    t.mood=?
+
+                    AND t.channel_id=?
+
+                    AND t.active=1
+
+                    AND NOT EXISTS (
+
+                        SELECT 1
+
+                        FROM history h
+
+                        WHERE
+
+                            h.user_id=?
+
+                            AND h.mood=?
+
+                            AND h.message_id=t.message_id
+
+                    )
+
+                ORDER BY RANDOM()
+
+                LIMIT 20
+                """,
+
+                (
+                    mood,
+                    channel_id,
+                    user_id,
+                    mood
+                )
+
+            ).fetchall()
+
+
+            if rows:
+
+                return [
+
+                    row["message_id"]
+
+                    for row in rows
+
+                ]
+
+
+            # ---------------------------------------------
+            # All tracks already used
+            #
+            # Reset this user's mood history
+            # ---------------------------------------------
+
+            conn.execute(
+                """
+                DELETE FROM history
+
+                WHERE
+
+                    user_id=?
+
+                    AND mood=?
+                """,
+
+                (
+                    user_id,
+                    mood
+                )
+
+            )
+
+            conn.commit()
+
+
+            # ---------------------------------------------
+            # Start new cycle
+            # ---------------------------------------------
+
+            rows = conn.execute(
+                """
+                SELECT
+                    message_id
+
+                FROM tracks
+
+                WHERE
+
+                    mood=?
+
+                    AND channel_id=?
+
+                    AND active=1
+
+                ORDER BY RANDOM()
+
+                LIMIT 20
+                """,
+
+                (
+                    mood,
+                    channel_id
+                )
+
+            ).fetchall()
+
+
+            return [
+
+                row["message_id"]
+
+                for row in rows
+
+            ]
+
+
+        finally:
+
+            conn.close()
+
+
+# =========================================================
+# ADD TRACK
+# =========================================================
+
+def add_track(
+    mood,
+    channel_id,
+    message_id
+):
+
+    now = int(
+        time.time()
+    )
+
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tracks
+                (
+                    mood,
+                    channel_id,
+                    message_id,
+                    active,
+                    created_at
+                )
+
+                VALUES
+                (
+                    ?,
+                    ?,
+                    ?,
+                    1,
+                    ?
+                )
+                """,
+
+                (
+                    mood,
+                    str(channel_id),
+                    message_id,
+                    now
+                )
+
+            )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+
+# =========================================================
+# CHANNEL ID CHECK
+# =========================================================
+
+def check_channels():
+
+    print(
+        "\n========== CHANNEL CHECK ==========\n"
+    )
+
+
+    for mood in MOODS:
+
+        channel = MOOD_CHANNELS[mood]
+
+
+        result = telegram(
+
+            "getChat",
+
+            {
+                "chat_id":
+                    channel
+            },
+
+            timeout=10
+
+        )
+
+
+        if result.get("ok"):
+
+            chat = result[
+                "result"
+            ]
+
+
+            real_id = chat.get(
+                "id"
+            )
+
+
+            title = chat.get(
+                "title",
+                ""
+            )
+
+
+            username = chat.get(
+                "username",
+                ""
+            )
+
+
+            print(
+                f"{mood.upper():12} "
+                f"ID={real_id} "
+                f"TITLE={title} "
+                f"USERNAME=@{username}"
+            )
+
+
+        else:
+
+            print(
+
+                f"{mood.upper():12} "
+                f"ERROR={result.get('description')}"
+
+            )
+
+
+    print(
+        "\n===================================\n"
+    )
+
+
+# =========================================================
+# ADMIN CHANNEL CHECK COMMAND
+# =========================================================
+
+def get_channel_info(
+    chat_id
+):
+
+    lines = []
+
+    for mood in MOODS:
+
+        channel = MOOD_CHANNELS[mood]
+
+
+        result = telegram(
+
+            "getChat",
+
+            {
+                "chat_id":
+                    channel
+            },
+
+            timeout=10
+
+        )
+
+
+        if result.get("ok"):
+
+            chat = result[
+                "result"
+            ]
+
+
+            real_id = chat.get(
+                "id"
+            )
+
+            title = chat.get(
+                "title",
+                "Unknown"
+            )
+
+
+            lines.append(
+
+                f"{MOOD_NAMES[mood]}\n"
+                f"ID: `{real_id}`\n"
+                f"Title: {title}"
+
+            )
+
+        else:
+
+            lines.append(
+
+                f"{MOOD_NAMES[mood]}\n"
+                f"❌ {result.get('description')}"
+
+            )
+
+
+    send_message(
+
+        chat_id,
+
+        "📡 CHANNEL INFORMATION\n\n"
+        + "\n\n".join(lines)
+
+    )
+
+
+# =========================================================
+# COUNT USERS
+# =========================================================
+
+def count_users():
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                AS total
+                FROM users
+                """
+            ).fetchone()
+
+
+            return row["total"]
+
+        finally:
+
+            conn.close()
+
+
+# =========================================================
+# COUNT TRACKS
+# =========================================================
+
+def count_tracks():
+
+    result = {}
+
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            rows = conn.execute(
+                """
+                SELECT
+                    mood,
+                    COUNT(*) AS total
+
+                FROM tracks
+
+                WHERE active=1
+
+                GROUP BY mood
+                """
+            ).fetchall()
+
+
+            for row in rows:
+
+                result[
+                    row["mood"]
+                ] = row["total"]
+
+
+        finally:
+
+            conn.close()
 
 
     return result
 
 
 # =========================================================
-# USER STATE
+# USER STATS
 # =========================================================
 
-def get_user_state(
+def send_stats(
     chat_id
 ):
 
-    with STATE_LOCK:
+    if ADMIN_ID:
 
-        if chat_id not in USER_STATE:
+        if chat_id != ADMIN_ID:
 
-            USER_STATE[chat_id] = {
+            send_message(
+                chat_id,
+                "❌ Admin only."
+            )
 
-                "mood": None,
-
-                "last_song": None,
-
-                # -----------------------------------------
-                # Keep last 50 songs
-                # -----------------------------------------
-
-                "history": deque(
-                    maxlen=50
-                )
-            }
+            return
 
 
-        return USER_STATE[chat_id]
+    total = count_users()
+
+    tracks = count_tracks()
 
 
-# =========================================================
-# PICK NEW TRACK
-# =========================================================
+    text = (
+        "📊 NOT YOUR VIBE BOT\n\n"
 
-def pick_track(
-    chat_id,
-    mood
-):
+        f"👥 Users: {total}\n\n"
 
-    tracks = get_tracks(
-        mood
+        "🎵 Tracks:\n"
     )
 
 
-    if not tracks:
+    for mood in MOODS:
 
-        return None
+        text += (
 
+            f"{MOOD_NAMES[mood]}: "
+            f"{tracks.get(mood, 0)}\n"
 
-    state = get_user_state(
-        chat_id
-    )
-
-
-    history = list(
-        state["history"]
-    )
-
-
-    # -----------------------------------------------------
-    # First try songs not recently played
-    # -----------------------------------------------------
-
-    candidates = [
-
-        track
-
-        for track in tracks
-
-        if track not in history
-    ]
-
-
-    # -----------------------------------------------------
-    # If all songs have been played
-    # allow old songs again,
-    # but don't immediately repeat last one.
-    # -----------------------------------------------------
-
-    if not candidates:
-
-        last_song = state.get(
-            "last_song"
         )
 
 
-        candidates = [
-
-            track
-
-            for track in tracks
-
-            if track != last_song
-        ]
-
-
-    # -----------------------------------------------------
-    # Only one track
-    # -----------------------------------------------------
-
-    if not candidates:
-
-        candidates = tracks
-
-
-    return random.choice(
-        candidates
+    send_message(
+        chat_id,
+        text
     )
-
-
-# =========================================================
-# SAVE USER TRACK
-# =========================================================
-
-def save_user_track(
-    chat_id,
-    mood,
-    message_id
-):
-
-    with STATE_LOCK:
-
-        state = get_user_state(
-            chat_id
-        )
-
-
-        state["mood"] = mood
-
-        state["last_song"] = message_id
-
-        state["history"].append(
-            message_id
-        )
 
 
 # =========================================================
@@ -831,16 +1219,12 @@ def mood_menu():
 
                 {
                     "text": "😢 Sad",
-
-                    "callback_data":
-                        "mood_sad"
+                    "callback_data": "mood_sad"
                 },
 
                 {
                     "text": "❤️ Love",
-
-                    "callback_data":
-                        "mood_love"
+                    "callback_data": "mood_love"
                 }
 
             ],
@@ -849,16 +1233,12 @@ def mood_menu():
 
                 {
                     "text": "🌙 Chill",
-
-                    "callback_data":
-                        "mood_chill"
+                    "callback_data": "mood_chill"
                 },
 
                 {
                     "text": "🔥 Hype",
-
-                    "callback_data":
-                        "mood_hype"
+                    "callback_data": "mood_hype"
                 }
 
             ],
@@ -866,17 +1246,13 @@ def mood_menu():
             [
 
                 {
-                    "text": "⚡ Energetic",
-
-                    "callback_data":
-                        "mood_energetic"
+                    "text": "🖤 Dark",
+                    "callback_data": "mood_dark"
                 },
 
                 {
-                    "text": "🖤 Dark",
-
-                    "callback_data":
-                        "mood_dark"
+                    "text": "⚡ Energetic",
+                    "callback_data": "mood_energetic"
                 }
 
             ],
@@ -885,16 +1261,12 @@ def mood_menu():
 
                 {
                     "text": "🚗 Night Drive",
-
-                    "callback_data":
-                        "mood_night"
+                    "callback_data": "mood_night"
                 },
 
                 {
                     "text": "🌌 Melodic",
-
-                    "callback_data":
-                        "mood_melodic"
+                    "callback_data": "mood_melodic"
                 }
 
             ]
@@ -946,318 +1318,369 @@ def music_buttons():
 # =========================================================
 
 def send_track(
-    chat_id,
+    user_id,
     mood
 ):
 
-    lock = USER_LOCKS[
-        chat_id
-    ]
+    channel_id = MOOD_CHANNELS[mood]
 
 
-    # -----------------------------------------------------
-    # User တစ်ယောက်တည်းက တစ်ချိန်တည်း request
-    # နှစ်ခုမလုပ်နိုင်အောင်
-    # -----------------------------------------------------
+    candidates = get_random_track(
+        user_id,
+        mood
+    )
 
-    with lock:
 
-        tracks = get_tracks(
-            mood
+    if not candidates:
+
+        send_message(
+
+            user_id,
+
+            f"{MOOD_NAMES[mood]}\n\n"
+
+            "⚠️ ဒီ mood channel ထဲမှာ "
+            "track database မရှိသေးပါ။\n\n"
+
+            "Bot ကို channel ထဲမှာ "
+            "Admin ထည့်ပြီး track အသစ်တင်ပါ။",
+
+            mood_menu()
+
+        )
+
+        return
+
+
+    # =====================================================
+    # Try several candidates
+    # =====================================================
+
+    for message_id in candidates:
+
+        result = copy_music(
+
+            user_id,
+
+            channel_id,
+
+            message_id
+
         )
 
 
-        # -------------------------------------------------
-        # No tracks
-        # -------------------------------------------------
+        if result.get("ok"):
 
-        if not tracks:
+            save_last_song(
 
-            send_message(
+                user_id,
 
-                chat_id,
-
-                f"{MOOD_NAMES[mood]}\n\n"
-                "⚠️ ဒီ mood channel ထဲမှာ "
-                "track မတွေ့သေးပါ။\n\n"
-                "Bot ကို channel ထဲ ADMIN ထည့်ပြီး "
-                "track post တစ်ခုတင်ပါ။",
-
-                mood_menu()
-            )
-
-            return
-
-
-        # -------------------------------------------------
-        # Channel source
-        # -------------------------------------------------
-
-        source = get_channel_source(
-            mood
-        )
-
-
-        if not source:
-
-            send_message(
-
-                chat_id,
-
-                f"{MOOD_NAMES[mood]}\n\n"
-                "⚠️ ဒီ mood channel ID မသတ်မှတ်ရသေးပါ။",
-
-                mood_menu()
-            )
-
-            return
-
-
-        # -------------------------------------------------
-        # Try several tracks
-        #
-        # Deleted / unavailable track တစ်ခုရှိရင်
-        # နောက် track ကို ဆက်စမ်းမယ်။
-        # -------------------------------------------------
-
-        state = get_user_state(
-            chat_id
-        )
-
-
-        history = list(
-            state["history"]
-        )
-
-
-        candidates = [
-
-            track
-
-            for track in tracks
-
-            if track not in history
-        ]
-
-
-        if not candidates:
-
-            candidates = [
-
-                track
-
-                for track in tracks
-
-                if track != state.get(
-                    "last_song"
-                )
-            ]
-
-
-        if not candidates:
-
-            candidates = tracks
-
-
-        random.shuffle(
-            candidates
-        )
-
-
-        # -------------------------------------------------
-        # Try maximum 10 tracks
-        # -------------------------------------------------
-
-        attempts = candidates[:10]
-
-
-        for message_id in attempts:
-
-            result = copy_music(
-
-                chat_id,
-
-                source,
+                mood,
 
                 message_id
 
             )
 
 
-            if result.get("ok"):
-
-                save_user_track(
-
-                    chat_id,
-
-                    mood,
-
-                    message_id
-
-                )
-
-
-                print(
-                    "✅ MUSIC SENT",
-                    "| user:",
-                    chat_id,
-                    "| mood:",
-                    mood,
-                    "| channel:",
-                    source,
-                    "| message:",
-                    message_id
-                )
-
-
-                send_message(
-
-                    chat_id,
-
-                    f"{MOOD_NAMES[mood]}\n\n"
-                    "🎧 Enjoy your music! 🔥",
-
-                    music_buttons()
-                )
-
-
-                return
-
-
             print(
-                "❌ COPY FAILED",
+
+                "TRACK SENT",
+
+                "| user:",
+                user_id,
+
                 "| mood:",
                 mood,
-                "| source:",
-                source,
+
+                "| channel:",
+                channel_id,
+
                 "| message:",
-                message_id,
-                "| result:",
-                result
+                message_id
+
             )
 
 
-        # -------------------------------------------------
-        # Nothing worked
-        # -------------------------------------------------
+            send_message(
 
-        send_message(
+                user_id,
 
-            chat_id,
+                f"{MOOD_NAMES[mood]}\n\n"
+                "🎧 Enjoy your music!",
 
-            f"{MOOD_NAMES[mood]}\n\n"
-            "❌ Track ပို့လို့မရပါ။\n\n"
-            "Channel ID / Message ID / "
-            "Bot Admin permission ကိုစစ်ပါ။",
+                music_buttons()
 
-            mood_menu()
-        )
+            )
 
 
-# =========================================================
-# BACKGROUND SEND
-# =========================================================
+            return
 
-def background_send(
-    chat_id,
-    mood
-):
-
-    try:
-
-        send_track(
-
-            chat_id,
-
-            mood
-
-        )
-
-    except Exception as e:
 
         print(
-            "BACKGROUND SEND ERROR:",
-            e
+
+            "TRACK FAILED",
+
+            "| user:",
+            user_id,
+
+            "| mood:",
+            mood,
+
+            "| message:",
+            message_id,
+
+            "| error:",
+            result.get("description")
+
         )
+
+
+    send_message(
+
+        user_id,
+
+        f"{MOOD_NAMES[mood]}\n\n"
+
+        "❌ Track ပို့မရပါ။\n\n"
+
+        "Channel permission / "
+        "message ID ကိုစစ်ပါ။",
+
+        mood_menu()
+
+    )
 
 
 # =========================================================
 # NEXT TRACK
 # =========================================================
 
-def background_next(
-    chat_id
+def next_track(
+    user_id
 ):
 
-    try:
-
-        state = get_user_state(
-            chat_id
-        )
+    state = get_user_state(
+        user_id
+    )
 
 
-        mood = state.get(
-            "mood"
-        )
+    if not state:
 
+        send_message(
 
-        if not mood:
+            user_id,
 
-            send_message(
+            "🎧 အရင်ဆုံး Mood ရွေးပါ 👇",
 
-                chat_id,
-
-                "🎧 အရင်ဆုံး Mood တစ်ခုရွေးပါ 👇",
-
-                mood_menu()
-            )
-
-            return
-
-
-        send_track(
-
-            chat_id,
-
-            mood
+            mood_menu()
 
         )
 
+        return
 
-    except Exception as e:
 
-        print(
-            "NEXT ERROR:",
-            e
+    mood = state.get(
+        "mood"
+    )
+
+
+    if mood not in MOODS:
+
+        send_message(
+
+            user_id,
+
+            "🎧 Mood ရွေးပါ 👇",
+
+            mood_menu()
+
         )
 
+        return
 
-# =========================================================
-# HOME
-# =========================================================
 
-@app.route(
-    "/",
-    methods=["GET"]
-)
-def home():
+    send_track(
 
-    return (
-        "NOT YOUR VIBE MUSIC BOT ONLINE"
+        user_id,
+
+        mood
+
     )
 
 
 # =========================================================
-# HEALTH
+# AUTO DISCOVER TRACK
+# =========================================================
+#
+# Channel ထဲက Bot ရရှိတဲ့ message ကို
+# database ထဲထည့်မယ်။
+#
+# Music message ဖြစ်မဖြစ် အကြမ်းဖျင်းစစ်တယ်။
+#
+
+def process_channel_message(
+    message
+):
+
+    chat = message.get(
+        "chat",
+        {}
+    )
+
+
+    chat_id = chat.get(
+        "id"
+    )
+
+
+    message_id = message.get(
+        "message_id"
+    )
+
+
+    if not chat_id or not message_id:
+
+        return
+
+
+    # -----------------------------------------------------
+    # Find mood from configured channel
+    # -----------------------------------------------------
+
+    mood = None
+
+
+    for m in MOODS:
+
+        configured = str(
+            MOOD_CHANNELS[m]
+        )
+
+
+        if configured == str(
+            chat_id
+        ):
+
+            mood = m
+
+            break
+
+
+        username = chat.get(
+            "username"
+        )
+
+
+        if username:
+
+            if configured.lower() == (
+                "@" + username.lower()
+            ):
+
+                mood = m
+
+                break
+
+
+    if not mood:
+
+        return
+
+
+    # -----------------------------------------------------
+    # Accept music/media messages
+    # -----------------------------------------------------
+
+    is_music = False
+
+
+    if message.get(
+        "audio"
+    ):
+
+        is_music = True
+
+
+    if message.get(
+        "document"
+    ):
+
+        is_music = True
+
+
+    if message.get(
+        "video"
+    ):
+
+        is_music = True
+
+
+    if message.get(
+        "voice"
+    ):
+
+        is_music = True
+
+
+    if not is_music:
+
+        return
+
+
+    add_track(
+
+        mood,
+
+        chat_id,
+
+        message_id
+
+    )
+
+
+    print(
+
+        "NEW TRACK",
+
+        "| mood:",
+        mood,
+
+        "| channel:",
+        chat_id,
+
+        "| message:",
+        message_id
+
+    )
+
+
+# =========================================================
+# START
 # =========================================================
 
-@app.route(
-    "/health",
-    methods=["GET"]
-)
-def health():
+def handle_start(
+    chat_id,
+    user
+):
 
-    return "OK"
+    save_user(
+        user
+    )
+
+
+    send_message(
+
+        chat_id,
+
+        "🎧 NOT YOUR VIBE MUSIC\n\n"
+
+        "Welcome! 🔥\n\n"
+
+        "Choose your mood 👇",
+
+        mood_menu()
+
+    )
 
 
 # =========================================================
@@ -1282,8 +1705,6 @@ def webhook():
 
     # =====================================================
     # CHANNEL POST
-    #
-    # ဒီနေရာက Private channel ID ရှာဖို့ အရေးကြီးဆုံး
     # =====================================================
 
     channel_post = update.get(
@@ -1293,7 +1714,7 @@ def webhook():
 
     if channel_post:
 
-        process_channel_post(
+        process_channel_message(
             channel_post
         )
 
@@ -1322,20 +1743,19 @@ def webhook():
         )
 
 
-        callback_message = (
-            callback.get(
-                "message"
-            )
-            or {}
-        )
+        message = callback.get(
+            "message"
+        ) or {}
 
 
-        chat = (
-            callback_message.get(
-                "chat"
-            )
-            or {}
-        )
+        chat = message.get(
+            "chat"
+        ) or {}
+
+
+        user = callback.get(
+            "from"
+        ) or {}
 
 
         chat_id = chat.get(
@@ -1343,21 +1763,29 @@ def webhook():
         )
 
 
-        if not chat_id:
+        user_id = user.get(
+            "id"
+        )
+
+
+        if not chat_id or not user_id:
 
             answer_callback(
-
                 callback_id,
-
-                "Chat not found"
+                "Error"
             )
 
             return "OK"
 
 
-        # =================================================
-        # MOOD BUTTON
-        # =================================================
+        save_user(
+            user
+        )
+
+
+        # -------------------------------------------------
+        # MOOD
+        # -------------------------------------------------
 
         if data.startswith(
             "mood_"
@@ -1371,71 +1799,50 @@ def webhook():
             if mood not in MOODS:
 
                 answer_callback(
-
                     callback_id,
-
                     "Invalid mood"
                 )
 
                 return "OK"
 
 
-            # ---------------------------------------------
-            # Save mood immediately
-            # ---------------------------------------------
+            set_user_mood(
 
-            state = get_user_state(
-                chat_id
+                user_id,
+
+                mood
+
             )
 
-
-            with STATE_LOCK:
-
-                state["mood"] = mood
-
-                # -----------------------------------------
-                # Mood ပြောင်းရင် history မဖျက်ဘူး။
-                #
-                # ဒါကြောင့် mood တစ်ခုချင်းစီမှာ
-                # သီချင်းထပ်မှုနည်းမယ်။
-                # -----------------------------------------
-
-            # ---------------------------------------------
-            # Callback ကိုချက်ချင်းဖြေ
-            # ---------------------------------------------
 
             answer_callback(
 
                 callback_id,
 
                 f"{MOOD_NAMES[mood]} ✓"
+
             )
 
 
             # ---------------------------------------------
-            # Music send background
+            # Send directly
             # ---------------------------------------------
 
-            threading.Thread(
+            send_track(
 
-                target=background_send,
+                user_id,
 
-                args=(
-                    chat_id,
-                    mood
-                ),
+                mood
 
-                daemon=True
-
-            ).start()
+            )
 
 
             return "OK"
 
 
-        # =================================================
+        # -------------------------------------------------
         # NEXT
-        # =================================================
+        # -------------------------------------------------
 
         if data == "next_music":
 
@@ -1443,29 +1850,22 @@ def webhook():
 
                 callback_id,
 
-                "🔀 Finding next track..."
+                "🔀 Finding next..."
+
             )
 
 
-            threading.Thread(
-
-                target=background_next,
-
-                args=(
-                    chat_id,
-                ),
-
-                daemon=True
-
-            ).start()
+            next_track(
+                user_id
+            )
 
 
             return "OK"
 
 
-        # =================================================
+        # -------------------------------------------------
         # CHANGE MOOD
-        # =================================================
+        # -------------------------------------------------
 
         if data == "change_mood":
 
@@ -1474,16 +1874,18 @@ def webhook():
                 callback_id,
 
                 "🎧 Choose mood"
+
             )
 
 
             send_message(
 
-                chat_id,
+                user_id,
 
                 "🎧 Choose your mood 👇",
 
                 mood_menu()
+
             )
 
 
@@ -1510,54 +1912,60 @@ def webhook():
         )
 
 
+        user = message.get(
+            "from"
+        ) or {}
+
+
         chat_id = chat.get(
             "id"
         )
 
 
+        user_id = user.get(
+            "id"
+        )
+
+
         text = (
+
             message.get(
                 "text",
                 ""
             )
+
             or ""
+
         ).strip()
 
 
-        if not chat_id:
+        if user:
 
-            return "OK"
+            save_user(
+                user
+            )
 
 
-        # =================================================
+        # -------------------------------------------------
         # START
-        # =================================================
+        # -------------------------------------------------
 
         if text == "/start":
 
-            get_user_state(
-                chat_id
-            )
-
-
-            send_message(
+            handle_start(
 
                 chat_id,
 
-                "🎧 NOT YOUR VIBE MUSIC\n\n"
-                "Welcome! 🔥\n\n"
-                "Mood တစ်ခုရွေးပါ 👇",
+                user
 
-                mood_menu()
             )
-
 
             return "OK"
 
 
-        # =================================================
+        # -------------------------------------------------
         # MOOD
-        # =================================================
+        # -------------------------------------------------
 
         if text == "/mood":
 
@@ -1568,65 +1976,28 @@ def webhook():
                 "🎧 Choose your mood 👇",
 
                 mood_menu()
-            )
 
+            )
 
             return "OK"
 
 
-        # =================================================
+        # -------------------------------------------------
         # NEXT
-        # =================================================
+        # -------------------------------------------------
 
         if text == "/next":
 
-            threading.Thread(
-
-                target=background_next,
-
-                args=(
-                    chat_id,
-                ),
-
-                daemon=True
-
-            ).start()
-
-
-            return "OK"
-
-
-        # =================================================
-        # RESET
-        # =================================================
-
-        if text == "/reset":
-
-            with STATE_LOCK:
-
-                USER_STATE.pop(
-                    chat_id,
-                    None
-                )
-
-
-            send_message(
-
-                chat_id,
-
-                "♻️ Your music history has been reset.\n\n"
-                "Choose a mood 👇",
-
-                mood_menu()
+            next_track(
+                user_id
             )
 
-
             return "OK"
 
 
-        # =================================================
+        # -------------------------------------------------
         # HELP
-        # =================================================
+        # -------------------------------------------------
 
         if text == "/help":
 
@@ -1637,19 +2008,86 @@ def webhook():
                 "🎧 NOT YOUR VIBE MUSIC BOT\n\n"
 
                 "/start - Start\n"
-                "/mood - Mood menu\n"
+                "/mood - Choose mood\n"
                 "/next - Next track\n"
-                "/reset - Reset your history\n"
                 "/help - Help\n\n"
 
-                "🎵 Mood ရွေးလိုက်တာနဲ့ "
-                "သက်ဆိုင်ရာ mood channel ထဲက "
-                "track ကို random ရွေးပေးပါတယ်။"
-            )
+                "Select a mood and the bot "
+                "will send a random track."
 
+            )
 
             return "OK"
 
+
+        # -------------------------------------------------
+        # STATS
+        # -------------------------------------------------
+
+        if text == "/stats":
+
+            send_stats(
+                chat_id
+            )
+
+            return "OK"
+
+
+        # -------------------------------------------------
+        # CHANNELS
+        # -------------------------------------------------
+
+        if text == "/channels":
+
+            if ADMIN_ID:
+
+                if chat_id != ADMIN_ID:
+
+                    send_message(
+
+                        chat_id,
+
+                        "❌ Admin only."
+
+                    )
+
+                    return "OK"
+
+
+            get_channel_info(
+                chat_id
+            )
+
+            return "OK"
+
+
+    return "OK"
+
+
+# =========================================================
+# HOME
+# =========================================================
+
+@app.route(
+    "/",
+    methods=["GET"]
+)
+def home():
+
+    return (
+        "NOT YOUR VIBE MUSIC BOT ONLINE"
+    )
+
+
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.route(
+    "/health",
+    methods=["GET"]
+)
+def health():
 
     return "OK"
 
@@ -1692,11 +2130,6 @@ def setup_webhook():
             "url":
                 webhook_url,
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            # channel_post ထည့်ထားတယ်။
-            # ------------------------------------------------
-
             "allowed_updates": [
 
                 "message",
@@ -1707,130 +2140,102 @@ def setup_webhook():
 
             ],
 
-            # ------------------------------------------------
-            # Render load များရင် concurrent webhook delivery
-            # ပိုကောင်းစေဖို့
-            # ------------------------------------------------
-
             "max_connections":
                 40,
 
-            # ------------------------------------------------
-            # Old pending updates မလိုချင်
-            # ------------------------------------------------
-
             "drop_pending_updates":
-                True
+                False
 
         },
 
         timeout=15
+
     )
 
 
     print(
-        "WEBHOOK RESULT:",
+        "WEBHOOK:",
         result
     )
 
 
 # =========================================================
-# WEBHOOK INFO
-# =========================================================
-
-def show_webhook_info():
-
-    result = telegram(
-
-        "getWebhookInfo",
-
-        {},
-
-        timeout=10
-    )
-
-
-    print(
-        "=============================================="
-    )
-
-    print(
-        "WEBHOOK INFO"
-    )
-
-    print(
-        result
-    )
-
-    print(
-        "=============================================="
-    )
-
-
-# =========================================================
-# START
+# MAIN
 # =========================================================
 
 if __name__ == "__main__":
 
     print(
-        "=============================================="
+        "=========================================="
     )
 
     print(
-        "🎧 NOT YOUR VIBE MUSIC BOT v2"
+        "🎧 NOT YOUR VIBE MUSIC BOT"
     )
 
     print(
-        "=============================================="
+        "=========================================="
     )
 
-    print(
-        "Webhook URL:",
-        RENDER_URL
-    )
+
+    # -----------------------------------------------------
+    # Database
+    # -----------------------------------------------------
+
+    init_database()
+
+
+    # -----------------------------------------------------
+    # Check channels
+    # -----------------------------------------------------
+
+    check_channels()
+
+
+    # -----------------------------------------------------
+    # Track statistics
+    # -----------------------------------------------------
 
     print(
-        "=============================================="
+        "TRACK DATABASE:"
     )
 
-    print(
-        "Configured channels:"
-    )
+
+    track_stats = count_tracks()
 
 
     for mood in MOODS:
 
         print(
-            mood,
-            "=>",
-            CHANNELS.get(
-                mood
+
+            MOOD_NAMES[mood],
+
+            "=",
+
+            track_stats.get(
+                mood,
+                0
             )
-            or PUBLIC_CHANNELS.get(
-                mood
-            )
-            or "NOT SET"
+
         )
 
 
     print(
-        "=============================================="
+        "TOTAL USERS:",
+        count_users()
+    )
+
+
+    print(
+        "=========================================="
     )
 
 
     # -----------------------------------------------------
-    # Configure webhook
+    # Webhook
     # -----------------------------------------------------
 
     setup_webhook()
-
-
-    # -----------------------------------------------------
-    # Show webhook status
-    # -----------------------------------------------------
-
-    show_webhook_info()
 
 
     # -----------------------------------------------------
@@ -1843,17 +2248,12 @@ if __name__ == "__main__":
             "PORT",
             "10000"
         )
-    )
 
-
-    print(
-        "Starting server on port:",
-        port
     )
 
 
     # -----------------------------------------------------
-    # Flask
+    # RUN
     # -----------------------------------------------------
 
     app.run(
