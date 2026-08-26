@@ -1,4 +1,4 @@
-Flask==3.1.2
-requests==2.32.5
-Telethon==1.41.2
-gunicorn==23.0.0
+Flask
+requests
+Telethon
+gunicorn
