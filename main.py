@@ -6,7 +6,7 @@ import threading
 import asyncio
 
 import requests
-from flask import Flask
+from flask import Flask, request
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
