@@ -6,6 +6,7 @@ import os
 import random
 import threading
 import time
+
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping, Optional
@@ -15,7 +16,8 @@ from flask import Flask, request
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import PoolError, ThreadedConnectionPool
-from telethon import TelegramClient, events
+
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 
@@ -32,25 +34,40 @@ app = Flask(__name__)
 
 logging.basicConfig(
     level=(os.getenv("LOG_LEVEL") or "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
+    format=(
+        "%(asctime)s | %(levelname)s | "
+        "%(threadName)s | %(message)s"
+    ),
 )
 
-logger = logging.getLogger("not_your_vibe_music_bot")
+logger = logging.getLogger(
+    "not-your-vibe-music-bot"
+)
 
 
 # ============================================================
 # ENV HELPERS
 # ============================================================
 
-def env_text(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or "").strip()
+def env_text(
+    name: str,
+    default: str = ""
+) -> str:
+
+    return (
+        os.getenv(
+            name,
+            default
+        )
+        or ""
+    ).strip()
 
 
 def env_int(
     name: str,
     default: int,
     minimum: int,
-    maximum: int,
+    maximum: int
 ) -> int:
 
     raw = env_text(name)
@@ -62,9 +79,8 @@ def env_int(
         value = int(raw)
     except ValueError:
         logger.warning(
-            "Invalid %s. Using default %s",
-            name,
-            default,
+            "Invalid %s. Using default.",
+            name
         )
         return default
 
@@ -72,9 +88,9 @@ def env_int(
         return value
 
     logger.warning(
-        "%s out of range. Using default %s",
-        name,
-        default,
+        "%s is outside allowed range. "
+        "Using default.",
+        name
     )
 
     return default
@@ -82,7 +98,7 @@ def env_int(
 
 def env_bool(
     name: str,
-    default: bool = False,
+    default: bool = False
 ) -> bool:
 
     raw = env_text(name).lower()
@@ -94,12 +110,12 @@ def env_bool(
         "1",
         "true",
         "yes",
-        "on",
+        "on"
     }
 
 
 # ============================================================
-# ENVIRONMENT
+# ENVIRONMENT VARIABLES
 # ============================================================
 
 BOT_TOKEN = env_text(
@@ -121,7 +137,6 @@ if not RENDER_EXTERNAL_URL:
     )
 
     if hostname:
-
         RENDER_EXTERNAL_URL = (
             f"https://{hostname}"
         )
@@ -143,13 +158,17 @@ DATABASE_URL = env_text(
 
 TELETHON_API_ID = (
     env_text("TELETHON_API_ID")
-    or env_text("API_ID")
+    or
+    env_text("API_ID")
 )
+
 
 TELETHON_API_HASH = (
     env_text("TELETHON_API_HASH")
-    or env_text("API_HASH")
+    or
+    env_text("API_HASH")
 )
+
 
 TELETHON_SESSION = env_text(
     "TELETHON_SESSION"
@@ -164,47 +183,53 @@ HTTP_TIMEOUT = env_int(
     "TELEGRAM_HTTP_TIMEOUT",
     20,
     5,
-    120,
+    120
 )
 
-WORKER_COUNT = env_int(
-    "MUSIC_WORKER_COUNT",
-    4,
-    1,
-    8,
-)
 
 DB_POOL_MAX_CONNECTIONS = env_int(
     "DB_POOL_MAX_CONNECTIONS",
     8,
     2,
-    20,
+    20
 )
+
+
+WORKER_COUNT = env_int(
+    "MUSIC_WORKER_COUNT",
+    4,
+    1,
+    8
+)
+
 
 RECENT_HISTORY_LIMIT = env_int(
     "RECENT_HISTORY_LIMIT",
     30,
     1,
-    500,
+    500
 )
+
 
 TRACK_CANDIDATE_LIMIT = env_int(
     "TRACK_CANDIDATE_LIMIT",
     100,
     1,
-    1000,
+    1000
 )
+
 
 WEBHOOK_MAX_CONNECTIONS = env_int(
     "WEBHOOK_MAX_CONNECTIONS",
     40,
     1,
-    100,
+    100
 )
+
 
 DROP_PENDING_UPDATES = env_bool(
     "DROP_PENDING_UPDATES",
-    False,
+    False
 )
 
 
@@ -249,55 +274,84 @@ MOOD_NAMES = {
 
     "melodic":
         "🌌 MELODIC",
+
+}
+
+
+# ============================================================
+# MOOD DESCRIPTIONS
+# ============================================================
+
+MOOD_DESCRIPTIONS = {
+
+    "sad":
+        "Emotional • Deep • Lonely",
+
+    "love":
+        "Romantic • Soft • Feelings",
+
+    "chill":
+        "Relax • Smooth • Vibes",
+
+    "hype":
+        "Bass • Energy • Festival",
+
+    "dark":
+        "Dark • Heavy • Intense",
+
+    "energetic":
+        "High Energy • Dance • Power",
+
+    "night":
+        "Late Night • Drive • Neon",
+
+    "melodic":
+        "Emotional • Atmospheric • Beautiful",
+
 }
 
 
 # ============================================================
 # CHANNELS
 # ============================================================
+#
+# HYPE + MELODIC are fixed.
+#
+# Other channels can be supplied through Render ENV.
+#
+# ============================================================
 
 MOOD_CHANNELS = {
 
     "sad":
-        env_text(
-            "SAD_CHANNEL"
-        ),
+        env_text("SAD_CHANNEL"),
 
     "love":
-        env_text(
-            "LOVE_CHANNEL"
-        ),
+        env_text("LOVE_CHANNEL"),
 
     "chill":
-        env_text(
-            "CHILL_CHANNEL"
-        ),
+        env_text("CHILL_CHANNEL"),
 
     "hype":
         "-1004427220481",
 
     "dark":
-        env_text(
-            "DARK_CHANNEL"
-        ),
+        env_text("DARK_CHANNEL"),
 
     "energetic":
-        env_text(
-            "ENERGETIC_CHANNEL"
-        ),
+        env_text("ENERGETIC_CHANNEL"),
 
     "night":
-        env_text(
-            "NIGHT_CHANNEL"
-        ),
+        env_text("NIGHT_CHANNEL"),
 
     "melodic":
         "-1004446996297",
+
 }
 
 
 # ============================================================
-# AUDIO TYPES
+# AUDIO EXTENSIONS
 # ============================================================
 
 AUDIO_EXTENSIONS = (
@@ -320,11 +374,10 @@ AUDIO_EXTENSIONS = (
 # GLOBALS
 # ============================================================
 
-http_local = threading.local()
-
 db_pool: Optional[
     ThreadedConnectionPool
 ] = None
+
 
 db_pool_lock = threading.Lock()
 
@@ -333,32 +386,39 @@ telethon_client: Optional[
     TelegramClient
 ] = None
 
+
 telethon_ready = threading.Event()
+
 
 telethon_thread: Optional[
     threading.Thread
 ] = None
+
 
 telethon_start_lock = threading.Lock()
 
 
 music_executor = ThreadPoolExecutor(
     max_workers=WORKER_COUNT,
-    thread_name_prefix="music-request",
+    thread_name_prefix="music-request"
 )
 
 
 pending_music_users: set[int] = set()
 
+
 pending_music_lock = threading.Lock()
 
 
+http_local = threading.local()
+
+
 # ============================================================
-# POSTGRESQL
+# DATABASE
 # ============================================================
 
 def normalize_database_url(
-    url: str,
+    url: str
 ) -> str:
 
     if url.startswith(
@@ -367,11 +427,16 @@ def normalize_database_url(
 
         return (
             "postgresql://"
-            + url[11:]
+            +
+            url[len("postgres://"):]
         )
 
     return url
 
+
+# ============================================================
+# CREATE DB POOL
+# ============================================================
 
 def initialize_db_pool() -> None:
 
@@ -381,39 +446,49 @@ def initialize_db_pool() -> None:
 
         raise RuntimeError(
             "DATABASE_URL is missing. "
-            "Add Render PostgreSQL Internal Database URL."
+            "Add Render PostgreSQL "
+            "Internal Database URL."
         )
+
 
     with db_pool_lock:
 
-        if db_pool is None:
+        if db_pool is not None:
+            return
 
-            logger.info(
-                "🐘 Creating PostgreSQL connection pool..."
-            )
 
-            db_pool = ThreadedConnectionPool(
+        logger.info(
+            "🔐 Creating PostgreSQL connection pool..."
+        )
 
-                1,
 
-                DB_POOL_MAX_CONNECTIONS,
+        db_pool = ThreadedConnectionPool(
 
-                dsn=normalize_database_url(
-                    DATABASE_URL
-                ),
+            1,
 
-                connect_timeout=10,
+            DB_POOL_MAX_CONNECTIONS,
 
-                application_name=(
-                    "not-your-vibe-music-bot"
-                ),
+            dsn=normalize_database_url(
+                DATABASE_URL
+            ),
 
-            )
+            connect_timeout=10,
 
-            logger.info(
-                "✅ PostgreSQL pool ready"
-            )
+            application_name=(
+                "not-your-vibe-music-bot"
+            ),
 
+        )
+
+
+        logger.info(
+            "✅ PostgreSQL connection pool created"
+        )
+
+
+# ============================================================
+# DB CONNECTION
+# ============================================================
 
 @contextmanager
 def db_connection() -> Iterator[Any]:
@@ -422,15 +497,19 @@ def db_connection() -> Iterator[Any]:
 
         initialize_db_pool()
 
+
     assert db_pool is not None
 
+
     connection = None
+
 
     try:
 
         connection = db_pool.getconn()
 
         connection.autocommit = False
+
 
         try:
 
@@ -440,19 +519,28 @@ def db_connection() -> Iterator[Any]:
                     "SELECT 1"
                 )
 
+
         except (
             OperationalError,
-            InterfaceError,
+            InterfaceError
         ):
 
             logger.warning(
-                "♻️ Replacing broken PostgreSQL connection"
+                "⚠️ PostgreSQL connection "
+                "was stale. Reconnecting..."
             )
 
-            db_pool.putconn(
-                connection,
-                close=True,
-            )
+
+            try:
+
+                db_pool.putconn(
+                    connection,
+                    close=True
+                )
+
+            except Exception:
+                pass
+
 
             connection = (
                 db_pool.getconn()
@@ -460,9 +548,12 @@ def db_connection() -> Iterator[Any]:
 
             connection.autocommit = False
 
+
         yield connection
 
+
         connection.commit()
+
 
     except Exception:
 
@@ -472,14 +563,12 @@ def db_connection() -> Iterator[Any]:
 
                 connection.rollback()
 
-            except (
-                OperationalError,
-                InterfaceError,
-            ):
-
+            except Exception:
                 pass
 
+
         raise
+
 
     finally:
 
@@ -494,17 +583,22 @@ def db_connection() -> Iterator[Any]:
             except (
                 PoolError,
                 OperationalError,
-                InterfaceError,
+                InterfaceError
             ):
 
                 logger.exception(
-                    "Could not return DB connection"
+                    "Could not return "
+                    "PostgreSQL connection"
                 )
 
 
+# ============================================================
+# DB CURSOR
+# ============================================================
+
 @contextmanager
 def db_cursor(
-    connection: Any,
+    connection: Any
 ) -> Iterator[Any]:
 
     cursor = connection.cursor(
@@ -521,10 +615,13 @@ def db_cursor(
 
 
 # ============================================================
-# DATABASE INIT
+# INIT DATABASE
 # ============================================================
 
 def init_db() -> None:
+
+    initialize_db_pool()
+
 
     schema = """
 
@@ -542,8 +639,7 @@ def init_db() -> None:
 
             last_seen BIGINT NOT NULL,
 
-            total_requests BIGINT
-                NOT NULL DEFAULT 0
+            total_requests BIGINT NOT NULL DEFAULT 0
 
         );
 
@@ -560,10 +656,7 @@ def init_db() -> None:
 
             created_at BIGINT NOT NULL,
 
-            UNIQUE(
-                channel_id,
-                message_id
-            )
+            UNIQUE(channel_id, message_id)
 
         );
 
@@ -605,8 +698,7 @@ def init_db() -> None:
         );
 
 
-        CREATE INDEX IF NOT EXISTS
-        idx_tracks_mood
+        CREATE INDEX IF NOT EXISTS idx_tracks_mood
 
         ON tracks(mood);
 
@@ -631,7 +723,6 @@ def init_db() -> None:
 
     """
 
-    initialize_db_pool()
 
     with db_connection() as connection:
 
@@ -641,16 +732,20 @@ def init_db() -> None:
                 schema
             )
 
+
+            # Keep only 7 days of webhook
+            # deduplication records.
+
             cursor.execute(
                 """
                 DELETE FROM processed_updates
                 WHERE processed_at < %s
                 """,
                 (
-                    int(time.time())
-                    - 604800,
-                ),
+                    int(time.time()) - 604800,
+                )
             )
+
 
     logger.info(
         "✅ PostgreSQL database is ready"
@@ -658,19 +753,20 @@ def init_db() -> None:
 
 
 # ============================================================
-# UPDATE DEDUPLICATION
+# WEBHOOK UPDATE DEDUPLICATION
 # ============================================================
 
 def claim_update(
-    update_id: Any,
+    update_id: Any
 ) -> bool:
 
     if not isinstance(
         update_id,
-        int,
+        int
     ):
 
         return True
+
 
     try:
 
@@ -679,52 +775,316 @@ def claim_update(
             with db_cursor(connection) as cursor:
 
                 cursor.execute(
-
                     """
-                    INSERT INTO processed_updates(
+                    INSERT INTO processed_updates
+                    (
                         update_id,
                         processed_at
                     )
-
                     VALUES (%s, %s)
 
-                    ON CONFLICT (
-                        update_id
-                    )
-
+                    ON CONFLICT (update_id)
                     DO NOTHING
 
                     RETURNING update_id
                     """,
-
                     (
                         update_id,
-                        int(time.time()),
-                    ),
-
+                        int(time.time())
+                    )
                 )
+
 
                 return (
                     cursor.fetchone()
                     is not None
                 )
 
+
     except Exception:
 
         logger.exception(
             "Could not deduplicate update %s",
-            update_id,
+            update_id
         )
 
         return True
 
 
 # ============================================================
-# USER
+# HTTP SESSION
+# ============================================================
+
+def get_http_session() -> requests.Session:
+
+    session = getattr(
+        http_local,
+        "session",
+        None
+    )
+
+
+    if session is None:
+
+        session = requests.Session()
+
+
+        session.headers.update({
+
+            "User-Agent":
+                "NOT-YOUR-VIBE-MUSIC-BOT/POSTGRES-2.0"
+
+        })
+
+
+        http_local.session = session
+
+
+    return session
+
+
+# ============================================================
+# TELEGRAM API
+# ============================================================
+
+def telegram(
+    method: str,
+    data: Optional[
+        dict[str, Any]
+    ] = None,
+    timeout: int = HTTP_TIMEOUT
+) -> dict[str, Any]:
+
+    if not BOT_TOKEN:
+
+        return {
+
+            "ok": False,
+
+            "description":
+                "BOT_TOKEN missing"
+
+        }
+
+
+    url = (
+
+        "https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/{method}"
+
+    )
+
+
+    try:
+
+        response = get_http_session().post(
+
+            url,
+
+            json=data or {},
+
+            timeout=timeout
+
+        )
+
+
+        try:
+
+            result = response.json()
+
+        except ValueError:
+
+            result = {
+
+                "ok": False,
+
+                "description":
+                    (
+                        "Non-JSON response "
+                        f"HTTP {response.status_code}"
+                    )
+
+            }
+
+
+        if not isinstance(
+            result,
+            dict
+        ):
+
+            result = {
+
+                "ok": False,
+
+                "description":
+                    "Unexpected Telegram response"
+
+            }
+
+
+        if (
+            response.status_code >= 400
+            or
+            not result.get("ok")
+        ):
+
+            logger.warning(
+
+                "Telegram %s failed: %s",
+
+                method,
+
+                result.get(
+                    "description",
+                    result
+                )
+
+            )
+
+
+        return result
+
+
+    except requests.RequestException as exc:
+
+        logger.warning(
+
+            "Telegram request %s failed: %s",
+
+            method,
+
+            exc
+
+        )
+
+
+        return {
+
+            "ok": False,
+
+            "description":
+                str(exc)
+
+        }
+
+
+# ============================================================
+# SEND MESSAGE
+# ============================================================
+
+def send_message(
+    chat_id: int,
+    text: str,
+    keyboard: Optional[
+        dict[str, Any]
+    ] = None
+) -> dict[str, Any]:
+
+    data: dict[str, Any] = {
+
+        "chat_id":
+            chat_id,
+
+        "text":
+            text,
+
+        "disable_web_page_preview":
+            True,
+
+    }
+
+
+    if keyboard is not None:
+
+        data[
+            "reply_markup"
+        ] = keyboard
+
+
+    return telegram(
+
+        "sendMessage",
+
+        data,
+
+        timeout=15
+
+    )
+
+
+# ============================================================
+# CALLBACK
+# ============================================================
+
+def answer_callback(
+    callback_id: Any,
+    text: str = ""
+) -> dict[str, Any]:
+
+    if not callback_id:
+
+        return {
+            "ok": False
+        }
+
+
+    return telegram(
+
+        "answerCallbackQuery",
+
+        {
+
+            "callback_query_id":
+                callback_id,
+
+            "text":
+                text,
+
+        },
+
+        timeout=8
+
+    )
+
+
+# ============================================================
+# COPY MUSIC
+# ============================================================
+
+def copy_music(
+    chat_id: int,
+    channel_id: str,
+    message_id: int
+) -> dict[str, Any]:
+
+    return telegram(
+
+        "copyMessage",
+
+        {
+
+            "chat_id":
+                chat_id,
+
+            "from_chat_id":
+                channel_id,
+
+            "message_id":
+                message_id,
+
+        },
+
+        timeout=30
+
+    )
+
+
+# ============================================================
+# USERS
 # ============================================================
 
 def register_user(
-    user: Mapping[str, Any],
+    user: Mapping[str, Any]
 ) -> None:
 
     user_id = (
@@ -733,16 +1093,19 @@ def register_user(
         else None
     )
 
+
     if not isinstance(
         user_id,
-        int,
+        int
     ):
 
         return
 
+
     now = int(
         time.time()
     )
+
 
     try:
 
@@ -753,8 +1116,8 @@ def register_user(
                 cursor.execute(
 
                     """
-                    INSERT INTO users(
-
+                    INSERT INTO users
+                    (
                         user_id,
                         username,
                         first_name,
@@ -762,17 +1125,20 @@ def register_user(
                         first_seen,
                         last_seen,
                         total_requests
-
                     )
 
-                    VALUES (
-                        %s, %s, %s,
-                        %s, %s, %s, 1
+                    VALUES
+                    (
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        1
                     )
 
-                    ON CONFLICT (
-                        user_id
-                    )
+                    ON CONFLICT (user_id)
 
                     DO UPDATE SET
 
@@ -793,21 +1159,35 @@ def register_user(
                     """,
 
                     (
+
                         user_id,
-                        user.get("username"),
-                        user.get("first_name"),
-                        user.get("last_name"),
+
+                        user.get(
+                            "username"
+                        ),
+
+                        user.get(
+                            "first_name"
+                        ),
+
+                        user.get(
+                            "last_name"
+                        ),
+
                         now,
+
                         now,
-                    ),
+
+                    )
 
                 )
+
 
     except Exception:
 
         logger.exception(
             "Could not register user %s",
-            user_id,
+            user_id
         )
 
 
@@ -818,27 +1198,22 @@ def register_user(
 def save_track(
     mood: str,
     channel_id: Any,
-    message_id: Any,
+    message_id: Any
 ) -> None:
 
     if mood not in MOODS:
         return
 
+
     if not channel_id:
         return
+
 
     if not message_id:
         return
 
+
     try:
-
-        channel_id = str(
-            channel_id
-        )
-
-        message_id = int(
-            message_id
-        )
 
         with db_connection() as connection:
 
@@ -847,20 +1222,24 @@ def save_track(
                 cursor.execute(
 
                     """
-                    INSERT INTO tracks(
-
+                    INSERT INTO tracks
+                    (
                         mood,
                         channel_id,
                         message_id,
                         created_at
-
                     )
 
-                    VALUES (
-                        %s, %s, %s, %s
+                    VALUES
+                    (
+                        %s,
+                        %s,
+                        %s,
+                        %s
                     )
 
-                    ON CONFLICT (
+                    ON CONFLICT
+                    (
                         channel_id,
                         message_id
                     )
@@ -869,13 +1248,25 @@ def save_track(
                     """,
 
                     (
+
                         mood,
-                        channel_id,
-                        message_id,
-                        int(time.time()),
-                    ),
+
+                        str(
+                            channel_id
+                        ),
+
+                        int(
+                            message_id
+                        ),
+
+                        int(
+                            time.time()
+                        ),
+
+                    )
 
                 )
+
 
     except Exception:
 
@@ -889,11 +1280,12 @@ def save_track(
 # ============================================================
 
 def get_track_count(
-    mood: str,
+    mood: str
 ) -> int:
 
     if mood not in MOODS:
         return 0
+
 
     try:
 
@@ -909,17 +1301,24 @@ def get_track_count(
                     WHERE mood = %s
                     """,
 
-                    (mood,),
+                    (
+                        mood,
+                    )
 
                 )
+
 
                 row = cursor.fetchone()
 
-                return (
-                    int(row["count"])
-                    if row
-                    else 0
+
+                if not row:
+                    return 0
+
+
+                return int(
+                    row["count"]
                 )
+
 
     except Exception:
 
@@ -931,16 +1330,16 @@ def get_track_count(
 
 
 # ============================================================
-# USER MOOD
+# TRACK COUNTS
 # ============================================================
 
-def set_user_mood(
-    user_id: int,
-    mood: str,
-) -> bool:
+def get_track_counts() -> dict[str, int]:
 
-    if mood not in MOODS:
-        return False
+    counts = {
+        mood: 0
+        for mood in MOODS
+    }
+
 
     try:
 
@@ -951,19 +1350,87 @@ def set_user_mood(
                 cursor.execute(
 
                     """
-                    INSERT INTO user_state(
+                    SELECT
+                        mood,
+                        COUNT(*) AS count
 
+                    FROM tracks
+
+                    GROUP BY mood
+                    """
+
+                )
+
+
+                for row in cursor.fetchall():
+
+                    mood = row[
+                        "mood"
+                    ]
+
+
+                    if mood in counts:
+
+                        counts[mood] = int(
+                            row["count"]
+                        )
+
+
+    except Exception:
+
+        logger.exception(
+            "Could not collect track statistics"
+        )
+
+
+    return counts
+
+
+# ============================================================
+# USER MOOD
+# ============================================================
+
+def set_user_mood(
+    user_id: int,
+    mood: str
+) -> bool:
+
+    if not isinstance(
+        user_id,
+        int
+    ):
+
+        return False
+
+
+    if mood not in MOODS:
+        return False
+
+
+    try:
+
+        with db_connection() as connection:
+
+            with db_cursor(connection) as cursor:
+
+                cursor.execute(
+
+                    """
+                    INSERT INTO user_state
+                    (
                         user_id,
                         mood,
                         updated_at
-
                     )
 
-                    VALUES (%s, %s, %s)
-
-                    ON CONFLICT (
-                        user_id
+                    VALUES
+                    (
+                        %s,
+                        %s,
+                        %s
                     )
+
+                    ON CONFLICT (user_id)
 
                     DO UPDATE SET
 
@@ -975,14 +1442,22 @@ def set_user_mood(
                     """,
 
                     (
+
                         user_id,
+
                         mood,
-                        int(time.time()),
-                    ),
+
+                        int(
+                            time.time()
+                        ),
+
+                    )
 
                 )
 
+
         return True
+
 
     except Exception:
 
@@ -993,9 +1468,21 @@ def set_user_mood(
         return False
 
 
+# ============================================================
+# GET USER MOOD
+# ============================================================
+
 def get_user_mood(
-    user_id: int,
+    user_id: int
 ) -> Optional[str]:
+
+    if not isinstance(
+        user_id,
+        int
+    ):
+
+        return None
+
 
     try:
 
@@ -1011,21 +1498,31 @@ def get_user_mood(
                     WHERE user_id = %s
                     """,
 
-                    (user_id,),
+                    (
+                        user_id,
+                    )
 
                 )
 
+
                 row = cursor.fetchone()
 
-                if row and row["mood"] in MOODS:
+
+                if (
+                    row
+                    and
+                    row["mood"] in MOODS
+                ):
 
                     return row["mood"]
+
 
     except Exception:
 
         logger.exception(
             "Could not read user mood"
         )
+
 
     return None
 
@@ -1036,11 +1533,22 @@ def get_user_mood(
 
 def reserve_track(
     user_id: int,
-    mood: str,
-) -> Optional[tuple[int, str]]:
+    mood: str
+) -> Optional[
+    tuple[int, str]
+]:
+
+    if not isinstance(
+        user_id,
+        int
+    ):
+
+        return None
+
 
     if mood not in MOODS:
         return None
+
 
     try:
 
@@ -1048,13 +1556,21 @@ def reserve_track(
 
             with db_cursor(connection) as cursor:
 
-                # Prevent two simultaneous requests
+                # Prevent two simultaneous
+                # requests from the same user.
+
                 cursor.execute(
+
                     """
                     SELECT pg_advisory_xact_lock(%s)
                     """,
-                    (user_id,),
+
+                    (
+                        user_id,
+                    )
+
                 )
+
 
                 cursor.execute(
 
@@ -1077,23 +1593,40 @@ def reserve_track(
                     """,
 
                     (
+
                         user_id,
+
                         mood,
+
                         RECENT_HISTORY_LIMIT,
-                    ),
+
+                    )
 
                 )
+
 
                 recent = {
 
                     (
-                        str(row["channel_id"]),
-                        int(row["message_id"]),
+                        str(
+                            row[
+                                "channel_id"
+                            ]
+                        ),
+
+                        int(
+                            row[
+                                "message_id"
+                            ]
+                        )
+
                     )
 
-                    for row in cursor.fetchall()
+                    for row
+                    in cursor.fetchall()
 
                 }
+
 
                 cursor.execute(
 
@@ -1112,83 +1645,143 @@ def reserve_track(
                     """,
 
                     (
+
                         mood,
+
                         TRACK_CANDIDATE_LIMIT,
-                    ),
+
+                    )
 
                 )
 
+
                 rows = cursor.fetchall()
 
+
                 if not rows:
+
                     return None
+
 
                 candidates = [
 
                     (
-                        int(row["message_id"]),
-                        str(row["channel_id"]),
+
+                        int(
+                            row[
+                                "message_id"
+                            ]
+                        ),
+
+                        str(
+                            row[
+                                "channel_id"
+                            ]
+                        )
+
                     )
 
-                    for row in rows
+                    for row
+                    in rows
 
                     if (
-                        str(row["channel_id"]),
-                        int(row["message_id"]),
-                    )
-                    not in recent
+
+                        str(
+                            row[
+                                "channel_id"
+                            ]
+                        ),
+
+                        int(
+                            row[
+                                "message_id"
+                            ]
+                        )
+
+                    ) not in recent
 
                 ]
+
 
                 if not candidates:
 
                     candidates = [
 
                         (
-                            int(row["message_id"]),
-                            str(row["channel_id"]),
+
+                            int(
+                                row[
+                                    "message_id"
+                                ]
+                            ),
+
+                            str(
+                                row[
+                                    "channel_id"
+                                ]
+                            )
+
                         )
 
-                        for row in rows
+                        for row
+                        in rows
 
                     ]
 
+
                 message_id, channel_id = (
-                    random.choice(candidates)
+                    random.choice(
+                        candidates
+                    )
                 )
+
 
                 cursor.execute(
 
                     """
-                    INSERT INTO user_history(
-
-                        user_id,
-                        mood,
-                        channel_id,
-                        message_id,
-                        sent_at
-
-                    )
-
-                    VALUES (
-                        %s, %s, %s, %s, %s
-                    )
-                    """,
-
+                    INSERT INTO user_history
                     (
                         user_id,
                         mood,
                         channel_id,
                         message_id,
-                        int(time.time()),
-                    ),
+                        sent_at
+                    )
+
+                    VALUES
+                    (
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        %s
+                    )
+                    """,
+
+                    (
+
+                        user_id,
+
+                        mood,
+
+                        channel_id,
+
+                        message_id,
+
+                        int(
+                            time.time()
+                        ),
+
+                    )
 
                 )
+
 
                 return (
                     message_id,
-                    channel_id,
+                    channel_id
                 )
+
 
     except Exception:
 
@@ -1206,7 +1799,7 @@ def reserve_track(
 def remove_failed_history(
     user_id: int,
     channel_id: str,
-    message_id: int,
+    message_id: int
 ) -> None:
 
     try:
@@ -1235,16 +1828,22 @@ def remove_failed_history(
                         ORDER BY id DESC
 
                         LIMIT 1
+
                     )
                     """,
 
                     (
+
                         user_id,
+
                         channel_id,
+
                         message_id,
-                    ),
+
+                    )
 
                 )
+
 
     except Exception:
 
@@ -1254,7 +1853,7 @@ def remove_failed_history(
 
 
 # ============================================================
-# USERS COUNT
+# USER COUNT
 # ============================================================
 
 def get_users_count() -> int:
@@ -1272,13 +1871,16 @@ def get_users_count() -> int:
                     """
                 )
 
+
                 row = cursor.fetchone()
 
-                return (
-                    int(row["count"])
-                    if row
-                    else 0
-                )
+
+                if row:
+
+                    return int(
+                        row["count"]
+                    )
+
 
     except Exception:
 
@@ -1286,293 +1888,8 @@ def get_users_count() -> int:
             "Could not count users"
         )
 
-        return 0
 
-
-# ============================================================
-# TRACK COUNTS
-# ============================================================
-
-def get_track_counts() -> dict[str, int]:
-
-    counts = {
-        mood: 0
-        for mood in MOODS
-    }
-
-    try:
-
-        with db_connection() as connection:
-
-            with db_cursor(connection) as cursor:
-
-                cursor.execute(
-
-                    """
-                    SELECT
-                        mood,
-                        COUNT(*) AS count
-
-                    FROM tracks
-
-                    GROUP BY mood
-                    """
-
-                )
-
-                for row in cursor.fetchall():
-
-                    mood = row["mood"]
-
-                    if mood in counts:
-
-                        counts[mood] = int(
-                            row["count"]
-                        )
-
-    except Exception:
-
-        logger.exception(
-            "Could not collect track stats"
-        )
-
-    return counts
-
-
-# ============================================================
-# TELEGRAM HTTP
-# ============================================================
-
-def get_http_session() -> requests.Session:
-
-    session = getattr(
-        http_local,
-        "session",
-        None,
-    )
-
-    if session is None:
-
-        session = requests.Session()
-
-        session.headers.update({
-
-            "User-Agent":
-                "NOT-YOUR-VIBE-MUSIC-BOT/7.0"
-
-        })
-
-        http_local.session = session
-
-    return session
-
-
-def telegram(
-    method: str,
-    data: Optional[
-        dict[str, Any]
-    ] = None,
-    timeout: int = HTTP_TIMEOUT,
-) -> dict[str, Any]:
-
-    if not BOT_TOKEN:
-
-        return {
-            "ok": False,
-            "description":
-                "BOT_TOKEN missing",
-        }
-
-    try:
-
-        response = (
-            get_http_session().post(
-
-                f"https://api.telegram.org/"
-                f"bot{BOT_TOKEN}/{method}",
-
-                json=data or {},
-
-                timeout=timeout,
-
-            )
-        )
-
-        try:
-
-            result = response.json()
-
-        except ValueError:
-
-            result = {
-
-                "ok": False,
-
-                "description":
-                    (
-                        "Non-JSON response: "
-                        f"HTTP {response.status_code}"
-                    ),
-
-            }
-
-        if not isinstance(
-            result,
-            dict,
-        ):
-
-            result = {
-
-                "ok": False,
-
-                "description":
-                    "Unexpected Telegram response",
-
-            }
-
-        if (
-            response.status_code >= 400
-            or not result.get("ok")
-        ):
-
-            logger.warning(
-
-                "Telegram %s failed: %s",
-
-                method,
-
-                result.get(
-                    "description",
-                    result,
-                ),
-
-            )
-
-        return result
-
-    except requests.RequestException as exc:
-
-        logger.warning(
-
-            "Telegram request %s failed: %s",
-
-            method,
-
-            exc,
-
-        )
-
-        return {
-
-            "ok": False,
-
-            "description":
-                str(exc),
-
-        }
-
-
-# ============================================================
-# SEND MESSAGE
-# ============================================================
-
-def send_message(
-    chat_id: int,
-    text: str,
-    keyboard: Optional[
-        dict[str, Any]
-    ] = None,
-) -> dict[str, Any]:
-
-    data = {
-
-        "chat_id":
-            chat_id,
-
-        "text":
-            text,
-
-        "disable_web_page_preview":
-            True,
-
-    }
-
-    if keyboard is not None:
-
-        data[
-            "reply_markup"
-        ] = keyboard
-
-    return telegram(
-        "sendMessage",
-        data,
-        timeout=15,
-    )
-
-
-# ============================================================
-# CALLBACK
-# ============================================================
-
-def answer_callback(
-    callback_id: Any,
-    text: str = "",
-) -> dict[str, Any]:
-
-    if not callback_id:
-
-        return {
-            "ok": False
-        }
-
-    return telegram(
-
-        "answerCallbackQuery",
-
-        {
-            "callback_query_id":
-                callback_id,
-
-            "text":
-                text,
-
-        },
-
-        timeout=8,
-
-    )
-
-
-# ============================================================
-# COPY MUSIC
-# ============================================================
-
-def copy_music(
-    chat_id: int,
-    channel_id: str,
-    message_id: int,
-) -> dict[str, Any]:
-
-    return telegram(
-
-        "copyMessage",
-
-        {
-
-            "chat_id":
-                chat_id,
-
-            "from_chat_id":
-                channel_id,
-
-            "message_id":
-                message_id,
-
-        },
-
-        timeout=30,
-
-    )
+    return 0
 
 
 # ============================================================
@@ -1590,17 +1907,15 @@ def mood_menu() -> dict[str, Any]:
                 {
                     "text":
                         "😢  SAD",
-
                     "callback_data":
-                        "mood_sad",
+                        "mood_sad"
                 },
 
                 {
                     "text":
                         "❤️  LOVE",
-
                     "callback_data":
-                        "mood_love",
+                        "mood_love"
                 },
 
             ],
@@ -1610,17 +1925,15 @@ def mood_menu() -> dict[str, Any]:
                 {
                     "text":
                         "🌙  CHILL",
-
                     "callback_data":
-                        "mood_chill",
+                        "mood_chill"
                 },
 
                 {
                     "text":
                         "🔥  HYPE",
-
                     "callback_data":
-                        "mood_hype",
+                        "mood_hype"
                 },
 
             ],
@@ -1630,17 +1943,15 @@ def mood_menu() -> dict[str, Any]:
                 {
                     "text":
                         "🖤  DARK",
-
                     "callback_data":
-                        "mood_dark",
+                        "mood_dark"
                 },
 
                 {
                     "text":
                         "⚡  ENERGY",
-
                     "callback_data":
-                        "mood_energetic",
+                        "mood_energetic"
                 },
 
             ],
@@ -1650,17 +1961,15 @@ def mood_menu() -> dict[str, Any]:
                 {
                     "text":
                         "🚗  NIGHT DRIVE",
-
                     "callback_data":
-                        "mood_night",
+                        "mood_night"
                 },
 
                 {
                     "text":
                         "🌌  MELODIC",
-
                     "callback_data":
-                        "mood_melodic",
+                        "mood_melodic"
                 },
 
             ],
@@ -1671,7 +1980,7 @@ def mood_menu() -> dict[str, Any]:
 
 
 # ============================================================
-# PREMIUM MUSIC BUTTONS
+# MUSIC BUTTONS
 # ============================================================
 
 def music_buttons() -> dict[str, Any]:
@@ -1684,10 +1993,9 @@ def music_buttons() -> dict[str, Any]:
 
                 {
                     "text":
-                        "⏭️  NEXT TRACK",
-
+                        "🔀  NEXT TRACK",
                     "callback_data":
-                        "next_music",
+                        "next_music"
                 }
 
             ],
@@ -1696,10 +2004,9 @@ def music_buttons() -> dict[str, Any]:
 
                 {
                     "text":
-                        "🎚️  CHANGE MOOD",
-
+                        "🎧  CHANGE MOOD",
                     "callback_data":
-                        "change_mood",
+                        "change_mood"
                 }
 
             ],
@@ -1710,27 +2017,50 @@ def music_buttons() -> dict[str, Any]:
 
 
 # ============================================================
-# PREMIUM START TEXT
+# WELCOME TEXT
 # ============================================================
 
-START_TEXT = (
-    "🎧  NOT YOUR VIBE\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "YOUR MUSIC. YOUR MOOD.\n\n"
-    "Discover a track that matches\n"
-    "your current vibe. 🎶\n\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "✨  SELECT YOUR MOOD"
-)
+def welcome_text() -> str:
+
+    return (
+
+        "🎧  NOT YOUR VIBE\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Welcome to your personal "
+        "music mood selector. ✦\n\n"
+
+        "Choose a vibe below and "
+        "let the music find you.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "✦ Curated by NOT YOUR VIBE\n"
+        "✦ Mood-based music discovery\n"
+        "━━━━━━━━━━━━━━━━━━"
+
+    )
 
 
-MOOD_TEXT = (
-    "🎚️  MOOD SELECTOR\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "What are you feeling right now?\n\n"
-    "Choose your vibe below 👇\n\n"
-    "━━━━━━━━━━━━━━━━━━━━"
-)
+# ============================================================
+# MOOD SELECTED TEXT
+# ============================================================
+
+def mood_selected_text(
+    mood: str
+) -> str:
+
+    return (
+
+        f"{MOOD_NAMES[mood]}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"✦ {MOOD_DESCRIPTIONS[mood]}\n\n"
+
+        "🎧 Finding something for you...\n\n"
+
+        "━━━━━━━━━━━━━━━━━━"
+
+    )
 
 
 # ============================================================
@@ -1740,7 +2070,7 @@ MOOD_TEXT = (
 def send_music(
     chat_id: int,
     user_id: int,
-    mood: str,
+    mood: str
 ) -> None:
 
     if mood not in MOODS:
@@ -1749,14 +2079,14 @@ def send_music(
 
             chat_id,
 
-            "⚠️ Mood မမှန်ပါ။\n\n"
-            "ပြန်ရွေးပါ 👇",
+            "⚠️ Mood မမှန်ပါ။",
 
-            mood_menu(),
+            mood_menu()
 
         )
 
         return
+
 
     try:
 
@@ -1764,16 +2094,20 @@ def send_music(
             mood
         )
 
+
         logger.info(
 
             "🎧 Music request | "
             "user=%s | mood=%s | tracks=%s",
 
             user_id,
+
             mood,
-            count,
+
+            count
 
         )
+
 
         if count <= 0:
 
@@ -1783,22 +2117,26 @@ def send_music(
 
                 (
                     f"{MOOD_NAMES[mood]}\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "📭 No tracks available yet.\n\n"
-                    "Try another mood 👇\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━"
+                    "━━━━━━━━━━━━━━━━━━\n\n"
+                    "⚠️ ဒီ mood ထဲမှာ "
+                    "music မတွေ့သေးပါ။\n\n"
+                    "Admin က channel ထဲမှာ "
+                    "music ထည့်ပေးပြီး "
+                    "scanner ပြန် run ပါလိမ့်မယ်။"
                 ),
 
-                mood_menu(),
+                mood_menu()
 
             )
 
             return
 
+
         attempts = min(
             count,
-            10,
+            10
         )
+
 
         for _ in range(
             attempts
@@ -1807,17 +2145,21 @@ def send_music(
             reserved = reserve_track(
 
                 user_id,
-                mood,
+
+                mood
 
             )
+
 
             if not reserved:
 
                 break
 
+
             message_id, channel_id = (
                 reserved
             )
+
 
             logger.info(
 
@@ -1825,37 +2167,46 @@ def send_music(
                 "mood=%s | channel=%s | message=%s",
 
                 mood,
+
                 channel_id,
-                message_id,
+
+                message_id
 
             )
+
 
             result = copy_music(
 
                 chat_id,
+
                 channel_id,
-                message_id,
+
+                message_id
 
             )
 
-            if result.get("ok"):
+
+            if result.get(
+                "ok"
+            ):
 
                 send_message(
 
                     chat_id,
 
                     (
-                        "🎧  NOW PLAYING\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"{MOOD_NAMES[mood]}\n\n"
-                        "✨ Your next vibe is ready.\n"
-                        "🎶 Enjoy the music.\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━"
+                        f"{MOOD_NAMES[mood]}\n"
+                        "━━━━━━━━━━━━━━━━━━\n\n"
+                        "🎧  NOW PLAYING\n\n"
+                        f"✦ {MOOD_DESCRIPTIONS[mood]}\n\n"
+                        "Enjoy the vibe. ✦\n\n"
+                        "━━━━━━━━━━━━━━━━━━"
                     ),
 
-                    music_buttons(),
+                    music_buttons()
 
                 )
+
 
                 logger.info(
 
@@ -1863,25 +2214,39 @@ def send_music(
                     "user=%s | mood=%s | message=%s",
 
                     user_id,
+
                     mood,
-                    message_id,
+
+                    message_id
 
                 )
 
+
                 return
 
+
             logger.warning(
-                "⚠️ Copy failed: %s",
-                result,
+
+                "⚠️ Copy failed | "
+                "channel=%s | message=%s",
+
+                channel_id,
+
+                message_id
+
             )
+
 
             remove_failed_history(
 
                 user_id,
+
                 channel_id,
-                message_id,
+
+                message_id
 
             )
+
 
         send_message(
 
@@ -1889,16 +2254,16 @@ def send_music(
 
             (
                 f"{MOOD_NAMES[mood]}\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "⚠️ This track is temporarily\n"
-                "unavailable.\n\n"
-                "Try another track 👇\n\n"
-                "━━━━━━━━━━━━━━━━━━━━"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "⚠️ ဒီ mood က track တွေကို "
+                "အခု copy လုပ်လို့မရသေးပါ။\n\n"
+                "ခဏနေရင် ပြန်စမ်းကြည့်ပါ။"
             ),
 
-            music_buttons(),
+            music_buttons()
 
         )
+
 
     except Exception:
 
@@ -1906,14 +2271,13 @@ def send_music(
             "Unexpected send_music error"
         )
 
+
         send_message(
 
             chat_id,
 
-            (
-                "⚠️ Something went wrong.\n\n"
-                "Please try again shortly."
-            ),
+            "⚠️ ခဏအကြာမှာ "
+            "ပြန်စမ်းကြည့်ပါ။"
 
         )
 
@@ -1925,15 +2289,19 @@ def send_music(
 def music_request_worker(
     chat_id: int,
     user_id: int,
-    mood: str,
+    mood: str
 ) -> None:
 
     try:
 
         send_music(
+
             chat_id,
+
             user_id,
-            mood,
+
+            mood
+
         )
 
     finally:
@@ -1945,15 +2313,20 @@ def music_request_worker(
             )
 
 
+# ============================================================
+# SCHEDULE MUSIC
+# ============================================================
+
 def schedule_music_request(
     chat_id: int,
     user_id: int,
-    mood: str,
+    mood: str
 ) -> bool:
 
     if mood not in MOODS:
 
         return False
+
 
     with pending_music_lock:
 
@@ -1961,9 +2334,11 @@ def schedule_music_request(
 
             return False
 
+
         pending_music_users.add(
             user_id
         )
+
 
     try:
 
@@ -1972,12 +2347,16 @@ def schedule_music_request(
             music_request_worker,
 
             chat_id,
+
             user_id,
-            mood,
+
+            mood
 
         )
 
+
         return True
+
 
     except Exception:
 
@@ -1987,9 +2366,11 @@ def schedule_music_request(
                 user_id
             )
 
+
         logger.exception(
             "Could not queue music request"
         )
+
 
         return False
 
@@ -1999,22 +2380,25 @@ def schedule_music_request(
 # ============================================================
 
 def normalize_channel_id(
-    entity: Any,
+    entity: Any
 ) -> Optional[str]:
 
     entity_id = getattr(
         entity,
         "id",
-        None,
+        None
     )
+
 
     if not entity_id:
 
         return None
 
+
     value = str(
         entity_id
     )
+
 
     if value.startswith(
         "-100"
@@ -2022,7 +2406,12 @@ def normalize_channel_id(
 
         return value
 
-    return "-100" + value
+
+    return (
+        "-100"
+        +
+        value
+    )
 
 
 # ============================================================
@@ -2030,70 +2419,87 @@ def normalize_channel_id(
 # ============================================================
 
 def is_music_message(
-    message: Any,
+    message: Any
 ) -> bool:
 
     if not message:
         return False
 
+
     if not getattr(
         message,
         "media",
-        None,
+        None
     ):
 
         return False
 
+
     if getattr(
         message,
         "audio",
-        None,
+        None
     ):
 
         return True
 
+
     document = getattr(
         message,
         "document",
-        None,
+        None
     )
+
 
     if not document:
 
         return False
 
+
     mime_type = (
+
         getattr(
             document,
             "mime_type",
-            "",
+            ""
         )
-        or ""
+        or
+        ""
+
     ).lower()
+
 
     if mime_type.startswith(
         (
             "audio/",
-            "video/",
+            "video/"
         )
     ):
 
         return True
 
-    file_name = (
+
+    file_obj = getattr(
+        message,
+        "file",
+        None
+    )
+
+
+    name = (
+
         getattr(
-            getattr(
-                message,
-                "file",
-                None,
-            ),
+            file_obj,
             "name",
-            "",
+            ""
         )
-        or ""
+        or
+        ""
+
     ).lower()
 
-    return file_name.endswith(
+
+    return name.endswith(
         AUDIO_EXTENSIONS
     )
 
@@ -2105,7 +2511,7 @@ def is_music_message(
 def save_telethon_message(
     mood: str,
     entity: Any,
-    message: Any,
+    message: Any
 ) -> bool:
 
     if not is_music_message(
@@ -2114,82 +2520,41 @@ def save_telethon_message(
 
         return False
 
-    channel_id = normalize_channel_id(
-        entity
+
+    channel_id = (
+        normalize_channel_id(
+            entity
+        )
     )
+
 
     message_id = getattr(
         message,
         "id",
-        None,
+        None
     )
 
-    if not channel_id or not message_id:
 
+    if not channel_id:
         return False
+
+
+    if not message_id:
+        return False
+
 
     save_track(
 
         mood,
+
         channel_id,
-        message_id,
+
+        message_id
 
     )
+
 
     return True
-
-
-# ============================================================
-# FIND MOOD FROM CHANNEL
-# ============================================================
-
-def mood_from_channel_id(
-    channel_id: str,
-) -> Optional[str]:
-
-    normalized = str(
-        channel_id
-    )
-
-    for mood, configured in (
-        MOOD_CHANNELS.items()
-    ):
-
-        if not configured:
-            continue
-
-        configured = str(
-            configured
-        )
-
-        if configured.lstrip(
-            "-"
-        ).isdigit():
-
-            try:
-
-                configured_int = int(
-                    configured
-                )
-
-                if (
-                    normalized
-                    == str(
-                        configured_int
-                    )
-                ):
-
-                    return mood
-
-            except Exception:
-
-                pass
-
-        elif configured == normalized:
-
-            return mood
-
-    return None
 
 
 # ============================================================
@@ -2198,39 +2563,64 @@ def mood_from_channel_id(
 
 async def scan_one_channel(
     mood: str,
-    channel_value: str,
+    channel_value: str
 ) -> int:
 
-    if (
-        not channel_value
-        or telethon_client is None
-    ):
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    logger.info(
+        "🔎 SCANNING %s",
+        mood.upper()
+    )
+
+
+    if not channel_value:
 
         logger.warning(
-            "%s channel cannot be scanned",
-            mood.upper(),
+
+            "⚠️ %s channel missing",
+
+            mood.upper()
+
         )
 
         return 0
 
+
+    if telethon_client is None:
+
+        logger.warning(
+            "⚠️ Telethon client unavailable"
+        )
+
+        return 0
+
+
     try:
 
-        lookup: Any = (
+        if channel_value.lstrip(
+            "-"
+        ).isdigit():
 
-            int(channel_value)
+            lookup: Any = int(
+                channel_value
+            )
 
-            if channel_value.lstrip(
-                "-"
-            ).isdigit()
+        else:
 
-            else channel_value
+            lookup = channel_value
 
-        )
 
         logger.info(
-            "🔎 Scanning %s...",
-            mood.upper(),
+
+            "🔎 Getting %s entity...",
+
+            mood.upper()
+
         )
+
 
         entity = await (
             telethon_client.get_entity(
@@ -2238,7 +2628,26 @@ async def scan_one_channel(
             )
         )
 
+
+        logger.info(
+
+            "✅ %s entity found | id=%s",
+
+            mood.upper(),
+
+            getattr(
+                entity,
+                "id",
+                "unknown"
+            )
+
+        )
+
+
         found = 0
+
+        scanned = 0
+
 
         async for message in (
             telethon_client.iter_messages(
@@ -2246,43 +2655,77 @@ async def scan_one_channel(
             )
         ):
 
+            scanned += 1
+
+
             try:
 
                 if save_telethon_message(
 
                     mood,
+
                     entity,
-                    message,
+
+                    message
 
                 ):
 
                     found += 1
 
+
             except Exception:
 
                 logger.exception(
-                    "Message processing failed"
+
+                    "Message processing failed "
+                    "in %s",
+
+                    mood.upper()
+
                 )
+
 
         logger.info(
 
-            "✅ %s scan complete | "
-            "music found=%s",
+            "📦 %s messages checked: %s",
 
             mood.upper(),
-            found,
+
+            scanned
 
         )
 
+
+        logger.info(
+
+            "🎵 %s MUSIC FOUND: %s",
+
+            mood.upper(),
+
+            found
+
+        )
+
+
+        logger.info(
+
+            "✅ %s SCAN COMPLETE",
+
+            mood.upper()
+
+        )
+
+
         return found
+
 
     except Exception:
 
         logger.exception(
 
-            "❌ %s scan failed",
+            "❌ %s SCAN FAILED",
 
-            mood.upper(),
+            mood.upper()
 
         )
 
@@ -2290,171 +2733,67 @@ async def scan_one_channel(
 
 
 # ============================================================
-# FULL SCAN
+# SCAN ALL CHANNELS
 # ============================================================
 
 async def scan_all_channels() -> None:
 
     logger.info(
-        "🚀 Starting full channel scan..."
+        "🚀 STARTING ALL CHANNEL SCANS"
     )
+
 
     total = 0
 
+
     for mood in MOODS:
 
-        count = await scan_one_channel(
+        try:
 
-            mood,
+            found = await scan_one_channel(
 
-            MOOD_CHANNELS.get(
                 mood,
-                "",
-            ),
 
-        )
+                MOOD_CHANNELS.get(
+                    mood,
+                    ""
+                )
 
-        total += count
+            )
+
+
+            total += found
+
+
+        except Exception:
+
+            logger.exception(
+
+                "❌ %s scan system error",
+
+                mood.upper()
+
+            )
+
 
         await asyncio.sleep(
             1
         )
 
+
     logger.info(
-        "🎵 FULL SCAN COMPLETE | found=%s",
-        total,
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
 
-# ============================================================
-# REALTIME TELETHON WATCHER
-# ============================================================
-
-async def register_channel_events() -> None:
-
-    if telethon_client is None:
-        return
-
-    channel_entities = []
-
-    for mood in MOODS:
-
-        channel_value = (
-            MOOD_CHANNELS.get(
-                mood,
-                "",
-            )
-        )
-
-        if not channel_value:
-            continue
-
-        try:
-
-            lookup: Any = (
-
-                int(channel_value)
-
-                if channel_value.lstrip(
-                    "-"
-                ).isdigit()
-
-                else channel_value
-
-            )
-
-            entity = await (
-                telethon_client.get_entity(
-                    lookup
-                )
-            )
-
-            channel_entities.append(
-                entity
-            )
-
-        except Exception:
-
-            logger.exception(
-
-                "Could not load %s event channel",
-
-                mood.upper(),
-
-            )
-
-    if not channel_entities:
-
-        logger.warning(
-            "⚠️ No channels available for realtime watcher"
-        )
-
-        return
-
-    @telethon_client.on(
-        events.NewMessage(
-            chats=channel_entities
-        )
+    logger.info(
+        "🎵 TOTAL MUSIC FOUND: %s",
+        total
     )
-    async def new_music_message(
-        event: Any,
-    ):
-
-        try:
-
-            entity = await event.get_chat()
-
-            channel_id = normalize_channel_id(
-                entity
-            )
-
-            if not channel_id:
-
-                return
-
-            mood = mood_from_channel_id(
-                channel_id
-            )
-
-            if not mood:
-
-                return
-
-            message = event.message
-
-            if is_music_message(
-                message
-            ):
-
-                save_track(
-
-                    mood,
-
-                    channel_id,
-
-                    message.id,
-
-                )
-
-                logger.info(
-
-                    "🎵 NEW MUSIC AUTO-ADDED | "
-                    "mood=%s | message=%s",
-
-                    mood.upper(),
-                    message.id,
-
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Realtime music watcher error"
-            )
 
 
     logger.info(
-        "👀 Realtime channel watcher READY"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
 
@@ -2466,9 +2805,11 @@ def telethon_worker() -> None:
 
     global telethon_client
 
+
     logger.info(
         "🔐 TELETHON WORKER STARTING"
     )
+
 
     if not TELETHON_API_ID:
 
@@ -2478,9 +2819,11 @@ def telethon_worker() -> None:
 
         return
 
+
     logger.info(
         "✅ TELETHON_API_ID found"
     )
+
 
     if not TELETHON_API_HASH:
 
@@ -2490,9 +2833,11 @@ def telethon_worker() -> None:
 
         return
 
+
     logger.info(
         "✅ TELETHON_API_HASH found"
     )
+
 
     if not TELETHON_SESSION:
 
@@ -2502,9 +2847,11 @@ def telethon_worker() -> None:
 
         return
 
+
     logger.info(
         "✅ TELETHON_SESSION found"
     )
+
 
     try:
 
@@ -2512,15 +2859,22 @@ def telethon_worker() -> None:
             TELETHON_API_ID
         )
 
+
     except ValueError:
 
         logger.error(
-            "❌ TELETHON_API_ID must be numeric"
+            "❌ TELETHON_API_ID is not a number"
         )
 
         return
 
+
     try:
+
+        logger.info(
+            "🔐 Creating Telegram client..."
+        )
+
 
         telethon_client = TelegramClient(
 
@@ -2538,14 +2892,18 @@ def telethon_worker() -> None:
 
             timeout=30,
 
-            auto_reconnect=True,
-
         )
+
+
+        logger.info(
+            "🔐 Telegram client created"
+        )
+
 
     except Exception:
 
         logger.exception(
-            "❌ Telethon client creation failed"
+            "❌ Telegram client creation failed"
         )
 
         return
@@ -2555,6 +2913,7 @@ def telethon_worker() -> None:
 
         assert telethon_client is not None
 
+
         while True:
 
             try:
@@ -2563,83 +2922,131 @@ def telethon_worker() -> None:
                     "🔐 Connecting to Telegram..."
                 )
 
-                await (
-                    telethon_client.connect()
+
+                await telethon_client.connect()
+
+
+                logger.info(
+                    "✅ Telegram connection established"
                 )
+
 
                 authorized = (
                     await telethon_client
                     .is_user_authorized()
                 )
 
+
                 if not authorized:
 
                     logger.error(
-                        "❌ TELETHON SESSION NOT AUTHORIZED"
+                        "❌ TELETHON SESSION "
+                        "NOT AUTHORIZED"
                     )
 
                     logger.error(
-                        "❌ Generate a new StringSession"
+                        "❌ Generate a new "
+                        "StringSession."
                     )
 
                     return
 
+
                 telethon_ready.set()
 
+
                 logger.info(
-                    "🟢 TELETHON LOGIN SUCCESS"
+                    "✅ TELETHON LOGIN SUCCESS"
                 )
+
+
+                # ------------------------------------------------
+                # ACCOUNT
+                # ------------------------------------------------
 
                 try:
 
                     me = await (
-                        telethon_client
-                        .get_me()
+                        telethon_client.get_me()
                     )
+
 
                     if me:
 
-                        logger.info(
-
-                            "👤 Telegram account: @%s",
+                        username = (
 
                             getattr(
                                 me,
                                 "username",
-                                None,
+                                None
                             )
-                            or getattr(
+
+                            or
+
+                            getattr(
                                 me,
                                 "first_name",
-                                "Unknown",
-                            ),
+                                None
+                            )
+
+                            or
+
+                            "Unknown"
 
                         )
+
+
+                        logger.info(
+
+                            "👤 Telegram account: %s",
+
+                            username
+
+                        )
+
 
                 except Exception:
 
                     logger.exception(
-                        "Could not get account info"
+                        "⚠️ Could not get "
+                        "Telegram account"
                     )
 
-                # Register realtime watcher
-                await register_channel_events()
 
-                # Full scan on startup/reconnect
-                await scan_all_channels()
+                # ------------------------------------------------
+                # SCAN CHANNELS
+                # ------------------------------------------------
+
+                try:
+
+                    await scan_all_channels()
+
+                except Exception:
+
+                    logger.exception(
+                        "❌ Channel scan error"
+                    )
+
 
                 logger.info(
                     "📡 TELETHON WATCHER READY"
                 )
+
+
+                # ------------------------------------------------
+                # KEEP CONNECTION ALIVE
+                # ------------------------------------------------
 
                 await (
                     telethon_client
                     .run_until_disconnected()
                 )
 
+
                 logger.warning(
                     "⚠️ Telethon disconnected"
                 )
+
 
             except Exception:
 
@@ -2647,28 +3054,42 @@ def telethon_worker() -> None:
                     "❌ TELETHON CONNECTION ERROR"
                 )
 
+
             finally:
 
                 telethon_ready.clear()
 
+
                 try:
 
-                    if telethon_client.is_connected():
+                    if (
+                        telethon_client
+                        and
+                        telethon_client.is_connected()
+                    ):
 
                         await (
                             telethon_client
                             .disconnect()
                         )
 
+
                 except Exception:
 
                     logger.exception(
-                        "Telethon disconnect error"
+                        "⚠️ Telethon disconnect error"
                     )
 
-            logger.info(
-                "🔄 Telethon will reconnect in 10 seconds..."
+
+            # ----------------------------------------------------
+            # AUTO RECONNECT
+            # ----------------------------------------------------
+
+            logger.warning(
+                "🔄 Telethon will reconnect "
+                "in 10 seconds..."
             )
+
 
             await asyncio.sleep(
                 10
@@ -2681,11 +3102,13 @@ def telethon_worker() -> None:
             runner()
         )
 
+
     except Exception:
 
         logger.exception(
             "❌ TELETHON WORKER STOPPED"
         )
+
 
     finally:
 
@@ -2693,21 +3116,24 @@ def telethon_worker() -> None:
 
 
 # ============================================================
-# START TELETHON
+# START TELETHON WORKER
 # ============================================================
 
 def start_telethon_worker() -> None:
 
     global telethon_thread
 
+
     with telethon_start_lock:
 
         if (
             telethon_thread
-            and telethon_thread.is_alive()
+            and
+            telethon_thread.is_alive()
         ):
 
             return
+
 
         telethon_thread = threading.Thread(
 
@@ -2719,6 +3145,7 @@ def start_telethon_worker() -> None:
 
         )
 
+
         telethon_thread.start()
 
 
@@ -2727,18 +3154,20 @@ def start_telethon_worker() -> None:
 # ============================================================
 
 def is_admin(
-    user_id: Any,
+    user_id: Any
 ) -> bool:
 
-    return bool(
+    if not ADMIN_USER_ID:
 
+        return False
+
+
+    return (
+        user_id is not None
+        and
+        str(user_id)
+        ==
         ADMIN_USER_ID
-
-        and user_id is not None
-
-        and str(user_id)
-        == ADMIN_USER_ID
-
     )
 
 
@@ -2748,7 +3177,7 @@ def is_admin(
 
 def send_stats(
     chat_id: int,
-    requester_id: int,
+    requester_id: int
 ) -> None:
 
     if not is_admin(
@@ -2757,10 +3186,11 @@ def send_stats(
 
         send_message(
             chat_id,
-            "❌ Admin only.",
+            "❌ Admin only."
         )
 
         return
+
 
     users = get_users_count()
 
@@ -2770,57 +3200,59 @@ def send_stats(
         counts.values()
     )
 
+
     lines = [
 
         "📊  NOT YOUR VIBE",
-        "━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━",
         "",
-        f"👥 Users        : {users}",
-        f"🎵 Total Tracks : {total}",
+        f"👥  Users       : {users}",
+        f"🎵  Total Tracks: {total}",
         "",
-        "MOOD DATABASE",
-        "━━━━━━━━━━━━━━━━━━━━",
+        "MOOD LIBRARY",
+        "──────────────",
 
     ]
+
 
     for mood in MOODS:
 
         lines.append(
 
-            f"{MOOD_NAMES[mood]}  →  "
+            f"{MOOD_NAMES[mood]}"
+            f"  →  "
             f"{counts[mood]}"
 
         )
 
+
     lines.extend([
 
         "",
-
-        "━━━━━━━━━━━━━━━━━━━━",
-
-        (
-            "🟢 Telethon"
-            if telethon_ready.is_set()
-            else "🔴 Telethon"
-        ),
+        "━━━━━━━━━━━━━━━━━━",
+        "✦ Database: PostgreSQL",
+        "✦ Scanner: Telethon",
 
     ])
+
 
     send_message(
 
         chat_id,
 
-        "\n".join(lines),
+        "\n".join(
+            lines
+        )
 
     )
 
 
 # ============================================================
-# COMMAND
+# COMMAND PARSER
 # ============================================================
 
 def extract_command(
-    text: str,
+    text: str
 ) -> str:
 
     if not text.startswith(
@@ -2829,7 +3261,9 @@ def extract_command(
 
         return ""
 
+
     return (
+
         text
         .split(
             maxsplit=1
@@ -2839,104 +3273,131 @@ def extract_command(
             "@",
             1
         )[0]
+
     )
 
 
 # ============================================================
-# CALLBACK HANDLER
+# HANDLE CALLBACK
 # ============================================================
 
 def handle_callback(
-    callback: Mapping[str, Any],
+    callback: Mapping[str, Any]
 ) -> None:
 
     callback_id = callback.get(
         "id"
     )
 
+
     data = (
         callback.get("data")
-        or ""
+        or
+        ""
     )
+
 
     user = (
         callback.get("from")
-        or {}
+        or
+        {}
     )
+
 
     message = (
         callback.get("message")
-        or {}
+        or
+        {}
     )
+
 
     chat = (
         message.get("chat")
-        or {}
+        or
+        {}
     )
+
 
     chat_id = chat.get(
         "id"
     )
 
+
     user_id = user.get(
         "id"
     )
 
+
     if not isinstance(
         chat_id,
-        int,
+        int
     ):
 
         return
+
 
     if not isinstance(
         user_id,
-        int,
+        int
     ):
 
         return
+
 
     register_user(
         user
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # MOOD
-    # --------------------------------------------------------
+    # ========================================================
 
     if data.startswith(
         "mood_"
     ):
 
-        mood = data[5:]
+        mood = data[
+            5:
+        ]
+
 
         if mood not in MOODS:
 
             answer_callback(
                 callback_id,
-                "Invalid mood",
+                "Invalid mood"
             )
 
             return
+
 
         if not set_user_mood(
+
             user_id,
-            mood,
+
+            mood
+
         ):
 
             answer_callback(
+
                 callback_id,
-                "Try again shortly",
+
+                "Please try again"
+
             )
 
             return
 
-        if schedule_music_request(
+
+        if not schedule_music_request(
 
             chat_id,
+
             user_id,
-            mood,
+
+            mood
 
         ):
 
@@ -2944,26 +3405,39 @@ def handle_callback(
 
                 callback_id,
 
-                f"{MOOD_NAMES[mood]} ✓",
+                "⏳ Already finding a track..."
 
             )
 
-        else:
+            return
 
-            answer_callback(
 
-                callback_id,
+        answer_callback(
 
-                "⏳ Track already loading",
+            callback_id,
 
+            f"{MOOD_NAMES[mood]} ✓"
+
+        )
+
+
+        send_message(
+
+            chat_id,
+
+            mood_selected_text(
+                mood
             )
+
+        )
+
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # NEXT
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "next_music":
 
@@ -2971,33 +3445,39 @@ def handle_callback(
             user_id
         )
 
+
         if not mood:
 
             answer_callback(
 
                 callback_id,
 
-                "Choose mood first",
+                "Choose a mood first"
 
             )
+
 
             send_message(
 
                 chat_id,
 
-                MOOD_TEXT,
+                welcome_text(),
 
-                mood_menu(),
+                mood_menu()
 
             )
 
+
             return
+
 
         if schedule_music_request(
 
             chat_id,
+
             user_id,
-            mood,
+
+            mood
 
         ):
 
@@ -3005,7 +3485,7 @@ def handle_callback(
 
                 callback_id,
 
-                "🔀 Finding next...",
+                "🔀 Finding next..."
 
             )
 
@@ -3015,16 +3495,17 @@ def handle_callback(
 
                 callback_id,
 
-                "⏳ Track already loading",
+                "⏳ Already finding a track..."
 
             )
+
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # CHANGE MOOD
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "change_mood":
 
@@ -3032,19 +3513,21 @@ def handle_callback(
 
             callback_id,
 
-            "🎚️ Choose your vibe",
+            "🎧 Choose your vibe"
 
         )
+
 
         send_message(
 
             chat_id,
 
-            MOOD_TEXT,
+            welcome_text(),
 
-            mood_menu(),
+            mood_menu()
 
         )
+
 
         return
 
@@ -3055,55 +3538,71 @@ def handle_callback(
 
 
 # ============================================================
-# MESSAGE HANDLER
+# HANDLE NORMAL MESSAGE
 # ============================================================
 
 def handle_message(
-    message: Mapping[str, Any],
+    message: Mapping[str, Any]
 ) -> None:
 
     chat = (
         message.get("chat")
-        or {}
+        or
+        {}
     )
+
 
     user = (
         message.get("from")
-        or {}
+        or
+        {}
     )
+
 
     chat_id = chat.get(
         "id"
     )
 
+
     user_id = user.get(
         "id"
     )
 
+
     if not isinstance(
         chat_id,
-        int,
+        int
     ):
 
         return
+
 
     register_user(
         user
     )
 
+
     text = (
-        message.get("text")
-        or ""
+
+        message
+        .get(
+            "text",
+            ""
+        )
+        or
+        ""
+
     ).strip()
+
 
     command = extract_command(
         text
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # START
-    # --------------------------------------------------------
+    # ========================================================
 
     if command == "/start":
 
@@ -3111,18 +3610,18 @@ def handle_message(
 
             chat_id,
 
-            START_TEXT,
+            welcome_text(),
 
-            mood_menu(),
+            mood_menu()
 
         )
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # MOOD
-    # --------------------------------------------------------
+    # ========================================================
 
     if command == "/mood":
 
@@ -3130,35 +3629,33 @@ def handle_message(
 
             chat_id,
 
-            MOOD_TEXT,
+            welcome_text(),
 
-            mood_menu(),
+            mood_menu()
 
         )
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # NEXT
-    # --------------------------------------------------------
+    # ========================================================
 
     if command == "/next":
 
-        mood = (
+        if not isinstance(
+            user_id,
+            int
+        ):
 
-            get_user_mood(
-                user_id
-            )
+            return
 
-            if isinstance(
-                user_id,
-                int,
-            )
 
-            else None
-
+        mood = get_user_mood(
+            user_id
         )
+
 
         if not mood:
 
@@ -3166,19 +3663,22 @@ def handle_message(
 
                 chat_id,
 
-                MOOD_TEXT,
+                welcome_text(),
 
-                mood_menu(),
+                mood_menu()
 
             )
 
             return
 
+
         if not schedule_music_request(
 
             chat_id,
+
             user_id,
-            mood,
+
+            mood
 
         ):
 
@@ -3186,17 +3686,18 @@ def handle_message(
 
                 chat_id,
 
-                "⏳ Track ရှာနေပြီးသားပါ။\n"
-                "ခဏစောင့်ပါ။",
+                "⏳ Track ရှာနေပြီးသားပါ။ "
+                "ခဏစောင့်ပါ။"
 
             )
+
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # USERS
-    # --------------------------------------------------------
+    # ========================================================
 
     if command == "/users":
 
@@ -3210,11 +3711,11 @@ def handle_message(
 
                 (
                     "👥  USER DATABASE\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "━━━━━━━━━━━━━━━━━━\n\n"
                     f"Total users: "
                     f"{get_users_count()}\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━"
-                ),
+                    "━━━━━━━━━━━━━━━━━━"
+                )
 
             )
 
@@ -3222,36 +3723,39 @@ def handle_message(
 
             send_message(
                 chat_id,
-                "❌ Admin only.",
+                "❌ Admin only."
             )
+
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATS
-    # --------------------------------------------------------
+    # ========================================================
 
     if command == "/stats":
 
         if isinstance(
             user_id,
-            int,
+            int
         ):
 
             send_stats(
 
                 chat_id,
-                user_id,
+
+                user_id
 
             )
+
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # TELEGRAM STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     if command == "/telegram":
 
@@ -3261,10 +3765,11 @@ def handle_message(
 
             send_message(
                 chat_id,
-                "❌ Admin only.",
+                "❌ Admin only."
             )
 
             return
+
 
         if telethon_ready.is_set():
 
@@ -3273,13 +3778,13 @@ def handle_message(
                 chat_id,
 
                 (
-                    "🟢  TELETHON STATUS\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "CONNECTED ✅\n\n"
-                    "📡 Channel scanner: READY\n"
-                    "👀 Realtime watcher: ACTIVE\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━"
-                ),
+                    "🟢  TELEGRAM CONNECTED\n"
+                    "━━━━━━━━━━━━━━━━━━\n\n"
+                    "📡 Telethon: ONLINE\n"
+                    "🎵 Channel Scanner: READY\n"
+                    "🔄 Auto Reconnect: ON\n\n"
+                    "━━━━━━━━━━━━━━━━━━"
+                )
 
             )
 
@@ -3290,22 +3795,25 @@ def handle_message(
                 chat_id,
 
                 (
-                    "🔴  TELETHON STATUS\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "NOT CONNECTED ❌\n\n"
-                    "Check Render Logs.\n"
-                    "Auto reconnect is enabled.\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━"
-                ),
+                    "🔴  TELEGRAM OFFLINE\n"
+                    "━━━━━━━━━━━━━━━━━━\n\n"
+                    "Telethon is currently "
+                    "not connected.\n\n"
+                    "🔄 Auto reconnect is ON.\n"
+                    "Check Render Logs if it "
+                    "doesn't reconnect.\n\n"
+                    "━━━━━━━━━━━━━━━━━━"
+                )
 
             )
+
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # HELP
-    # --------------------------------------------------------
+    # ========================================================
 
     if command == "/help":
 
@@ -3315,18 +3823,21 @@ def handle_message(
 
             (
                 "🎧  NOT YOUR VIBE\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "/start  →  Open music menu\n"
-                "/mood   →  Choose mood\n"
-                "/next   →  Next track\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+
+                "/start  →  Start Bot\n"
+                "/mood   →  Mood Menu\n"
+                "/next   →  Next Track\n"
+                "/users  →  User Count\n"
+                "/stats  →  Bot Statistics\n"
+                "/telegram → Connection Status\n"
                 "/help   →  Help\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "ADMIN\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "/users\n"
-                "/stats\n"
-                "/telegram"
-            ),
+
+                "━━━━━━━━━━━━━━━━━━\n"
+                "✦ Choose a mood.\n"
+                "✦ Get a random track.\n"
+                "✦ Press NEXT for another one."
+            )
 
         )
 
@@ -3334,28 +3845,33 @@ def handle_message(
 
 
 # ============================================================
-# UPDATE
+# HANDLE UPDATE
 # ============================================================
 
 def handle_update(
-    update: Mapping[str, Any],
+    update: Mapping[str, Any]
 ) -> None:
 
+    update_id = update.get(
+        "update_id"
+    )
+
+
     if not claim_update(
-        update.get(
-            "update_id"
-        )
+        update_id
     ):
 
         return
+
 
     callback = update.get(
         "callback_query"
     )
 
+
     if isinstance(
         callback,
-        Mapping,
+        Mapping
     ):
 
         handle_callback(
@@ -3364,13 +3880,15 @@ def handle_update(
 
         return
 
+
     message = update.get(
         "message"
     )
 
+
     if isinstance(
         message,
-        Mapping,
+        Mapping
     ):
 
         handle_message(
@@ -3394,16 +3912,22 @@ def home() -> str:
 # HEALTH
 # ============================================================
 
-@app.route("/health")
+@app.route(
+    "/health"
+)
 def health():
 
-    if db_pool is not None:
+    if db_pool is None:
 
-        return "OK", 200
+        return (
+            "Database not ready",
+            503
+        )
+
 
     return (
-        "Database not ready",
-        503,
+        "OK",
+        200
     )
 
 
@@ -3413,15 +3937,16 @@ def health():
 
 @app.route(
     "/webhook",
-    methods=["POST"],
+    methods=["POST"]
 )
 def webhook():
 
     if (
         WEBHOOK_SECRET
-        and request.headers.get(
+        and
+        request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token",
-            "",
+            ""
         )
         != WEBHOOK_SECRET
     ):
@@ -3432,8 +3957,9 @@ def webhook():
 
         return (
             "Forbidden",
-            403,
+            403
         )
+
 
     try:
 
@@ -3441,21 +3967,16 @@ def webhook():
             silent=True
         )
 
+
         if isinstance(
             update,
-            Mapping,
+            Mapping
         ):
 
-            # Don't block Flask request thread
-            threading.Thread(
+            handle_update(
+                update
+            )
 
-                target=handle_update,
-
-                args=(update,),
-
-                daemon=True,
-
-            ).start()
 
     except Exception:
 
@@ -3463,40 +3984,44 @@ def webhook():
             "Webhook processing error"
         )
 
-    return "OK", 200
+
+    return "OK"
 
 
 # ============================================================
-# WEBHOOK SETUP
+# SET WEBHOOK
 # ============================================================
 
 def setup_webhook() -> None:
 
     if not BOT_TOKEN:
 
-        logger.warning(
-            "⚠️ BOT_TOKEN missing"
+        logger.error(
+            "❌ BOT_TOKEN missing"
         )
 
         return
+
 
     if not RENDER_EXTERNAL_URL:
 
-        logger.warning(
-            "⚠️ RENDER_EXTERNAL_URL missing"
+        logger.error(
+            "❌ RENDER_EXTERNAL_URL missing"
         )
 
         return
+
 
     webhook_url = (
 
         RENDER_EXTERNAL_URL.rstrip("/")
-
-        + "/webhook"
+        +
+        "/webhook"
 
     )
 
-    payload = {
+
+    payload: dict[str, Any] = {
 
         "url":
             webhook_url,
@@ -3517,16 +4042,19 @@ def setup_webhook() -> None:
 
     }
 
+
     if WEBHOOK_SECRET:
 
         payload[
             "secret_token"
         ] = WEBHOOK_SECRET
 
+
     logger.info(
-        "🔗 Setting webhook: %s",
-        webhook_url,
+        "🔗 Webhook URL: %s",
+        webhook_url
     )
+
 
     result = telegram(
 
@@ -3534,21 +4062,24 @@ def setup_webhook() -> None:
 
         payload,
 
-        timeout=20,
+        timeout=20
 
     )
 
-    if result.get("ok"):
+
+    if result.get(
+        "ok"
+    ):
 
         logger.info(
-            "✅ Telegram webhook configured"
+            "✅ Webhook configured"
         )
 
     else:
 
         logger.error(
-            "❌ Webhook setup failed: %s",
-            result,
+            "❌ Webhook configuration failed: %s",
+            result
         )
 
 
@@ -3559,42 +4090,23 @@ def setup_webhook() -> None:
 def startup() -> bool:
 
     logger.info(
-        "============================================================"
+        "=================================================="
     )
+
 
     logger.info(
         "🎧 NOT YOUR VIBE MUSIC BOT"
     )
 
-    logger.info(
-        "🐘 PostgreSQL + Telethon + Premium UI"
-    )
 
     logger.info(
-        "============================================================"
+        "=================================================="
     )
 
 
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
-
-    try:
-
-        init_db()
-
-    except Exception:
-
-        logger.exception(
-            "❌ PostgreSQL initialization failed"
-        )
-
-        return False
-
-
-    # --------------------------------------------------------
-    # BOT TOKEN
-    # --------------------------------------------------------
+    # ========================================================
+    # ENV CHECK
+    # ========================================================
 
     if BOT_TOKEN:
 
@@ -3609,10 +4121,6 @@ def startup() -> bool:
         )
 
 
-    # --------------------------------------------------------
-    # ADMIN
-    # --------------------------------------------------------
-
     if ADMIN_USER_ID:
 
         logger.info(
@@ -3626,29 +4134,45 @@ def startup() -> bool:
         )
 
 
-    # --------------------------------------------------------
+    if DATABASE_URL:
+
+        logger.info(
+            "✅ DATABASE_URL found"
+        )
+
+    else:
+
+        logger.error(
+            "❌ DATABASE_URL missing"
+        )
+
+
+    # ========================================================
     # CHANNELS
-    # --------------------------------------------------------
+    # ========================================================
 
     logger.info(
         "📡 MOOD CHANNELS"
     )
 
+
     for mood in MOODS:
 
-        value = MOOD_CHANNELS.get(
+        channel = MOOD_CHANNELS.get(
             mood,
-            "",
+            ""
         )
 
-        if value:
+
+        if channel:
 
             logger.info(
 
                 "✅ %s → %s",
 
                 mood.upper(),
-                value,
+
+                channel
 
             )
 
@@ -3658,36 +4182,57 @@ def startup() -> bool:
 
                 "⚠️ %s channel missing",
 
-                mood.upper(),
+                mood.upper()
 
             )
 
 
-    # --------------------------------------------------------
+    # ========================================================
+    # DATABASE
+    # ========================================================
+
+    try:
+
+        init_db()
+
+
+    except Exception:
+
+        logger.exception(
+            "❌ PostgreSQL initialization failed"
+        )
+
+        return False
+
+
+    # ========================================================
     # WEBHOOK
-    # --------------------------------------------------------
+    # ========================================================
 
     setup_webhook()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # TELETHON
-    # --------------------------------------------------------
+    # ========================================================
 
     start_telethon_worker()
 
 
     logger.info(
-        "============================================================"
+        "=================================================="
     )
+
 
     logger.info(
         "🚀 BOT SERVER READY"
     )
 
+
     logger.info(
-        "============================================================"
+        "=================================================="
     )
+
 
     return True
 
@@ -3700,12 +4245,19 @@ if __name__ == "__main__":
 
     startup()
 
+
     port = env_int(
+
         "PORT",
+
         10000,
+
         1,
-        65535,
+
+        65535
+
     )
+
 
     app.run(
 
@@ -3715,6 +4267,6 @@ if __name__ == "__main__":
 
         threaded=True,
 
-        use_reloader=False,
+        use_reloader=False
 
 )
