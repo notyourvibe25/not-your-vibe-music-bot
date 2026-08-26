@@ -1,45 +1,51 @@
 import os
-import random
-import threading
 import time
-import asyncio
-import requests
+import random
+import sqlite3
+import threading
 
+import requests
 from flask import Flask
 
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from telethon import TelegramClient
 
 
-# =========================================================
+# ============================================================
 # APP
-# =========================================================
+# ============================================================
 
 app = Flask(__name__)
 
 
-# =========================================================
+# ============================================================
 # ENVIRONMENT VARIABLES
-# =========================================================
+# ============================================================
 
-BOT_TOKEN = os.getenv(
-    "BOT_TOKEN",
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
+
+RENDER_EXTERNAL_URL = os.getenv(
+    "RENDER_EXTERNAL_URL",
     ""
 ).strip()
 
-ADMIN_USER_ID = os.getenv(
-    "ADMIN_USER_ID",
-    ""
+
+# ------------------------------------------------------------
+# Telethon
+# TELETHON_* ကို ဦးစားပေးသုံးမယ်
+# ------------------------------------------------------------
+
+TELETHON_API_ID = (
+    os.getenv("TELETHON_API_ID")
+    or os.getenv("API_ID")
+    or ""
 ).strip()
 
-TELETHON_API_ID = os.getenv(
-    "TELETHON_API_ID",
-    ""
-).strip()
-
-TELETHON_API_HASH = os.getenv(
-    "TELETHON_API_HASH",
-    ""
+TELETHON_API_HASH = (
+    os.getenv("TELETHON_API_HASH")
+    or os.getenv("API_HASH")
+    or ""
 ).strip()
 
 TELETHON_SESSION = os.getenv(
@@ -48,44 +54,33 @@ TELETHON_SESSION = os.getenv(
 ).strip()
 
 
-# =========================================================
-# TELEGRAM BOT API
-# =========================================================
+# ============================================================
+# DATABASE
+# ============================================================
+#
+# Render Free မှာ persistent disk မသုံးဘူး။
+#
+# Database က restart ဖြစ်ရင် ပျောက်နိုင်တယ်။
+# ဒါပေမယ့် Telethon က channel history ကို startup မှာ
+# ပြန် scan လုပ်ပြီး database ကို rebuild လုပ်ပေးမယ်။
+#
+# ============================================================
 
-BOT_API = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
-    if BOT_TOKEN
-    else ""
-)
-
-
-http = requests.Session()
-
-http.headers.update({
-    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT"
-})
+DB_PATH = "music_bot.db"
 
 
-# =========================================================
+# ============================================================
 # MOODS
-# =========================================================
+# ============================================================
 
 MOOD_NAMES = {
-
     "sad": "😢 SAD",
-
     "love": "❤️ LOVE",
-
     "chill": "🌙 CHILL",
-
     "hype": "🔥 HYPE",
-
     "dark": "🖤 DARK",
-
     "energetic": "⚡ ENERGETIC",
-
     "night": "🚗 NIGHT DRIVE",
-
     "melodic": "🌌 MELODIC",
 }
 
@@ -102,85 +97,199 @@ MOODS = [
 ]
 
 
-# =========================================================
-# CHANNEL CONFIG
-# =========================================================
+# ============================================================
+# CHANNELS
+# ============================================================
+#
+# Render Environment Variables ထဲမှာ
+# channel တစ်ခုချင်းစီရဲ့ value ထည့်ထားရမယ်။
+#
+# ============================================================
 
 MOOD_CHANNELS = {
-
-    "sad": "@sadmooddatabase",
-
-    "love": "@lovemooddatabase",
-
-    "chill": "@chillmooddatabase",
-
-    "hype": "-1004427220481",
-
-    "dark": "@darkmooddatabase",
-
-    "energetic": "@energeticmooddatabase",
-
-    "night": "@nightdrivemooddatabase",
-
-    "melodic": "-1004446996297",
+    "sad": os.getenv("SAD_CHANNEL", "").strip(),
+    "love": os.getenv("LOVE_CHANNEL", "").strip(),
+    "chill": os.getenv("CHILL_CHANNEL", "").strip(),
+    "hype": os.getenv("HYPE_CHANNEL", "").strip(),
+    "dark": os.getenv("DARK_CHANNEL", "").strip(),
+    "energetic": os.getenv("ENERGETIC_CHANNEL", "").strip(),
+    "night": os.getenv("NIGHT_CHANNEL", "").strip(),
+    "melodic": os.getenv("MELODIC_CHANNEL", "").strip(),
 }
 
 
-# =========================================================
-# MEMORY DATABASE
-#
-# Render Free မှာ Disk မသုံးတဲ့အတွက်
-# ဒီ data တွေကို RAM ထဲမှာပဲထားမယ်။
-#
-# Restart ဖြစ်ရင် Telethon က channel history
-# ကို ပြန် scan လုပ်ပြီး MUSIC ကို ပြန်တည်ဆောက်မယ်။
-# =========================================================
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
-music_lock = threading.RLock()
+http = requests.Session()
 
-MUSIC = {
-    mood: []
-    for mood in MOODS
-}
+http.headers.update(
+    {
+        "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT/3.0"
+    }
+)
 
 
-# =========================================================
-# USER STATE
-# =========================================================
+# ============================================================
+# LOCKS
+# ============================================================
 
-state_lock = threading.RLock()
+db_init_lock = threading.Lock()
 
-USER_STATE = {}
+user_locks = {}
 
-USER_HISTORY = {}
-
-USER_LOCKS = {}
-
-USER_COUNT_LOCK = threading.RLock()
+user_locks_lock = threading.Lock()
 
 
-# =========================================================
-# TELETHON GLOBALS
-# =========================================================
+# ============================================================
+# TELETHON CLIENT
+# ============================================================
 
 telethon_client = None
 
-telethon_loop = None
 
-resolved_channels = {}
+# ============================================================
+# DATABASE
+# ============================================================
 
-channel_id_to_mood = {}
+def get_db():
+    """
+    Flask / Thread အများကြီး run နေရင်
+    SQLite connection တစ်ခုကို thread အများကြီး မမျှသုံးဘူး။
+    Thread တစ်ခုတိုင်း connection အသစ်ယူမယ်။
+    """
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False,
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    conn.execute(
+        "PRAGMA busy_timeout = 30000"
+    )
+
+    conn.execute(
+        "PRAGMA journal_mode = WAL"
+    )
+
+    return conn
 
 
-# =========================================================
-# BOT API REQUEST
-# =========================================================
+def init_db():
+    """
+    Database tables တွေ create လုပ်မယ်။
+    """
+
+    with db_init_lock:
+
+        conn = get_db()
+
+        try:
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    total_requests INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tracks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mood TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(channel_id, message_id)
+                )
+                """
+            )
+
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    mood TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    sent_at INTEGER NOT NULL
+                )
+                """
+            )
+
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_state (
+                    user_id INTEGER PRIMARY KEY,
+                    mood TEXT,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_tracks_mood
+                ON tracks(mood)
+                """
+            )
+
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_history_user
+                ON user_history(user_id, sent_at DESC)
+                """
+            )
+
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_history_user_mood
+                ON user_history(user_id, mood, sent_at DESC)
+                """
+            )
+
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+
+# ============================================================
+# TELEGRAM BOT API
+# ============================================================
 
 def telegram(
     method,
     data=None,
-    timeout=20
+    timeout=20,
 ):
+    """
+    Telegram Bot API request helper.
+    """
 
     if not BOT_TOKEN:
 
@@ -190,20 +299,22 @@ def telegram(
 
         return {
             "ok": False,
-            "description": "BOT_TOKEN missing"
+            "description": "BOT_TOKEN missing",
         }
+
+
+    url = (
+        "https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/{method}"
+    )
 
 
     try:
 
         response = http.post(
-
-            f"{BOT_API}/{method}",
-
+            url,
             json=data or {},
-
-            timeout=timeout
-
+            timeout=timeout,
         )
 
 
@@ -215,67 +326,53 @@ def telegram(
 
             result = {
                 "ok": False,
-                "description": response.text
+                "description": response.text,
             }
 
 
         if not result.get("ok"):
 
             print(
-                "❌ TELEGRAM API ERROR:",
+                "TELEGRAM API ERROR:",
                 method,
-                result
+                result,
             )
 
 
         return result
 
 
-    except requests.Timeout:
+    except Exception as exc:
 
         print(
-            "❌ TELEGRAM TIMEOUT:",
-            method
-        )
-
-        return {
-            "ok": False,
-            "description": "Telegram request timeout"
-        }
-
-
-    except Exception as e:
-
-        print(
-            "❌ TELEGRAM REQUEST ERROR:",
+            "TELEGRAM REQUEST ERROR:",
             method,
-            repr(e)
+            repr(exc),
         )
 
         return {
             "ok": False,
-            "description": str(e)
+            "description": str(exc),
         }
 
 
-# =========================================================
+# ============================================================
 # SEND MESSAGE
-# =========================================================
+# ============================================================
 
 def send_message(
     chat_id,
     text,
-    keyboard=None
+    keyboard=None,
 ):
+    """
+    Send normal Telegram message.
+    """
 
     data = {
-
         "chat_id": chat_id,
-
         "text": text,
-
-        "disable_web_page_preview": True
-
+        "disable_web_page_preview": True,
     }
 
 
@@ -285,350 +382,105 @@ def send_message(
 
 
     return telegram(
-
         "sendMessage",
-
         data,
-
-        timeout=15
-
+        timeout=15,
     )
 
 
-# =========================================================
+# ============================================================
 # ANSWER CALLBACK
-# =========================================================
+# ============================================================
 
 def answer_callback(
     callback_id,
-    text=""
+    text="",
 ):
+    """
+    Inline button loading ကိုပျောက်စေတယ်။
+    """
 
     return telegram(
-
         "answerCallbackQuery",
-
         {
             "callback_query_id": callback_id,
-
-            "text": text
+            "text": text,
         },
-
-        timeout=5
-
+        timeout=8,
     )
 
 
-# =========================================================
+# ============================================================
 # COPY MUSIC
-# =========================================================
+# ============================================================
 
 def copy_music(
     chat_id,
     channel_id,
-    message_id
+    message_id,
 ):
+    """
+    Channel ထဲက music post ကို
+    user chat ထဲ copy လုပ်မယ်။
+    """
 
     return telegram(
-
         "copyMessage",
-
         {
-
             "chat_id": chat_id,
-
             "from_chat_id": channel_id,
-
-            "message_id": message_id
-
+            "message_id": message_id,
         },
-
-        timeout=30
-
+        timeout=30,
     )
 
 
-# =========================================================
-# MOOD MENU
-# =========================================================
-
-def mood_menu():
-
-    return {
-
-        "inline_keyboard": [
-
-            [
-
-                {
-                    "text": "😢 Sad",
-                    "callback_data": "mood_sad"
-                },
-
-                {
-                    "text": "❤️ Love",
-                    "callback_data": "mood_love"
-                }
-
-            ],
-
-            [
-
-                {
-                    "text": "🌙 Chill",
-                    "callback_data": "mood_chill"
-                },
-
-                {
-                    "text": "🔥 Hype",
-                    "callback_data": "mood_hype"
-                }
-
-            ],
-
-            [
-
-                {
-                    "text": "🖤 Dark",
-                    "callback_data": "mood_dark"
-                },
-
-                {
-                    "text": "⚡ Energetic",
-                    "callback_data": "mood_energetic"
-                }
-
-            ],
-
-            [
-
-                {
-                    "text": "🚗 Night Drive",
-                    "callback_data": "mood_night"
-                },
-
-                {
-                    "text": "🌌 Melodic",
-                    "callback_data": "mood_melodic"
-                }
-
-            ]
-
-        ]
-
-    }
-
-
-# =========================================================
-# MUSIC BUTTONS
-# =========================================================
-
-def music_buttons():
-
-    return {
-
-        "inline_keyboard": [
-
-            [
-
-                {
-                    "text": "🔀 Next",
-                    "callback_data": "next_music"
-                }
-
-            ],
-
-            [
-
-                {
-                    "text": "🎧 Change Mood",
-                    "callback_data": "change_mood"
-                }
-
-            ]
-
-        ]
-
-    }
-
-
-# =========================================================
+# ============================================================
 # USER LOCK
-# =========================================================
+# ============================================================
 
-def get_user_lock(
-    user_id
-):
+def get_user_lock(user_id):
 
-    with state_lock:
+    with user_locks_lock:
 
-        if user_id not in USER_LOCKS:
+        if user_id not in user_locks:
 
-            USER_LOCKS[user_id] = (
-                threading.Lock()
-            )
+            user_locks[user_id] = threading.Lock()
+
+        return user_locks[user_id]
 
 
-        return USER_LOCKS[user_id]
-
-
-# =========================================================
+# ============================================================
 # REGISTER USER
-# =========================================================
+# ============================================================
 
-def register_user(
-    user
-):
+def register_user(user):
 
     if not user:
 
         return
 
 
-    user_id = user.get(
-        "id"
-    )
-
+    user_id = user.get("id")
 
     if not user_id:
 
         return
 
 
-    now = int(
-        time.time()
+    username = user.get(
+        "username"
     )
 
-
-    with state_lock:
-
-        if user_id not in USER_STATE:
-
-            USER_STATE[user_id] = {
-
-                "mood": None,
-
-                "first_seen": now,
-
-                "last_seen": now
-
-            }
-
-        else:
-
-            USER_STATE[user_id][
-                "last_seen"
-            ] = now
-
-
-# =========================================================
-# MUSIC MESSAGE CHECK
-# =========================================================
-
-def is_music_message(
-    message
-):
-
-    # Telegram audio
-    if getattr(
-        message,
-        "audio",
-        None
-    ):
-
-        return True
-
-
-    # Telegram document
-    document = getattr(
-        message,
-        "document",
-        None
+    first_name = user.get(
+        "first_name"
     )
 
-
-    if document:
-
-        mime_type = getattr(
-
-            document,
-
-            "mime_type",
-
-            ""
-
-        ) or ""
-
-
-        if mime_type.startswith(
-            "audio/"
-        ):
-
-            return True
-
-
-        # File name စစ်
-        attributes = getattr(
-            document,
-            "attributes",
-            []
-        )
-
-
-        for attribute in attributes:
-
-            file_name = getattr(
-                attribute,
-                "file_name",
-                ""
-            ) or ""
-
-
-            if file_name.lower().endswith(
-                (
-                    ".mp3",
-                    ".wav",
-                    ".flac",
-                    ".m4a",
-                    ".aac",
-                    ".ogg",
-                    ".opus"
-                )
-            ):
-
-                return True
-
-
-    return False
-
-
-# =========================================================
-# ADD MUSIC
-# =========================================================
-
-def add_music(
-    mood,
-    channel_id,
-    message_id
-):
-
-    if mood not in MOODS:
-
-        return
-
-
-    track = (
-
-        str(channel_id),
-
-        int(message_id)
-
+    last_name = user.get(
+        "last_name"
     )
 
+    now = int(time.time())
 
-    with music_lock:
 
-        if track not in MUSIC[mood]:
-
-            MUSIC[mood].append(
-                track
+    conn
