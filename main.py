@@ -20,12 +20,18 @@ app = Flask(__name__)
 
 
 # ============================================================
-# ENV
+# ENVIRONMENT
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    ""
+).strip()
 
-ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
+ADMIN_USER_ID = os.getenv(
+    "ADMIN_USER_ID",
+    ""
+).strip()
 
 RENDER_EXTERNAL_URL = os.getenv(
     "RENDER_EXTERNAL_URL",
@@ -34,7 +40,7 @@ RENDER_EXTERNAL_URL = os.getenv(
 
 
 # ============================================================
-# TELETHON
+# TELETHON ENVIRONMENT
 # ============================================================
 
 TELETHON_API_ID = (
@@ -57,12 +63,6 @@ TELETHON_SESSION = os.getenv(
 
 # ============================================================
 # DATABASE
-# ============================================================
-#
-# Render Free မှာ /data ကို မသုံးရပါ။
-#
-# Current working directory ကို သုံးမယ်။
-#
 # ============================================================
 
 BASE_DIR = os.path.dirname(
@@ -104,29 +104,61 @@ MOODS = [
 
 
 # ============================================================
-# CHANNEL ENV
+# CHANNELS
 # ============================================================
 
 MOOD_CHANNELS = {
-    "sad": os.getenv("SAD_CHANNEL", "").strip(),
-    "love": os.getenv("LOVE_CHANNEL", "").strip(),
-    "chill": os.getenv("CHILL_CHANNEL", "").strip(),
-    "hype": os.getenv("HYPE_CHANNEL", "").strip(),
-    "dark": os.getenv("DARK_CHANNEL", "").strip(),
-    "energetic": os.getenv("ENERGETIC_CHANNEL", "").strip(),
-    "night": os.getenv("NIGHT_CHANNEL", "").strip(),
-    "melodic": os.getenv("MELODIC_CHANNEL", "").strip(),
+
+    "sad": os.getenv(
+        "SAD_CHANNEL",
+        ""
+    ).strip(),
+
+    "love": os.getenv(
+        "LOVE_CHANNEL",
+        ""
+    ).strip(),
+
+    "chill": os.getenv(
+        "CHILL_CHANNEL",
+        ""
+    ).strip(),
+
+    "hype": os.getenv(
+        "HYPE_CHANNEL",
+        ""
+    ).strip(),
+
+    "dark": os.getenv(
+        "DARK_CHANNEL",
+        ""
+    ).strip(),
+
+    "energetic": os.getenv(
+        "ENERGETIC_CHANNEL",
+        ""
+    ).strip(),
+
+    "night": os.getenv(
+        "NIGHT_CHANNEL",
+        ""
+    ).strip(),
+
+    "melodic": os.getenv(
+        "MELODIC_CHANNEL",
+        ""
+    ).strip(),
 }
 
 
 # ============================================================
-# HTTP
+# HTTP SESSION
 # ============================================================
 
 http = requests.Session()
 
 http.headers.update({
-    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT/5.0"
+    "User-Agent": "NOT-YOUR-VIBE-MUSIC-BOT/6.0"
 })
 
 
@@ -149,7 +181,7 @@ telethon_client = None
 
 
 # ============================================================
-# DATABASE
+# DATABASE CONNECTION
 # ============================================================
 
 def get_db():
@@ -168,6 +200,10 @@ def get_db():
 
     return conn
 
+
+# ============================================================
+# INITIALIZE DATABASE
+# ============================================================
 
 def init_db():
 
@@ -248,6 +284,7 @@ def init_db():
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS
                 idx_tracks_mood
+
                 ON tracks(mood)
             """)
 
@@ -255,14 +292,23 @@ def init_db():
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS
                 idx_history_user
-                ON user_history(user_id, sent_at DESC)
+
+                ON user_history(
+                    user_id,
+                    sent_at DESC
+                )
             """)
 
 
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS
                 idx_history_user_mood
-                ON user_history(user_id, mood, sent_at DESC)
+
+                ON user_history(
+                    user_id,
+                    mood,
+                    sent_at DESC
+                )
             """)
 
 
@@ -285,7 +331,9 @@ def telegram(
 
     if not BOT_TOKEN:
 
-        print("❌ BOT_TOKEN missing")
+        print(
+            "❌ BOT_TOKEN missing"
+        )
 
         return {
             "ok": False,
@@ -294,7 +342,7 @@ def telegram(
 
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{BOT_TOKEN}/{method}"
     )
 
@@ -323,7 +371,7 @@ def telegram(
         if not result.get("ok"):
 
             print(
-                "Telegram API ERROR:",
+                "⚠️ Telegram API ERROR:",
                 method,
                 result
             )
@@ -335,7 +383,7 @@ def telegram(
     except Exception as exc:
 
         print(
-            "Telegram REQUEST ERROR:",
+            "⚠️ Telegram REQUEST ERROR:",
             method,
             repr(exc)
         )
@@ -376,7 +424,7 @@ def send_message(
 
 
 # ============================================================
-# CALLBACK
+# CALLBACK ANSWER
 # ============================================================
 
 def answer_callback(
@@ -427,6 +475,7 @@ def get_user_lock(user_id):
 
             user_locks[user_id] = threading.Lock()
 
+
         return user_locks[user_id]
 
 
@@ -446,7 +495,9 @@ def register_user(user):
         return
 
 
-    now = int(time.time())
+    now = int(
+        time.time()
+    )
 
 
     conn = get_db()
@@ -484,16 +535,24 @@ def register_user(user):
                     users.total_requests + 1
 
         """, (
+
             user_id,
+
             user.get("username"),
+
             user.get("first_name"),
+
             user.get("last_name"),
+
             now,
+
             now
+
         ))
 
 
         conn.commit()
+
 
     except Exception as exc:
 
@@ -501,6 +560,7 @@ def register_user(user):
             "REGISTER USER ERROR:",
             repr(exc)
         )
+
 
     finally:
 
@@ -546,14 +606,20 @@ def save_track(
             VALUES (?, ?, ?, ?)
 
         """, (
+
             mood,
+
             str(channel_id),
+
             int(message_id),
+
             int(time.time())
+
         ))
 
 
         conn.commit()
+
 
     except Exception as exc:
 
@@ -561,6 +627,7 @@ def save_track(
             "SAVE TRACK ERROR:",
             repr(exc)
         )
+
 
     finally:
 
@@ -592,7 +659,6 @@ def save_telethon_message(
         return
 
 
-    # Music / audio / video / document
     if not getattr(
         message,
         "media",
@@ -602,23 +668,29 @@ def save_telethon_message(
         return
 
 
-    channel_id = str(
-        getattr(
-            entity,
-            "id",
-            ""
-        )
+    entity_id = getattr(
+        entity,
+        "id",
+        None
     )
 
 
-    if not channel_id:
+    if not entity_id:
         return
 
 
-    # Telegram Bot API channel ID
-    if not channel_id.startswith("-100"):
+    entity_id = str(
+        entity_id
+    )
 
-        channel_id = "-100" + channel_id
+
+    if entity_id.startswith("-100"):
+
+        channel_id = entity_id
+
+    else:
+
+        channel_id = "-100" + entity_id
 
 
     save_track(
@@ -629,13 +701,27 @@ def save_telethon_message(
 
 
 # ============================================================
-# TELETHON SCAN
+# SCAN ONE CHANNEL
 # ============================================================
 
 async def scan_one_channel(
     mood,
     channel_value
 ):
+
+    print("")
+    print(
+        "=========================================="
+    )
+
+    print(
+        f"🔎 Scanning {mood.upper()}..."
+    )
+
+    print(
+        f"📌 Channel: {channel_value}"
+    )
+
 
     if not channel_value:
 
@@ -648,18 +734,27 @@ async def scan_one_channel(
 
     if telethon_client is None:
 
+        print(
+            "❌ Telethon client unavailable"
+        )
+
         return 0
-
-
-    print(
-        f"🔎 Scanning {mood.upper()}..."
-    )
 
 
     try:
 
+        print(
+            f"🔗 Getting {mood.upper()} channel..."
+        )
+
+
         entity = await telethon_client.get_entity(
             channel_value
+        )
+
+
+        print(
+            f"✅ {mood.upper()} channel found"
         )
 
 
@@ -671,6 +766,7 @@ async def scan_one_channel(
         ):
 
             if not message:
+
                 continue
 
 
@@ -691,6 +787,14 @@ async def scan_one_channel(
 
 
             count += 1
+
+
+            if count % 100 == 0:
+
+                print(
+                    f"🎵 {mood.upper()}: "
+                    f"{count} tracks found..."
+                )
 
 
         print(
@@ -717,6 +821,20 @@ async def scan_one_channel(
 
 async def scan_all_channels():
 
+    print("")
+    print(
+        "##########################################"
+    )
+
+    print(
+        "🎵 STARTING ALL MOOD CHANNEL SCAN"
+    )
+
+    print(
+        "##########################################"
+    )
+
+
     total = 0
 
 
@@ -724,23 +842,38 @@ async def scan_all_channels():
 
         try:
 
-            total += await scan_one_channel(
+            count = await scan_one_channel(
                 mood,
-                MOOD_CHANNELS.get(mood, "")
+                MOOD_CHANNELS.get(
+                    mood,
+                    ""
+                )
             )
+
+
+            total += count
+
 
         except Exception as exc:
 
             print(
-                "CHANNEL SCAN ERROR:",
+                "⚠️ CHANNEL SCAN ERROR:",
                 mood,
                 repr(exc)
             )
 
 
+    print("")
     print(
-        "🎵 TOTAL TRACKS SCANNED:",
-        total
+        "##########################################"
+    )
+
+    print(
+        f"🎵 TOTAL TRACKS SCANNED: {total}"
+    )
+
+    print(
+        "##########################################"
     )
 
 
@@ -753,6 +886,24 @@ def telethon_worker():
     global telethon_client
 
 
+    print("")
+    print(
+        "=========================================="
+    )
+
+    print(
+        "🔐 TELETHON WORKER STARTING"
+    )
+
+    print(
+        "=========================================="
+    )
+
+
+    # --------------------------------------------------------
+    # API ID
+    # --------------------------------------------------------
+
     if not TELETHON_API_ID:
 
         print(
@@ -761,6 +912,10 @@ def telethon_worker():
 
         return
 
+
+    # --------------------------------------------------------
+    # API HASH
+    # --------------------------------------------------------
 
     if not TELETHON_API_HASH:
 
@@ -771,6 +926,10 @@ def telethon_worker():
         return
 
 
+    # --------------------------------------------------------
+    # SESSION
+    # --------------------------------------------------------
+
     if not TELETHON_SESSION:
 
         print(
@@ -778,6 +937,19 @@ def telethon_worker():
         )
 
         return
+
+
+    print(
+        "✅ TELETHON_API_ID found"
+    )
+
+    print(
+        "✅ TELETHON_API_HASH found"
+    )
+
+    print(
+        "✅ TELETHON_SESSION found"
+    )
 
 
     try:
@@ -788,29 +960,114 @@ def telethon_worker():
 
 
         print(
-            "🔐 Connecting Telegram account..."
+            "🔐 Creating Telegram client..."
         )
 
 
-        # ----------------------------------------------------
-        # StringSession
-        # ----------------------------------------------------
-
         telethon_client = TelegramClient(
+
             StringSession(
                 TELETHON_SESSION
             ),
+
             api_id,
-            TELETHON_API_HASH
+
+            TELETHON_API_HASH,
+
+            connection_retries=5,
+
+            retry_delay=5,
+
+            timeout=20
+
+        )
+
+
+        print(
+            "🔐 Telegram client created"
         )
 
 
         async def runner():
 
-            await telethon_client.start()
+            print(
+                "🔌 Connecting to Telegram..."
+            )
+
+
+            await telethon_client.connect()
+
+
+            print(
+                "🔌 Telegram connection established"
+            )
+
+
+            authorized = await telethon_client.is_user_authorized()
+
+
+            if not authorized:
+
+                print(
+                    "❌ TELETHON SESSION NOT AUTHORIZED"
+                )
+
+                print(
+                    "⚠️ Create a new TELETHON_SESSION"
+                )
+
+                await telethon_client.disconnect()
+
+                return
+
 
             print(
                 "✅ TELETHON LOGIN SUCCESS"
+            )
+
+
+            # ------------------------------------------------
+            # GET ACCOUNT
+            # ------------------------------------------------
+
+            try:
+
+                me = await telethon_client.get_me()
+
+                if me:
+
+                    username = getattr(
+                        me,
+                        "username",
+                        None
+                    )
+
+                    first_name = getattr(
+                        me,
+                        "first_name",
+                        None
+                    )
+
+                    print(
+                        "👤 Telegram account:",
+                        first_name,
+                        username
+                    )
+
+            except Exception as exc:
+
+                print(
+                    "⚠️ Could not get account:",
+                    repr(exc)
+                )
+
+
+            # ------------------------------------------------
+            # SCAN
+            # ------------------------------------------------
+
+            print(
+                "🔎 Starting channel scan..."
             )
 
 
@@ -819,6 +1076,15 @@ def telethon_worker():
 
             print(
                 "📡 Telegram account watcher ready"
+            )
+
+
+            # ------------------------------------------------
+            # KEEP CONNECTION ALIVE
+            # ------------------------------------------------
+
+            print(
+                "💓 Telethon waiting for updates..."
             )
 
 
@@ -837,16 +1103,11 @@ def telethon_worker():
             repr(exc)
         )
 
-
-        # IMPORTANT:
-        # Telethon ပျက်သွားလို့
-        # Bot server မရပ်စေဘူး။
+        print(
+            "🔄 Telethon worker stopped"
+        )
 
         time.sleep(10)
-
-        print(
-            "🔄 Telethon worker stopped."
-        )
 
 
 # ============================================================
@@ -860,47 +1121,59 @@ def mood_menu():
         "inline_keyboard": [
 
             [
+
                 {
                     "text": "😢 Sad",
                     "callback_data": "mood_sad"
                 },
+
                 {
                     "text": "❤️ Love",
                     "callback_data": "mood_love"
                 }
+
             ],
 
             [
+
                 {
                     "text": "🌙 Chill",
                     "callback_data": "mood_chill"
                 },
+
                 {
                     "text": "🔥 Hype",
                     "callback_data": "mood_hype"
                 }
+
             ],
 
             [
+
                 {
                     "text": "🖤 Dark",
                     "callback_data": "mood_dark"
                 },
+
                 {
                     "text": "⚡ Energetic",
                     "callback_data": "mood_energetic"
                 }
+
             ],
 
             [
+
                 {
                     "text": "🚗 Night Drive",
                     "callback_data": "mood_night"
                 },
+
                 {
                     "text": "🌌 Melodic",
                     "callback_data": "mood_melodic"
                 }
+
             ]
 
         ]
@@ -918,17 +1191,21 @@ def music_buttons():
         "inline_keyboard": [
 
             [
+
                 {
                     "text": "🔀 Next",
                     "callback_data": "next_music"
                 }
+
             ],
 
             [
+
                 {
                     "text": "🎧 Change Mood",
                     "callback_data": "change_mood"
                 }
+
             ]
 
         ]
@@ -960,6 +1237,7 @@ def get_track_count(mood):
         return int(
             row["count"]
         )
+
 
     finally:
 
@@ -994,9 +1272,13 @@ def get_recent_tracks(
             LIMIT ?
 
         """, (
+
             user_id,
+
             mood,
+
             limit
+
         )).fetchall()
 
 
@@ -1004,6 +1286,7 @@ def get_recent_tracks(
             int(row["message_id"])
             for row in rows
         }
+
 
     finally:
 
@@ -1043,13 +1326,18 @@ def set_user_mood(
                 updated_at = excluded.updated_at
 
         """, (
+
             user_id,
+
             mood,
+
             int(time.time())
+
         ))
 
 
         conn.commit()
+
 
     finally:
 
@@ -1079,10 +1367,12 @@ def get_user_mood(user_id):
 
 
         if not row:
+
             return None
 
 
         return row["mood"]
+
 
     finally:
 
@@ -1118,7 +1408,9 @@ def reserve_track(
 
             rows = conn.execute("""
                 SELECT
+
                     message_id,
+
                     channel_id
 
                 FROM tracks
@@ -1152,21 +1444,36 @@ def reserve_track(
                 if message_id not in recent:
 
                     candidates.append(
+
                         (
                             message_id,
-                            str(row["channel_id"])
+
+                            str(
+                                row["channel_id"]
+                            )
                         )
+
                     )
 
 
             if not candidates:
 
                 candidates = [
+
                     (
-                        int(row["message_id"]),
-                        str(row["channel_id"])
+
+                        int(
+                            row["message_id"]
+                        ),
+
+                        str(
+                            row["channel_id"]
+                        )
+
                     )
+
                     for row in rows
+
                 ]
 
 
@@ -1189,11 +1496,17 @@ def reserve_track(
                 VALUES (?, ?, ?, ?, ?)
 
             """, (
+
                 user_id,
+
                 mood,
+
                 channel_id,
+
                 message_id,
+
                 int(time.time())
+
             ))
 
 
@@ -1216,6 +1529,7 @@ def reserve_track(
             )
 
             return None
+
 
         finally:
 
@@ -1254,12 +1568,16 @@ def remove_last_history(
             )
 
         """, (
+
             user_id,
+
             message_id
+
         ))
 
 
         conn.commit()
+
 
     except Exception as exc:
 
@@ -1267,6 +1585,7 @@ def remove_last_history(
             "REMOVE HISTORY ERROR:",
             repr(exc)
         )
+
 
     finally:
 
@@ -1283,21 +1602,44 @@ def send_music(
     mood
 ):
 
-    count = get_track_count(
-        mood
+    try:
+
+        count = get_track_count(
+            mood
+        )
+
+    except Exception as exc:
+
+        print(
+            "TRACK COUNT ERROR:",
+            repr(exc)
+        )
+
+        send_message(
+            chat_id,
+            "⚠️ Database ခဏပြဿနာဖြစ်နေပါတယ်။"
+        )
+
+        return
+
+
+    print(
+        f"🎵 {mood.upper()} tracks available:",
+        count
     )
 
 
     if count <= 0:
 
         send_message(
+
             chat_id,
 
             f"{MOOD_NAMES[mood]}\n\n"
-            "⚠️ ဒီ mood ထဲမှာ music မတွေ့သေးပါ။\n\n"
-            "ခဏနေရင် ထပ်စမ်းကြည့်ပါ။",
+            "⚠️ ဒီ mood ထဲမှာ music မတွေ့သေးပါ။",
 
             mood_menu()
+
         )
 
         return
@@ -1325,30 +1667,45 @@ def send_music(
         message_id, channel_id = reserved
 
 
-        result = copy_music(
-            chat_id,
+        print(
+            "🎧 Trying track:",
             channel_id,
             message_id
+        )
+
+
+        result = copy_music(
+
+            chat_id,
+
+            channel_id,
+
+            message_id
+
         )
 
 
         if result.get("ok"):
 
             send_message(
+
                 chat_id,
 
                 f"{MOOD_NAMES[mood]}\n\n"
                 "🎧 Enjoy your music! 🔥",
 
                 music_buttons()
+
             )
 
+
             print(
-                "🎵 MUSIC SENT:",
+                "✅ MUSIC SENT:",
                 user_id,
                 mood,
                 message_id
             )
+
 
             return
 
@@ -1367,13 +1724,15 @@ def send_music(
 
 
     send_message(
+
         chat_id,
 
         f"{MOOD_NAMES[mood]}\n\n"
-        "⚠️ ဒီ track ကို အခု copy လုပ်လို့မရပါ။\n"
+        "⚠️ ဒီ track ကို ပို့လို့မရပါ။ "
         "နောက်တစ်ပုဒ်ကို စမ်းကြည့်ပါ။",
 
         music_buttons()
+
     )
 
 
@@ -1395,12 +1754,14 @@ def background_music(
             mood
         )
 
+
     except Exception as exc:
 
         print(
             "BACKGROUND MUSIC ERROR:",
             repr(exc)
         )
+
 
         try:
 
@@ -1410,6 +1771,7 @@ def background_music(
             )
 
         except Exception:
+
             pass
 
 
@@ -1451,6 +1813,7 @@ def get_users_count():
             row["count"]
         )
 
+
     finally:
 
         conn.close()
@@ -1474,7 +1837,9 @@ def get_track_counts():
 
         rows = conn.execute("""
             SELECT
+
                 mood,
+
                 COUNT(*) AS count
 
             FROM tracks
@@ -1486,11 +1851,12 @@ def get_track_counts():
 
         for row in rows:
 
-            if row["mood"] in result:
+            mood = row["mood"]
 
-                result[
-                    row["mood"]
-                ] = int(
+
+            if mood in result:
+
+                result[mood] = int(
                     row["count"]
                 )
 
@@ -1529,19 +1895,27 @@ def send_stats(chat_id):
 
 
     lines = [
+
         "📊 NOT YOUR VIBE MUSIC BOT",
+
         "",
+
         f"👥 Users: {users}",
+
         f"🎵 Total tracks: {total}",
-        "",
+
+        ""
+
     ]
 
 
     for mood in MOODS:
 
         lines.append(
+
             f"{MOOD_NAMES[mood]} → "
             f"{counts[mood]}"
+
         )
 
 
@@ -1558,7 +1932,9 @@ def send_stats(chat_id):
 @app.route("/")
 def home():
 
-    return "🎧 NOT YOUR VIBE MUSIC BOT ONLINE"
+    return (
+        "🎧 NOT YOUR VIBE MUSIC BOT ONLINE"
+    )
 
 
 # ============================================================
@@ -1583,12 +1959,16 @@ def webhook():
 
     try:
 
-        update = app.request_class.get_json(
-            request,
+        update = request.get_json(
             silent=True
         )
 
-    except Exception:
+    except Exception as exc:
+
+        print(
+            "WEBHOOK JSON ERROR:",
+            repr(exc)
+        )
 
         update = None
 
@@ -1691,13 +2071,21 @@ def webhook():
 
 
             threading.Thread(
+
                 target=background_music,
+
                 args=(
+
                     chat_id,
+
                     user_id,
+
                     mood
+
                 ),
+
                 daemon=True
+
             ).start()
 
 
@@ -1724,28 +2112,44 @@ def webhook():
 
 
                 send_message(
+
                     chat_id,
+
                     "🎧 Choose your mood 👇",
+
                     mood_menu()
+
                 )
+
 
                 return "OK"
 
 
             answer_callback(
+
                 callback_id,
+
                 "🔀 Finding next..."
+
             )
 
 
             threading.Thread(
+
                 target=background_music,
+
                 args=(
+
                     chat_id,
+
                     user_id,
+
                     mood
+
                 ),
+
                 daemon=True
+
             ).start()
 
 
@@ -1759,15 +2163,22 @@ def webhook():
         if data == "change_mood":
 
             answer_callback(
+
                 callback_id,
+
                 "🎧 Choose mood"
+
             )
 
 
             send_message(
+
                 chat_id,
+
                 "🎧 Choose your mood 👇",
+
                 mood_menu()
+
             )
 
 
@@ -1817,11 +2228,14 @@ def webhook():
 
 
     text = (
+
         message.get(
             "text",
             ""
         )
+
         or ""
+
     ).strip()
 
 
@@ -1879,22 +2293,34 @@ def webhook():
         if not mood:
 
             send_message(
+
                 chat_id,
+
                 "🎧 အရင်ဆုံး Mood ရွေးပါ 👇",
+
                 mood_menu()
+
             )
 
             return "OK"
 
 
         threading.Thread(
+
             target=background_music,
+
             args=(
+
                 chat_id,
+
                 chat_id,
+
                 mood
+
             ),
+
             daemon=True
+
         ).start()
 
 
@@ -1910,17 +2336,24 @@ def webhook():
         if is_admin(chat_id):
 
             send_message(
+
                 chat_id,
+
                 f"👥 Total users: "
                 f"{get_users_count()}"
+
             )
 
         else:
 
             send_message(
+
                 chat_id,
+
                 "❌ Admin only."
+
             )
+
 
         return "OK"
 
@@ -1990,8 +2423,17 @@ def setup_webhook():
 
 
     webhook_url = (
+
         RENDER_EXTERNAL_URL.rstrip("/")
+
         + "/webhook"
+
+    )
+
+
+    print(
+        "🌐 Webhook URL:",
+        webhook_url
     )
 
 
@@ -2000,24 +2442,30 @@ def setup_webhook():
         "setWebhook",
 
         {
+
             "url": webhook_url,
 
             "allowed_updates": [
+
                 "message",
+
                 "callback_query"
+
             ],
 
             "drop_pending_updates": True,
 
             "max_connections": 40
+
         },
 
         timeout=20
+
     )
 
 
     print(
-        "WEBHOOK:",
+        "WEBHOOK RESULT:",
         result
     )
 
@@ -2029,13 +2477,21 @@ def setup_webhook():
 def startup():
 
     print("")
-    print("=" * 50)
-    print("🎧 NOT YOUR VIBE MUSIC BOT")
-    print("=" * 50)
+    print(
+        "=================================================="
+    )
+
+    print(
+        "🎧 NOT YOUR VIBE MUSIC BOT"
+    )
+
+    print(
+        "=================================================="
+    )
 
 
     # --------------------------------------------------------
-    # Database
+    # DATABASE
     # --------------------------------------------------------
 
     print(
@@ -2061,38 +2517,48 @@ def startup():
 
 
     # --------------------------------------------------------
-    # Environment check
+    # BOT TOKEN
     # --------------------------------------------------------
 
-    if not BOT_TOKEN:
-
-        print(
-            "❌ BOT_TOKEN missing"
-        )
-
-    else:
+    if BOT_TOKEN:
 
         print(
             "✅ BOT_TOKEN found"
         )
 
-
-    if not ADMIN_USER_ID:
+    else:
 
         print(
-            "⚠️ ADMIN_USER_ID missing"
+            "❌ BOT_TOKEN missing"
         )
 
-    else:
+
+    # --------------------------------------------------------
+    # ADMIN
+    # --------------------------------------------------------
+
+    if ADMIN_USER_ID:
 
         print(
             "✅ ADMIN_USER_ID found"
         )
 
+    else:
+
+        print(
+            "⚠️ ADMIN_USER_ID missing"
+        )
+
 
     # --------------------------------------------------------
-    # Channels
+    # CHANNELS
     # --------------------------------------------------------
+
+    print("")
+    print(
+        "🎵 MOOD CHANNELS"
+    )
+
 
     for mood in MOODS:
 
@@ -2105,8 +2571,8 @@ def startup():
         if value:
 
             print(
-                f"✅ {mood.upper()} CHANNEL:",
-                value
+                f"✅ {mood.upper()} CHANNEL: "
+                f"{value}"
             )
 
         else:
@@ -2117,25 +2583,42 @@ def startup():
 
 
     # --------------------------------------------------------
-    # Webhook
+    # WEBHOOK
     # --------------------------------------------------------
 
     setup_webhook()
 
 
     # --------------------------------------------------------
-    # Telethon
+    # TELETHON
     # --------------------------------------------------------
 
     threading.Thread(
+
         target=telethon_worker,
+
         daemon=True
+
     ).start()
 
 
-    print("=" * 50)
-    print("🚀 BOT SERVER READY")
-    print("=" * 50)
+    # --------------------------------------------------------
+    # READY
+    # --------------------------------------------------------
+
+    print("")
+    print(
+        "=================================================="
+    )
+
+    print(
+        "🚀 BOT SERVER READY"
+    )
+
+    print(
+        "=================================================="
+    )
+
     print("")
 
 
@@ -2149,15 +2632,21 @@ if __name__ == "__main__":
 
 
     port = int(
+
         os.getenv(
             "PORT",
             "10000"
         )
+
     )
 
 
     app.run(
+
         host="0.0.0.0",
+
         port=port,
+
         threaded=True
-    )
+
+)
