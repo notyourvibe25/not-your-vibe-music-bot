@@ -2050,6 +2050,42 @@ def get_track_counts() -> dict[str, int]:
 # ============================================================
 # FEEDBACK
 #
+def resolve_feedback_track_id(
+    data: str,
+) -> Optional[int]:
+    """Resolve current `like_<id>` and legacy `like:mood:channel:message` data."""
+    if data.startswith(("like_", "unlike_")):
+        try:
+            return int(data.split("_", 1)[1])
+        except (TypeError, ValueError):
+            return None
+
+    parts = data.split(":", 3)
+    if len(parts) != 4 or parts[0] not in {"like", "notme", "unlike"}:
+        return None
+    try:
+        channel_id = str(parts[2])
+        message_id = int(parts[3])
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            cursor.execute(
+                """
+                SELECT id FROM tracks
+                WHERE channel_id=%s AND message_id=%s
+                LIMIT 1
+                """,
+                (channel_id, message_id),
+            )
+            row = cursor.fetchone()
+            return int(row["id"]) if row else None
+    except Exception:
+        logger.exception("Could not resolve legacy feedback track")
+        return None
+
+
 # ❤️ = like
 # 😴 = unlike
 # ============================================================
@@ -3211,17 +3247,12 @@ def handle_callback(
     # ========================================================
     # LIKE
     # ========================================================
-    if data.startswith(
-        "like_"
-    ):
-        try:
-            track_id = int(
-                data[5:]
-            )
-        except ValueError:
+    if data.startswith(("like_", "like:")):
+        track_id = resolve_feedback_track_id(data)
+        if track_id is None:
             answer_callback(
                 callback_id,
-                "Invalid track",
+                "Track not found",
             )
             return
         if save_feedback(
@@ -3244,21 +3275,21 @@ def handle_callback(
                     "ဒီလို style တွေကို ဦးစားပေးပါမယ်။"
                 ),
             )
+        else:
+            answer_callback(
+                callback_id,
+                "Could not save Like. Please try again.",
+            )
         return
     # ========================================================
     # UNLIKE
     # ========================================================
-    if data.startswith(
-        "unlike_"
-    ):
-        try:
-            track_id = int(
-                data[7:]
-            )
-        except ValueError:
+    if data.startswith(("unlike_", "unlike:", "notme:")):
+        track_id = resolve_feedback_track_id(data)
+        if track_id is None:
             answer_callback(
                 callback_id,
-                "Invalid track",
+                "Track not found",
             )
             return
         if save_feedback(
@@ -3281,6 +3312,11 @@ def handle_callback(
                     "နောက်တစ်ခါ ဒီ track ကို "
                     "ရှောင်ပေးပါမယ်။"
                 ),
+            )
+        else:
+            answer_callback(
+                callback_id,
+                "Could not save feedback. Please try again.",
             )
         return
     # ========================================================
