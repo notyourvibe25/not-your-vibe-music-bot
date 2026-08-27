@@ -1,5 +1,6 @@
 Flask
 requests
 psycopg2-binary
-Telethon
+telethon
+openai
 gunicorn
