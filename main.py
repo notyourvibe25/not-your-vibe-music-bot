@@ -400,6 +400,8 @@ telethon_thread: Optional[
 ] = None
 
 telethon_start_lock = threading.Lock()
+startup_lock = threading.Lock()
+startup_completed = False
 
 music_executor = ThreadPoolExecutor(
     max_workers=WORKER_COUNT,
@@ -576,198 +578,108 @@ def db_cursor(
 # ============================================================
 
 def init_db() -> None:
-
+    """Create or upgrade the PostgreSQL schema without deleting bot data."""
     initialize_db_pool()
 
-    schema = """
-
+    base_schema = """
     CREATE TABLE IF NOT EXISTS users (
-
         user_id BIGINT PRIMARY KEY,
-
         username TEXT,
-
         first_name TEXT,
-
         last_name TEXT,
-
-        first_seen BIGINT NOT NULL,
-
-        last_seen BIGINT NOT NULL,
-
+        first_seen BIGINT NOT NULL DEFAULT 0,
+        last_seen BIGINT NOT NULL DEFAULT 0,
         total_requests BIGINT NOT NULL DEFAULT 0
-
     );
-
-
     CREATE TABLE IF NOT EXISTS tracks (
-
         id BIGSERIAL PRIMARY KEY,
-
-        mood TEXT NOT NULL,
-
-        channel_id TEXT NOT NULL,
-
-        message_id BIGINT NOT NULL,
-
-        created_at BIGINT NOT NULL,
-
+        mood TEXT NOT NULL DEFAULT 'chill',
+        channel_id TEXT NOT NULL DEFAULT '',
+        message_id BIGINT NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL DEFAULT 0,
         UNIQUE(channel_id, message_id)
-
     );
-
-
     CREATE TABLE IF NOT EXISTS user_history (
-
         id BIGSERIAL PRIMARY KEY,
-
         user_id BIGINT NOT NULL,
-
-        mood TEXT NOT NULL,
-
-        channel_id TEXT NOT NULL,
-
-        message_id BIGINT NOT NULL,
-
+        mood TEXT NOT NULL DEFAULT 'chill',
+        channel_id TEXT NOT NULL DEFAULT '',
+        message_id BIGINT NOT NULL DEFAULT 0,
         action TEXT NOT NULL DEFAULT 'served',
-
-        sent_at BIGINT NOT NULL
-
+        sent_at BIGINT NOT NULL DEFAULT 0
     );
-
-
     CREATE TABLE IF NOT EXISTS user_state (
-
         user_id BIGINT PRIMARY KEY,
-
         mood TEXT,
-
         radio_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-
         radio_index INTEGER NOT NULL DEFAULT 0,
-
-        updated_at BIGINT NOT NULL
-
+        updated_at BIGINT NOT NULL DEFAULT 0
     );
-
-
     CREATE TABLE IF NOT EXISTS track_feedback (
-
         id BIGSERIAL PRIMARY KEY,
-
         user_id BIGINT NOT NULL,
-
-        channel_id TEXT NOT NULL,
-
-        message_id BIGINT NOT NULL,
-
-        mood TEXT NOT NULL,
-
-        feedback TEXT NOT NULL,
-
-        created_at BIGINT NOT NULL,
-
-        UNIQUE(
-            user_id,
-            channel_id,
-            message_id
-        )
-
+        channel_id TEXT NOT NULL DEFAULT '',
+        message_id BIGINT NOT NULL DEFAULT 0,
+        mood TEXT NOT NULL DEFAULT 'chill',
+        feedback TEXT NOT NULL DEFAULT 'like',
+        created_at BIGINT NOT NULL DEFAULT 0,
+        UNIQUE(user_id, channel_id, message_id)
     );
-
-
     CREATE TABLE IF NOT EXISTS processed_updates (
-
         update_id BIGINT PRIMARY KEY,
-
-        processed_at BIGINT NOT NULL
-
+        processed_at BIGINT NOT NULL DEFAULT 0
     );
-
-
-    CREATE INDEX IF NOT EXISTS
-        idx_tracks_mood
-        ON tracks(mood);
-
-
-    CREATE INDEX IF NOT EXISTS
-        idx_history_user
-        ON user_history(
-            user_id,
-            sent_at DESC
-        );
-
-
-    CREATE INDEX IF NOT EXISTS
-        idx_feedback_user
-        ON track_feedback(
-            user_id,
-            created_at DESC
-        );
-
-
-    CREATE INDEX IF NOT EXISTS
-        idx_feedback_track
-        ON track_feedback(
-            channel_id,
-            message_id
-        );
-
-
-    CREATE INDEX IF NOT EXISTS
-        idx_processed_updates_time
-        ON processed_updates(
-            processed_at
-        );
-
     """
 
-    with (
-        db_connection() as connection,
-        db_cursor(connection) as cursor
-    ):
-
-        cursor.execute(schema)
-
-        # Existing DB হলে নতুন column ထည့်ရန်
-        cursor.execute(
-            """
-            ALTER TABLE user_history
-            ADD COLUMN IF NOT EXISTS action
-            TEXT NOT NULL DEFAULT 'served'
-            """
-        )
-
-        cursor.execute(
-            """
-            ALTER TABLE user_state
-            ADD COLUMN IF NOT EXISTS radio_enabled
-            BOOLEAN NOT NULL DEFAULT FALSE
-            """
-        )
-
-        cursor.execute(
-            """
-            ALTER TABLE user_state
-            ADD COLUMN IF NOT EXISTS radio_index
-            INTEGER NOT NULL DEFAULT 0
-            """
-        )
-
-        cursor.execute(
-            """
-            DELETE FROM processed_updates
-            WHERE processed_at < %s
-            """,
-            (
-                int(time.time()) - 604800,
-            ),
-        )
-
-    logger.info(
-        "🟢 PostgreSQL database is ready"
+    # Migrations must run before any index/query relies on the columns. Each
+    # statement is idempotent, so this safely supports both new and old DBs.
+    migrations = (
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_seen BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_requests BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS mood TEXT NOT NULL DEFAULT 'chill'",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS message_id BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS created_at BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS mood TEXT NOT NULL DEFAULT 'chill'",
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS message_id BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'served'",
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS sent_at BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS mood TEXT",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS radio_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS radio_index INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE track_feedback ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE track_feedback ADD COLUMN IF NOT EXISTS message_id BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE track_feedback ADD COLUMN IF NOT EXISTS mood TEXT NOT NULL DEFAULT 'chill'",
+        "ALTER TABLE track_feedback ADD COLUMN IF NOT EXISTS feedback TEXT NOT NULL DEFAULT 'like'",
+        "ALTER TABLE track_feedback ADD COLUMN IF NOT EXISTS created_at BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE processed_updates ADD COLUMN IF NOT EXISTS processed_at BIGINT NOT NULL DEFAULT 0",
+    )
+    indexes = (
+        "CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood)",
+        "CREATE INDEX IF NOT EXISTS idx_history_user ON user_history(user_id, sent_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_feedback_user ON track_feedback(user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_feedback_track ON track_feedback(channel_id, message_id)",
+        "CREATE INDEX IF NOT EXISTS idx_processed_updates_time ON processed_updates(processed_at)",
     )
 
+    with db_connection() as connection, db_cursor(connection) as cursor:
+        cursor.execute(base_schema)
+        for statement in migrations:
+            cursor.execute(statement)
+        for statement in indexes:
+            cursor.execute(statement)
+        cursor.execute(
+            "DELETE FROM processed_updates WHERE processed_at < %s",
+            (int(time.time()) - 604800,),
+        )
+
+    logger.info("🟢 PostgreSQL database is ready")
 
 # ============================================================
 # UPDATE DEDUPLICATION
@@ -3442,11 +3354,29 @@ def handle_callback(
     # LIKE / NOT FOR ME
     # --------------------------------------------------------
 
-    feedback_data = (
-        parse_feedback_callback(
-            data
-        )
-    )
+    feedback_data = parse_feedback_callback(data)
+
+    # Compatibility: current compact buttons use like_<track_id> / notme_<id>;
+    # earlier messages use like:mood:channel_id:message_id.
+    if not feedback_data and "_" in data:
+        compact_action, _, raw_track_id = data.partition("_")
+        if compact_action in {"like", "notme"} and raw_track_id.isdigit():
+            try:
+                with db_connection() as connection, db_cursor(connection) as cursor:
+                    cursor.execute(
+                        "SELECT mood, channel_id, message_id FROM tracks WHERE id=%s",
+                        (int(raw_track_id),),
+                    )
+                    row = cursor.fetchone()
+                if row and row["mood"] in MOODS:
+                    feedback_data = (
+                        compact_action,
+                        row["mood"],
+                        str(row["channel_id"]),
+                        int(row["message_id"]),
+                    )
+            except Exception:
+                logger.exception("Could not resolve compact feedback callback")
 
     if feedback_data:
 
@@ -3713,9 +3643,11 @@ def handle_callback(
 
         return
 
-    answer_callback(
-        callback_id
-    )
+    if data.startswith(("like", "notme")):
+        answer_callback(callback_id, "This track is no longer available.")
+        return
+
+    answer_callback(callback_id)
 
 
 # ============================================================
@@ -4245,6 +4177,12 @@ def setup_webhook() -> None:
 
 def startup() -> bool:
 
+    global startup_completed
+
+    with startup_lock:
+        if startup_completed:
+            return True
+
     logger.info(
         "========================================"
     )
@@ -4298,6 +4236,7 @@ def startup() -> bool:
         "🟢 Bot server is ready"
     )
 
+    startup_completed = True
     return True
 
 
@@ -4325,4 +4264,4 @@ if __name__ == "__main__":
         threaded=True,
 
         use_reloader=False,
-    )
+)
