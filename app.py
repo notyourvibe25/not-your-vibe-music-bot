@@ -500,11 +500,18 @@ def db_cursor(
     finally:
         cursor.close()
 # ============================================================
-# DATABASE SCHEMA
+# DATABASE SCHEMA AND LEGACY MIGRATIONS
 # ============================================================
 def init_db() -> None:
+    """Create current tables and upgrade databases created by earlier bot versions.
+
+    Important: indexes that depend on newer columns are created only after
+    ALTER TABLE migrations succeed. `CREATE TABLE IF NOT EXISTS` does not add
+    columns to a table that already exists.
+    """
     initialize_db_pool()
-    schema = """
+
+    base_schema = """
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
         username TEXT,
@@ -563,98 +570,63 @@ def init_db() -> None:
         update_id BIGINT PRIMARY KEY,
         processed_at BIGINT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS
-        idx_tracks_mood
-        ON tracks(mood);
-    CREATE INDEX IF NOT EXISTS
-        idx_tracks_ai_status
-        ON tracks(ai_status);
-    CREATE INDEX IF NOT EXISTS
-        idx_history_user_time
-        ON user_history(
-            user_id,
-            sent_at DESC,
-            id DESC
-        );
-    CREATE INDEX IF NOT EXISTS
-        idx_feedback_user
-        ON track_feedback(
-            user_id,
-            feedback
-        );
     """
-    with (
-        db_connection() as connection,
-        db_cursor(connection) as cursor
-    ):
-        cursor.execute(schema)
-        # Upgrade older installations.
-        alter_statements = [
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS artist TEXT
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS title TEXT
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS raw_text TEXT
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_status TEXT
-            NOT NULL DEFAULT 'pending'
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_mood TEXT
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_genres TEXT
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_energy INTEGER
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_valence INTEGER
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_profile TEXT
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_scanned_at BIGINT
-            """,
-            """
-            ALTER TABLE tracks
-            ADD COLUMN IF NOT EXISTS ai_error TEXT
-            """,
-        ]
-        for statement in alter_statements:
-            try:
-                cursor.execute(statement)
-            except Exception:
-                logger.exception(
-                    "Database upgrade statement failed"
-                )
+
+    migrations = [
+        # tracks columns from the AI-enabled release
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS artist TEXT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS title TEXT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS raw_text TEXT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_status TEXT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_mood TEXT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_genres TEXT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_energy INTEGER",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_valence INTEGER",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_profile TEXT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_scanned_at BIGINT",
+        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_error TEXT",
+        # Required by the newer Like/Unlike and history code.
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS track_id BIGINT",
+    ]
+
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood)",
+        "CREATE INDEX IF NOT EXISTS idx_tracks_ai_status ON tracks(ai_status)",
+        "CREATE INDEX IF NOT EXISTS idx_history_user_time ON user_history(user_id, sent_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_feedback_user ON track_feedback(user_id, feedback)",
+    ]
+
+    with db_connection() as connection, db_cursor(connection) as cursor:
+        # 1. Create missing tables. This is harmless on existing databases.
+        cursor.execute(base_schema)
+
+        # 2. Upgrade old tables before any SQL references the new columns.
+        for statement in migrations:
+            cursor.execute(statement)
+
+        # 3. Normalize an ai_status column that existed but allowed NULL.
         cursor.execute(
-            """
-            DELETE FROM processed_updates
-            WHERE processed_at < %s
-            """,
-            (
-                int(time.time()) - 604800,
-            ),
+            "UPDATE tracks SET ai_status='pending' WHERE ai_status IS NULL"
         )
-    logger.info(
-        "🟢 PostgreSQL database ready"
-    )
+        cursor.execute(
+            "ALTER TABLE tracks ALTER COLUMN ai_status SET DEFAULT 'pending'"
+        )
+        cursor.execute(
+            "ALTER TABLE tracks ALTER COLUMN ai_status SET NOT NULL"
+        )
+
+        # 4. Only now are dependent indexes safe to create.
+        for statement in indexes:
+            cursor.execute(statement)
+
+        cursor.execute(
+            "DELETE FROM processed_updates WHERE processed_at < %s",
+            (int(time.time()) - 604800,),
+        )
+
+    logger.info("PostgreSQL database ready; legacy migration completed")
+
+
 # ============================================================
 # UPDATE DEDUPLICATION
 # ============================================================
@@ -4033,4 +4005,4 @@ if __name__ == "__main__":
         port=port,
         threaded=True,
         use_reloader=False,
-)
+    )
