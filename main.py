@@ -35,29 +35,18 @@ app = Flask(__name__)
 
 logging.basicConfig(
     level=(os.getenv("LOG_LEVEL") or "INFO").upper(),
-    format=(
-        "%(asctime)s | %(levelname)s | "
-        "%(threadName)s | %(message)s"
-    ),
+    format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
 )
 
-logger = logging.getLogger(
-    "not_your_vibe_music_bot"
-)
+logger = logging.getLogger("not_your_vibe_music_bot")
 
 
 # ============================================================
 # ENV HELPERS
 # ============================================================
 
-def env_text(
-    name: str,
-    default: str = "",
-) -> str:
-
-    return (
-        os.getenv(name, default) or ""
-    ).strip()
+def env_text(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
 
 
 def env_int(
@@ -74,15 +63,12 @@ def env_int(
 
     try:
         value = int(raw)
-
     except ValueError:
-
         logger.warning(
             "Invalid %s. Using default %s",
             name,
             default,
         )
-
         return default
 
     if minimum <= value <= maximum:
@@ -119,17 +105,11 @@ def env_bool(
 # ENVIRONMENT
 # ============================================================
 
-BOT_TOKEN = env_text(
-    "BOT_TOKEN"
-)
+BOT_TOKEN = env_text("BOT_TOKEN")
 
-ADMIN_USER_ID = env_text(
-    "ADMIN_USER_ID"
-)
+ADMIN_USER_ID = env_text("ADMIN_USER_ID")
 
-DATABASE_URL = env_text(
-    "DATABASE_URL"
-)
+DATABASE_URL = env_text("DATABASE_URL")
 
 RENDER_EXTERNAL_URL = env_text(
     "RENDER_EXTERNAL_URL"
@@ -211,6 +191,20 @@ TRACK_CANDIDATE_LIMIT = env_int(
     1000,
 )
 
+RADIO_HISTORY_LIMIT = env_int(
+    "RADIO_HISTORY_LIMIT",
+    100,
+    10,
+    1000,
+)
+
+RADIO_CANDIDATE_LIMIT = env_int(
+    "RADIO_CANDIDATE_LIMIT",
+    150,
+    20,
+    1000,
+)
+
 AUTO_SCAN_INTERVAL = env_int(
     "AUTO_SCAN_INTERVAL",
     300,
@@ -239,32 +233,6 @@ DROP_PENDING_UPDATES = env_bool(
 
 
 # ============================================================
-# RADIO SETTINGS
-# ============================================================
-
-RADIO_HISTORY_LIMIT = env_int(
-    "RADIO_HISTORY_LIMIT",
-    100,
-    10,
-    1000,
-)
-
-RADIO_CANDIDATE_LIMIT = env_int(
-    "RADIO_CANDIDATE_LIMIT",
-    150,
-    20,
-    1000,
-)
-
-RADIO_MIN_LIKES_FOR_PERSONAL = env_int(
-    "RADIO_MIN_LIKES_FOR_PERSONAL",
-    3,
-    1,
-    100,
-)
-
-
-# ============================================================
 # MOODS
 # ============================================================
 
@@ -282,29 +250,21 @@ MOODS = (
 
 MOOD_NAMES = {
 
-    "sad":
-        "😢 SAD",
+    "sad": "😢 SAD",
 
-    "love":
-        "❤️ LOVE",
+    "love": "❤️ LOVE",
 
-    "chill":
-        "🌙 CHILL",
+    "chill": "🌙 CHILL",
 
-    "hype":
-        "🔥 HYPE",
+    "hype": "🔥 HYPE",
 
-    "dark":
-        "🖤 DARK",
+    "dark": "🖤 DARK",
 
-    "energetic":
-        "⚡ ENERGETIC",
+    "energetic": "⚡ ENERGETIC",
 
-    "night":
-        "🚗 NIGHT DRIVE",
+    "night": "🚗 NIGHT DRIVE",
 
-    "melodic":
-        "🌌 MELODIC",
+    "melodic": "🌌 MELODIC",
 }
 
 
@@ -337,7 +297,7 @@ MOOD_DESCRIPTIONS = {
 
 
 # ============================================================
-# CHANNELS
+# MOOD CHANNELS
 # ============================================================
 
 MOOD_CHANNELS = {
@@ -400,7 +360,7 @@ telethon_start_lock = threading.Lock()
 
 music_executor = ThreadPoolExecutor(
     max_workers=WORKER_COUNT,
-    thread_name_prefix="music-request",
+    thread_name_prefix="music-worker",
 )
 
 pending_music_users: set[int] = set()
@@ -570,12 +530,6 @@ def db_cursor(
 
 def init_db() -> None:
 
-    if not DATABASE_URL:
-
-        raise RuntimeError(
-            "DATABASE_URL missing"
-        )
-
     initialize_db_pool()
 
     schema = """
@@ -616,12 +570,6 @@ def init_db() -> None:
         artist TEXT,
 
         caption TEXT,
-
-        ai_tags TEXT,
-
-        ai_energy INTEGER,
-
-        ai_valence INTEGER,
 
         UNIQUE(channel_id, message_id)
 
@@ -707,15 +655,6 @@ def init_db() -> None:
 
 
     CREATE INDEX IF NOT EXISTS
-        idx_history_user_mood
-        ON user_history(
-            user_id,
-            mood,
-            sent_at DESC
-        );
-
-
-    CREATE INDEX IF NOT EXISTS
         idx_feedback_user
         ON track_feedback(
             user_id,
@@ -724,17 +663,11 @@ def init_db() -> None:
 
 
     CREATE INDEX IF NOT EXISTS
-        idx_feedback_track
+        idx_feedback_mood
         ON track_feedback(
-            channel_id,
-            message_id
-        );
-
-
-    CREATE INDEX IF NOT EXISTS
-        idx_processed_updates_time
-        ON processed_updates(
-            processed_at
+            user_id,
+            mood,
+            feedback
         );
 
     """
@@ -746,64 +679,41 @@ def init_db() -> None:
 
         cursor.execute(schema)
 
-        migration_columns = [
+        # Safe migration.
 
-            (
-                "tracks",
-                "title",
-                "TEXT",
-            ),
+        cursor.execute(
+            """
+            ALTER TABLE tracks
+            ADD COLUMN IF NOT EXISTS
+            title TEXT
+            """
+        )
 
-            (
-                "tracks",
-                "artist",
-                "TEXT",
-            ),
+        cursor.execute(
+            """
+            ALTER TABLE tracks
+            ADD COLUMN IF NOT EXISTS
+            artist TEXT
+            """
+        )
 
-            (
-                "tracks",
-                "caption",
-                "TEXT",
-            ),
+        cursor.execute(
+            """
+            ALTER TABLE tracks
+            ADD COLUMN IF NOT EXISTS
+            caption TEXT
+            """
+        )
 
-            (
-                "tracks",
-                "ai_tags",
-                "TEXT",
-            ),
-
-            (
-                "tracks",
-                "ai_energy",
-                "INTEGER",
-            ),
-
-            (
-                "tracks",
-                "ai_valence",
-                "INTEGER",
-            ),
-
-            (
-                "user_state",
-                "radio_active",
-                "BOOLEAN NOT NULL DEFAULT FALSE",
-            ),
-        ]
-
-        for (
-            table,
-            column,
-            data_type,
-        ) in migration_columns:
-
-            cursor.execute(
-                f"""
-                ALTER TABLE {table}
-                ADD COLUMN IF NOT EXISTS
-                {column} {data_type}
-                """
-            )
+        cursor.execute(
+            """
+            ALTER TABLE user_state
+            ADD COLUMN IF NOT EXISTS
+            radio_active BOOLEAN
+            NOT NULL
+            DEFAULT FALSE
+            """
+        )
 
         cursor.execute(
             """
@@ -848,9 +758,9 @@ def claim_update(
                     processed_at
                 )
 
-                VALUES (%s, %s)
+                VALUES(%s,%s)
 
-                ON CONFLICT (update_id)
+                ON CONFLICT(update_id)
                 DO NOTHING
 
                 RETURNING update_id
@@ -861,16 +771,12 @@ def claim_update(
                 ),
             )
 
-            return (
-                cursor.fetchone()
-                is not None
-            )
+            return cursor.fetchone() is not None
 
     except Exception:
 
         logger.exception(
-            "Could not deduplicate update %s",
-            update_id,
+            "Update deduplication failed"
         )
 
         return True
@@ -884,11 +790,7 @@ def register_user(
     user: Mapping[str, Any],
 ) -> None:
 
-    user_id = (
-        user.get("id")
-        if user
-        else None
-    )
+    user_id = user.get("id")
 
     if not isinstance(
         user_id,
@@ -922,6 +824,7 @@ def register_user(
                 )
 
                 ON CONFLICT(user_id)
+
                 DO UPDATE SET
 
                     username =
@@ -952,8 +855,7 @@ def register_user(
     except Exception:
 
         logger.exception(
-            "Could not register user %s",
-            user_id,
+            "Could not register user"
         )
 
 
@@ -1122,8 +1024,6 @@ def save_track(
                             EXCLUDED.caption,
                             tracks.caption
                         )
-
-                RETURNING id
                 """,
                 (
                     mood,
@@ -1136,21 +1036,7 @@ def save_track(
                 ),
             )
 
-            row = cursor.fetchone()
-
-            if row:
-
-                logger.info(
-                    (
-                        "🎵 TRACK READY | %s | "
-                        "channel=%s | message=%s"
-                    ),
-                    mood.upper(),
-                    channel_id,
-                    message_id,
-                )
-
-                return True
+        return True
 
     except Exception:
 
@@ -1158,12 +1044,8 @@ def save_track(
             "Could not save track"
         )
 
-    return False
+        return False
 
-
-# ============================================================
-# TRACK COUNTS
-# ============================================================
 
 def get_track_count(
     mood: str,
@@ -1247,7 +1129,7 @@ def get_track_counts() -> dict[str, int]:
 
 
 # ============================================================
-# USER MOOD
+# USER STATE
 # ============================================================
 
 def set_user_mood(
@@ -1282,6 +1164,7 @@ def set_user_mood(
                 )
 
                 ON CONFLICT(user_id)
+
                 DO UPDATE SET
 
                     mood =
@@ -1363,17 +1246,31 @@ def set_radio_state(
 
             cursor.execute(
                 """
-                UPDATE user_state
+                INSERT INTO user_state(
+                    user_id,
+                    mood,
+                    radio_active,
+                    updated_at
+                )
 
-                SET radio_active=%s,
-                    updated_at=%s
+                VALUES(
+                    %s,NULL,%s,%s
+                )
 
-                WHERE user_id=%s
+                ON CONFLICT(user_id)
+
+                DO UPDATE SET
+
+                    radio_active =
+                        EXCLUDED.radio_active,
+
+                    updated_at =
+                        EXCLUDED.updated_at
                 """,
                 (
+                    user_id,
                     active,
                     int(time.time()),
-                    user_id,
                 ),
             )
 
@@ -1417,7 +1314,7 @@ def is_radio_active(
 
 
 # ============================================================
-# USER HISTORY
+# HISTORY
 # ============================================================
 
 def add_history(
@@ -1589,17 +1486,6 @@ def save_feedback(
                 ),
             )
 
-        logger.info(
-            (
-                "💡 FEEDBACK | user=%s | "
-                "%s | %s/%s"
-            ),
-            user_id,
-            feedback.upper(),
-            channel_id,
-            message_id,
-        )
-
         return True
 
     except Exception:
@@ -1644,11 +1530,11 @@ def get_feedback_stats(
 
             for row in cursor.fetchall():
 
-                if row["feedback"] in result:
+                feedback = row["feedback"]
 
-                    result[
-                        row["feedback"]
-                    ] = int(
+                if feedback in result:
+
+                    result[feedback] = int(
                         row["count"]
                     )
 
@@ -1679,18 +1565,18 @@ def get_last_track_for_user(
             cursor.execute(
                 """
                 SELECT
-                    h.mood,
-                    h.channel_id,
-                    h.message_id,
-                    h.sent_at
+                    mood,
+                    channel_id,
+                    message_id,
+                    sent_at
 
-                FROM user_history h
+                FROM user_history
 
-                WHERE h.user_id=%s
+                WHERE user_id=%s
 
                 ORDER BY
-                    h.sent_at DESC,
-                    h.id DESC
+                    sent_at DESC,
+                    id DESC
 
                 LIMIT 1
                 """,
@@ -1715,7 +1601,7 @@ def get_last_track_for_user(
 
 
 # ============================================================
-# NORMAL TRACK RESERVATION
+# NORMAL TRACK
 # ============================================================
 
 def reserve_next_track(
@@ -1732,34 +1618,52 @@ def reserve_next_track(
 
     try:
 
-        with db_connection() as connection:
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
 
-            with db_cursor(connection) as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    message_id,
+                    channel_id
 
-                cursor.execute(
-                    """
-                    SELECT
-                        message_id,
-                        channel_id
+                FROM tracks
 
-                    FROM tracks
+                WHERE mood=%s
 
-                    WHERE mood=%s
+                ORDER BY RANDOM()
 
-                    ORDER BY RANDOM()
+                LIMIT %s
+                """,
+                (
+                    mood,
+                    TRACK_CANDIDATE_LIMIT,
+                ),
+            )
 
-                    LIMIT %s
-                    """,
-                    (
-                        mood,
-                        TRACK_CANDIDATE_LIMIT,
-                    ),
+            rows = cursor.fetchall()
+
+            if not rows:
+                return None
+
+            candidates = [
+
+                (
+                    int(row["message_id"]),
+                    str(row["channel_id"]),
                 )
 
-                rows = cursor.fetchall()
+                for row in rows
 
-                if not rows:
-                    return None
+                if (
+                    str(row["channel_id"]),
+                    int(row["message_id"]),
+                ) not in recent
+            ]
+
+            if not candidates:
 
                 candidates = [
 
@@ -1769,48 +1673,31 @@ def reserve_next_track(
                     )
 
                     for row in rows
-
-                    if (
-                        str(row["channel_id"]),
-                        int(row["message_id"]),
-                    ) not in recent
                 ]
 
-                if not candidates:
-
-                    candidates = [
-
-                        (
-                            int(row["message_id"]),
-                            str(row["channel_id"]),
-                        )
-
-                        for row in rows
-                    ]
-
-                return random.choice(
-                    candidates
-                )
+            return random.choice(
+                candidates
+            )
 
     except Exception:
 
         logger.exception(
-            "Could not reserve next track"
+            "Could not reserve normal track"
         )
 
         return None
 
 
 # ============================================================
-# PERSONAL RADIO
+# RADIO PREFERENCE
 # ============================================================
 
 def get_user_preference(
     user_id: int,
-) -> dict[str, int]:
+) -> dict[str, float]:
 
-    result = {
-        mood: 0
+    scores = {
+        mood: 0.0
         for mood in MOODS
     }
 
@@ -1821,11 +1708,13 @@ def get_user_preference(
             db_cursor(connection) as cursor
         ):
 
+            # Listening history gives a small signal.
+
             cursor.execute(
                 """
                 SELECT
                     mood,
-                    COUNT(*) AS score
+                    COUNT(*) AS count
 
                 FROM user_history
 
@@ -1840,24 +1729,26 @@ def get_user_preference(
 
                 mood = row["mood"]
 
-                if mood in result:
+                if mood in scores:
 
-                    result[mood] = int(
-                        row["score"]
+                    scores[mood] += (
+                        int(row["count"]) * 1.0
                     )
+
+            # Likes are strong positive signals.
 
             cursor.execute(
                 """
                 SELECT
                     mood,
-                    feedback,
                     COUNT(*) AS count
 
                 FROM track_feedback
 
                 WHERE user_id=%s
+                AND feedback='like'
 
-                GROUP BY mood, feedback
+                GROUP BY mood
                 """,
                 (user_id,),
             )
@@ -1866,37 +1757,52 @@ def get_user_preference(
 
                 mood = row["mood"]
 
-                if mood not in result:
-                    continue
+                if mood in scores:
 
-                count = int(
-                    row["count"]
-                )
-
-                if row["feedback"] == "like":
-
-                    result[mood] += (
-                        count * 5
+                    scores[mood] += (
+                        int(row["count"]) * 8.0
                     )
 
-                elif row["feedback"] == "skip":
+            # Skips are strong negative signals.
 
-                    result[mood] -= (
-                        count * 4
+            cursor.execute(
+                """
+                SELECT
+                    mood,
+                    COUNT(*) AS count
+
+                FROM track_feedback
+
+                WHERE user_id=%s
+                AND feedback='skip'
+
+                GROUP BY mood
+                """,
+                (user_id,),
+            )
+
+            for row in cursor.fetchall():
+
+                mood = row["mood"]
+
+                if mood in scores:
+
+                    scores[mood] -= (
+                        int(row["count"]) * 6.0
                     )
 
     except Exception:
 
         logger.exception(
-            "Could not calculate user preference"
+            "Could not calculate preferences"
         )
 
-    return result
+    return scores
 
 
 def get_liked_tracks(
     user_id: int,
-) -> list[tuple[str, int, str]]:
+) -> set[tuple[str, int]]:
 
     try:
 
@@ -1909,8 +1815,7 @@ def get_liked_tracks(
                 """
                 SELECT
                     channel_id,
-                    message_id,
-                    mood
+                    message_id
 
                 FROM track_feedback
 
@@ -1927,16 +1832,15 @@ def get_liked_tracks(
                 ),
             )
 
-            return [
+            return {
 
                 (
                     str(row["channel_id"]),
                     int(row["message_id"]),
-                    str(row["mood"]),
                 )
 
                 for row in cursor.fetchall()
-            ]
+            }
 
     except Exception:
 
@@ -1944,13 +1848,19 @@ def get_liked_tracks(
             "Could not read liked tracks"
         )
 
-        return []
+        return set()
 
+
+# ============================================================
+# PERSONAL RADIO
+# ============================================================
 
 def reserve_radio_track(
     user_id: int,
     preferred_mood: Optional[str],
-) -> Optional[tuple[int, str, str]]:
+) -> Optional[
+    tuple[int, str, str]
+]:
 
     recent = get_recent_history(
         user_id
@@ -1960,9 +1870,13 @@ def reserve_radio_track(
         user_id
     )
 
-    likes = get_liked_tracks(
+    liked_tracks = get_liked_tracks(
         user_id
     )
+
+    # --------------------------------------------------------
+    # Mood selection
+    # --------------------------------------------------------
 
     mood_scores = dict(
         preferences
@@ -1972,27 +1886,34 @@ def reserve_radio_track(
 
         mood_scores[
             preferred_mood
-        ] += 8
+        ] += 10
 
-    if not any(
-        value > 0
-        for value in mood_scores.values()
-    ):
+    has_learning_data = any(
+        score != 0
+        for score in mood_scores.values()
+    )
 
-        selected_mood = (
-            preferred_mood
-            if preferred_mood in MOODS
-            else random.choice(MOODS)
-        )
+    if not has_learning_data:
+
+        if preferred_mood in MOODS:
+
+            selected_mood = preferred_mood
+
+        else:
+
+            selected_mood = random.choice(
+                MOODS
+            )
 
     else:
 
-        positive = {
+        positive_scores = {
 
-            mood: max(
-                1,
-                score + 5,
-            )
+            mood:
+                max(
+                    1.0,
+                    score + 8.0
+                )
 
             for mood, score
             in mood_scores.items()
@@ -2001,15 +1922,19 @@ def reserve_radio_track(
         selected_mood = random.choices(
 
             list(
-                positive.keys()
+                positive_scores.keys()
             ),
 
             weights=list(
-                positive.values()
+                positive_scores.values()
             ),
 
             k=1,
         )[0]
+
+    # --------------------------------------------------------
+    # Candidate query
+    # --------------------------------------------------------
 
     try:
 
@@ -2041,6 +1966,8 @@ def reserve_radio_track(
 
             rows = cursor.fetchall()
 
+            # Fallback if selected mood is empty.
+
             if not rows:
 
                 cursor.execute(
@@ -2068,20 +1995,6 @@ def reserve_radio_track(
 
             scored = []
 
-            liked_set = {
-
-                (
-                    channel_id,
-                    message_id,
-                )
-
-                for (
-                    channel_id,
-                    message_id,
-                    _,
-                ) in likes
-            }
-
             for row in rows:
 
                 channel_id = str(
@@ -2103,16 +2016,29 @@ def reserve_radio_track(
 
                 score = random.uniform(
                     0,
-                    10,
+                    5,
                 )
+
+                # Avoid recent repeats.
 
                 if key in recent:
 
                     score -= 1000
 
+                # Never recommend a track
+                # that user already liked.
+
+                if key in liked_tracks:
+
+                    score -= 1000
+
+                # Preferred mood.
+
                 if mood == selected_mood:
 
                     score += 20
+
+                # User preference.
 
                 score += (
                     mood_scores.get(
@@ -2120,10 +2046,6 @@ def reserve_radio_track(
                         0,
                     ) * 2
                 )
-
-                if key in liked_set:
-
-                    score -= 1000
 
                 scored.append(
                     (
@@ -2139,12 +2061,13 @@ def reserve_radio_track(
                 reverse=True,
             )
 
-            top = scored[
-                :min(10, len(scored))
-            ]
+            top_count = min(
+                10,
+                len(scored),
+            )
 
             chosen = random.choice(
-                top
+                scored[:top_count]
             )
 
             return (
@@ -2163,7 +2086,7 @@ def reserve_radio_track(
 
 
 # ============================================================
-# FAILED HISTORY CLEANUP
+# HISTORY CLEANUP
 # ============================================================
 
 def remove_latest_history(
@@ -2361,18 +2284,23 @@ def answer_callback(
             "ok": False
         }
 
+    payload: dict[str, Any] = {
+
+        "callback_query_id":
+            callback_id,
+
+    }
+
+    # Only show a small Telegram toast.
+    # No new chat message.
+
+    if text:
+
+        payload["text"] = text
+
     return telegram(
-
         "answerCallbackQuery",
-
-        {
-            "callback_query_id":
-                callback_id,
-
-            "text":
-                text,
-        },
-
+        payload,
         timeout=8,
     )
 
@@ -2403,8 +2331,90 @@ def copy_music(
 
 
 # ============================================================
-# MOOD MENU
+# START MENU
 # ============================================================
+
+def start_menu() -> dict[str, Any]:
+
+    return {
+
+        "inline_keyboard": [
+
+            [
+                {
+                    "text":
+                        "😢 SAD",
+                    "callback_data":
+                        "mood_sad",
+                },
+
+                {
+                    "text":
+                        "❤️ LOVE",
+                    "callback_data":
+                        "mood_love",
+                },
+            ],
+
+            [
+                {
+                    "text":
+                        "🌙 CHILL",
+                    "callback_data":
+                        "mood_chill",
+                },
+
+                {
+                    "text":
+                        "🔥 HYPE",
+                    "callback_data":
+                        "mood_hype",
+                },
+            ],
+
+            [
+                {
+                    "text":
+                        "🖤 DARK",
+                    "callback_data":
+                        "mood_dark",
+                },
+
+                {
+                    "text":
+                        "⚡ ENERGETIC",
+                    "callback_data":
+                        "mood_energetic",
+                },
+            ],
+
+            [
+                {
+                    "text":
+                        "🚗 NIGHT DRIVE",
+                    "callback_data":
+                        "mood_night",
+                },
+
+                {
+                    "text":
+                        "🌌 MELODIC",
+                    "callback_data":
+                        "mood_melodic",
+                },
+            ],
+
+            [
+                {
+                    "text":
+                        "📻 PERSONAL RADIO",
+                    "callback_data":
+                        "start_radio",
+                },
+            ],
+        ]
+    }
+
 
 def mood_menu() -> dict[str, Any]:
 
@@ -2415,16 +2425,14 @@ def mood_menu() -> dict[str, Any]:
             [
                 {
                     "text":
-                        "😢  SAD",
-
+                        "😢 SAD",
                     "callback_data":
                         "mood_sad",
                 },
 
                 {
                     "text":
-                        "❤️  LOVE",
-
+                        "❤️ LOVE",
                     "callback_data":
                         "mood_love",
                 },
@@ -2433,16 +2441,14 @@ def mood_menu() -> dict[str, Any]:
             [
                 {
                     "text":
-                        "🌙  CHILL",
-
+                        "🌙 CHILL",
                     "callback_data":
                         "mood_chill",
                 },
 
                 {
                     "text":
-                        "🔥  HYPE",
-
+                        "🔥 HYPE",
                     "callback_data":
                         "mood_hype",
                 },
@@ -2451,16 +2457,14 @@ def mood_menu() -> dict[str, Any]:
             [
                 {
                     "text":
-                        "🖤  DARK",
-
+                        "🖤 DARK",
                     "callback_data":
                         "mood_dark",
                 },
 
                 {
                     "text":
-                        "⚡  ENERGETIC",
-
+                        "⚡ ENERGETIC",
                     "callback_data":
                         "mood_energetic",
                 },
@@ -2469,21 +2473,27 @@ def mood_menu() -> dict[str, Any]:
             [
                 {
                     "text":
-                        "🚗  NIGHT DRIVE",
-
+                        "🚗 NIGHT DRIVE",
                     "callback_data":
                         "mood_night",
                 },
 
                 {
                     "text":
-                        "🌌  MELODIC",
-
+                        "🌌 MELODIC",
                     "callback_data":
                         "mood_melodic",
                 },
             ],
 
+            [
+                {
+                    "text":
+                        "📻 PERSONAL RADIO",
+                    "callback_data":
+                        "start_radio",
+                },
+            ],
         ]
     }
 
@@ -2496,14 +2506,6 @@ def music_buttons(
     radio: bool = False,
 ) -> dict[str, Any]:
 
-    # ❤️ and 😴 are intentionally emoji-only.
-    #
-    # IMPORTANT:
-    # Clicking them DOES NOT send another
-    # Telegram chat message.
-    #
-    # Feedback is saved silently in PostgreSQL.
-
     if radio:
 
         return {
@@ -2514,7 +2516,6 @@ def music_buttons(
                     {
                         "text":
                             "❤️",
-
                         "callback_data":
                             "like_track",
                     },
@@ -2522,7 +2523,6 @@ def music_buttons(
                     {
                         "text":
                             "😴",
-
                         "callback_data":
                             "skip_track",
                     },
@@ -2531,16 +2531,14 @@ def music_buttons(
                 [
                     {
                         "text":
-                            "⏭  NEXT",
-
+                            "⏭ NEXT",
                         "callback_data":
                             "radio_next",
                     },
 
                     {
                         "text":
-                            "⏹  STOP RADIO",
-
+                            "⏹ STOP",
                         "callback_data":
                             "stop_radio",
                     },
@@ -2549,8 +2547,7 @@ def music_buttons(
                 [
                     {
                         "text":
-                            "🎛  CHANGE MOOD",
-
+                            "🎛 CHANGE MOOD",
                         "callback_data":
                             "change_mood",
                     },
@@ -2566,7 +2563,6 @@ def music_buttons(
                 {
                     "text":
                         "❤️",
-
                     "callback_data":
                         "like_track",
                 },
@@ -2574,7 +2570,6 @@ def music_buttons(
                 {
                     "text":
                         "😴",
-
                     "callback_data":
                         "skip_track",
                 },
@@ -2583,16 +2578,14 @@ def music_buttons(
             [
                 {
                     "text":
-                        "⏭  NEXT",
-
-                    "callback_data":
-                        "next_music",
+                        "⏭ NEXT",
+                        "callback_data":
+                            "next_music",
                 },
 
                 {
                     "text":
-                        "📻  RADIO",
-
+                        "📻 RADIO",
                     "callback_data":
                         "start_radio",
                 },
@@ -2601,8 +2594,7 @@ def music_buttons(
             [
                 {
                     "text":
-                        "🎛  CHANGE MOOD",
-
+                        "🎛 CHANGE MOOD",
                     "callback_data":
                         "change_mood",
                 },
@@ -2612,7 +2604,7 @@ def music_buttons(
 
 
 # ============================================================
-# SEND TRACK
+# DELIVER TRACK
 # ============================================================
 
 def deliver_track(
@@ -2643,46 +2635,39 @@ def deliver_track(
 
         return False
 
-    add_history(
+    if not add_history(
         user_id,
         mood,
         channel_id,
         message_id,
-    )
+    ):
+
+        return False
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # No Like / Not for me text here.
+    # Only send a clean control message.
+    # --------------------------------------------------------
 
     if radio:
 
-        header = (
-            "📻 PERSONAL RADIO"
-        )
-
-        description = (
-            "Your radio is learning "
-            "your taste."
+        text = (
+            "📻 PERSONAL RADIO\n"
+            "━━━━━━━━━━━━━━━━━━"
         )
 
     else:
 
-        header = (
-            MOOD_NAMES[mood]
-        )
-
-        description = (
-            MOOD_DESCRIPTIONS[mood]
+        text = (
+            f"{MOOD_NAMES[mood]}\n"
+            "━━━━━━━━━━━━━━━━━━"
         )
 
     send_message(
-
         chat_id,
-
-        (
-            f"{header}\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"{description}\n\n"
-            "❤️  = Like\n"
-            "😴  = Not for me"
-        ),
-
+        text,
         music_buttons(
             radio=radio
         ),
@@ -2692,7 +2677,7 @@ def deliver_track(
 
 
 # ============================================================
-# SEND NEXT
+# NORMAL NEXT
 # ============================================================
 
 def send_next(
@@ -2707,20 +2692,22 @@ def send_next(
     if not mood:
 
         send_message(
+
             chat_id,
+
             (
-                "🎧 Choose a mood first."
+                "🎧 Choose a mood first\n"
+                "or start Personal Radio."
             ),
-            mood_menu(),
+
+            start_menu(),
         )
 
         return
 
-    count = get_track_count(
+    if get_track_count(
         mood
-    )
-
-    if count <= 0:
+    ) <= 0:
 
         send_message(
 
@@ -2757,10 +2744,15 @@ def send_next(
     delivered = deliver_track(
 
         chat_id,
+
         user_id,
+
         message_id,
+
         channel_id,
+
         mood,
+
         False,
     )
 
@@ -2780,125 +2772,6 @@ def send_next(
 
 
 # ============================================================
-# MOOD SELECTED
-#
-# THIS IS THE IMPORTANT PART
-#
-# User selects a mood.
-# Mood is saved.
-# Then a track is IMMEDIATELY sent.
-#
-# User does NOT need to press NEXT.
-# ============================================================
-
-def select_mood_and_send(
-    chat_id: int,
-    user_id: int,
-    mood: str,
-) -> None:
-
-    if mood not in MOODS:
-
-        send_message(
-            chat_id,
-            "⚠️ Invalid mood.",
-            mood_menu(),
-        )
-
-        return
-
-    if not set_user_mood(
-        user_id,
-        mood,
-    ):
-
-        send_message(
-            chat_id,
-            "⚠️ Could not save your mood.",
-            mood_menu(),
-        )
-
-        return
-
-    count = get_track_count(
-        mood
-    )
-
-    if count <= 0:
-
-        send_message(
-
-            chat_id,
-
-            (
-                f"{MOOD_NAMES[mood]}\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                f"{MOOD_DESCRIPTIONS[mood]}\n\n"
-                "⚠️ No tracks are available "
-                "for this mood yet."
-            ),
-
-            mood_menu(),
-        )
-
-        return
-
-    reserved = reserve_next_track(
-        user_id,
-        mood,
-    )
-
-    if not reserved:
-
-        send_message(
-
-            chat_id,
-
-            (
-                f"{MOOD_NAMES[mood]}\n\n"
-                "⚠️ I couldn't find a track "
-                "right now."
-            ),
-
-            mood_menu(),
-        )
-
-        return
-
-    message_id, channel_id = reserved
-
-    delivered = deliver_track(
-
-        chat_id,
-        user_id,
-        message_id,
-        channel_id,
-        mood,
-        False,
-    )
-
-    if not delivered:
-
-        remove_latest_history(
-            user_id,
-            channel_id,
-            message_id,
-        )
-
-        send_message(
-
-            chat_id,
-
-            (
-                "⚠️ This track is "
-                "temporarily unavailable."
-            ),
-
-            music_buttons(),
-        )
-
-
-# ============================================================
 # START RADIO
 # ============================================================
 
@@ -2906,6 +2779,15 @@ def start_radio(
     chat_id: int,
     user_id: int,
 ) -> None:
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Mood is NOT required.
+    #
+    # If user has a mood, Radio uses it.
+    # If not, Radio learns / chooses automatically.
+    # --------------------------------------------------------
 
     mood = get_user_mood(
         user_id
@@ -2933,13 +2815,13 @@ def start_radio(
             chat_id,
 
             (
-                "📻 RADIO\n"
+                "📻 PERSONAL RADIO\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                "I don't have enough tracks "
-                "to build your radio yet."
+                "I need some tracks in the "
+                "database before Radio can start."
             ),
 
-            mood_menu(),
+            start_menu(),
         )
 
         return
@@ -2953,10 +2835,15 @@ def start_radio(
     delivered = deliver_track(
 
         chat_id,
+
         user_id,
+
         message_id,
+
         channel_id,
+
         selected_mood,
+
         True,
     )
 
@@ -3008,10 +2895,7 @@ def radio_next(
 
         send_message(
             chat_id,
-            (
-                "📻 Radio needs more tracks "
-                "to continue."
-            ),
+            "📻 Radio needs more tracks to continue.",
             music_buttons(True),
         )
 
@@ -3026,10 +2910,15 @@ def radio_next(
     delivered = deliver_track(
 
         chat_id,
+
         user_id,
+
         message_id,
+
         channel_id,
+
         selected_mood,
+
         True,
     )
 
@@ -3039,12 +2928,6 @@ def radio_next(
             user_id,
             channel_id,
             message_id,
-        )
-
-        send_message(
-            chat_id,
-            "⚠️ Radio skipped an unavailable track.",
-            music_buttons(True),
         )
 
 
@@ -3069,22 +2952,15 @@ def stop_radio(
         (
             "⏹ RADIO STOPPED\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            "Your listening history is saved.\n"
-            "Come back anytime for a smarter radio."
+            "Your listening history is saved."
         ),
 
-        music_buttons(),
+        start_menu(),
     )
 
 
 # ============================================================
-# SILENT FEEDBACK
-#
-# IMPORTANT:
-#
-# ❤️ / 😴 DOES NOT SEND A NEW MESSAGE.
-#
-# It only writes the feedback into PostgreSQL.
+# FEEDBACK
 # ============================================================
 
 def feedback_current_track(
@@ -3097,12 +2973,6 @@ def feedback_current_track(
     )
 
     if not current:
-
-        logger.info(
-            "No current track for feedback. user=%s",
-            user_id,
-        )
-
         return False
 
     return save_feedback(
@@ -3197,9 +3067,13 @@ def schedule_music(
     try:
 
         music_executor.submit(
+
             music_worker,
+
             chat_id,
+
             user_id,
+
             action,
         )
 
@@ -3225,6 +3099,7 @@ def schedule_music(
 # ============================================================
 
 AUDIO_EXTENSIONS = (
+
     ".mp3",
     ".m4a",
     ".flac",
@@ -3235,6 +3110,7 @@ AUDIO_EXTENSIONS = (
     ".mp4",
     ".mkv",
     ".webm",
+
 )
 
 
@@ -3417,11 +3293,17 @@ def process_channel_message(
     )
 
     return save_track(
+
         mood,
+
         channel_id,
+
         message_id,
+
         title,
+
         artist,
+
         caption,
     )
 
@@ -3444,11 +3326,9 @@ async def scan_one_channel(
 
     try:
 
-        lookup: Any
-
         if channel_value.lstrip("-").isdigit():
 
-            lookup = int(
+            lookup: Any = int(
                 channel_value
             )
 
@@ -3489,7 +3369,7 @@ async def scan_one_channel(
         logger.info(
             (
                 "🔎 %s scan completed | "
-                "new/updated=%s"
+                "processed=%s"
             ),
             mood.upper(),
             found,
@@ -3508,7 +3388,7 @@ async def scan_one_channel(
 
 
 # ============================================================
-# FULL CHANNEL SCAN
+# FULL SCAN
 # ============================================================
 
 async def scan_all_channels() -> None:
@@ -3611,7 +3491,7 @@ def register_telethon_events(
             if not message_id:
                 return
 
-            inserted = save_track(
+            if save_track(
 
                 mood,
 
@@ -3624,14 +3504,13 @@ def register_telethon_events(
                 artist,
 
                 caption,
-            )
 
-            if inserted:
+            ):
 
                 logger.info(
                     (
-                        "🚀 REAL-TIME NEW TRACK | "
-                        "%s | %s"
+                        "🚀 NEW TRACK | "
+                        "%s | message=%s"
                     ),
                     mood.upper(),
                     message_id,
@@ -3776,7 +3655,7 @@ def telethon_worker() -> None:
                 )
 
                 logger.info(
-                    "👀 Real-time channel watcher ACTIVE"
+                    "👀 Channel watcher ACTIVE"
                 )
 
                 await (
@@ -3799,9 +3678,11 @@ def telethon_worker() -> None:
                     scanner_task.cancel()
 
                     try:
+
                         await scanner_task
 
-                    except Exception:
+                    except BaseException:
+
                         pass
 
                 try:
@@ -3814,6 +3695,7 @@ def telethon_worker() -> None:
                         )
 
                 except Exception:
+
                     pass
 
             logger.warning(
@@ -3919,10 +3801,7 @@ def send_stats(
 
         "",
 
-        (
-            f"👥 Users: "
-            f"{get_users_count()}"
-        ),
+        f"👥 Users: {get_users_count()}",
 
         f"🎵 Tracks: {total}",
 
@@ -3940,13 +3819,16 @@ def send_stats(
 
     lines.extend(
         [
+
             "",
+
             (
                 "🟢 PostgreSQL: ONLINE"
                 if db_pool
                 else
                 "🔴 PostgreSQL: OFFLINE"
             ),
+
             (
                 "🟢 Telethon: CONNECTED"
                 if telethon_ready.is_set()
@@ -3978,10 +3860,9 @@ def send_user_feedback_stats(
         (
             "🎧 YOUR TASTE\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"❤️ Liked: {stats['like']}\n"
-            f"😴 Not for me: {stats['skip']}\n\n"
-            "Your Radio uses these signals "
-            "to improve recommendations."
+            f"❤️ {stats['like']}\n"
+            f"😴 {stats['skip']}\n\n"
+            "Radio learns from your choices."
         ),
     )
 
@@ -4006,7 +3887,7 @@ def extract_command(
 
 
 # ============================================================
-# CALLBACK
+# CALLBACK HANDLER
 # ============================================================
 
 def handle_callback(
@@ -4055,13 +3936,8 @@ def handle_callback(
         user
     )
 
-
     # ========================================================
     # MOOD
-    #
-    # IMPORTANT:
-    #
-    # Selecting a mood immediately sends a song.
     # ========================================================
 
     if data.startswith(
@@ -4074,35 +3950,54 @@ def handle_callback(
 
             answer_callback(
                 callback_id,
-                "Invalid mood.",
+                "Invalid mood",
             )
 
             return
 
-        # Small Telegram popup only.
+        if not set_user_mood(
+            user_id,
+            mood,
+        ):
+
+            answer_callback(
+                callback_id,
+                "Please try again",
+            )
+
+            return
+
         answer_callback(
             callback_id,
             MOOD_NAMES[mood],
         )
 
-        # IMPORTANT:
-        # Mood selection directly delivers music.
-        select_mood_and_send(
+        send_message(
+
             chat_id,
-            user_id,
-            mood,
+
+            (
+                f"{MOOD_NAMES[mood]}\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Ready. Choose your next track."
+            ),
+
+            music_buttons(),
         )
 
         return
 
-
     # ========================================================
     # LIKE
-    #
-    # NO NEW MESSAGE
     # ========================================================
 
     if data == "like_track":
+
+        # IMPORTANT:
+        # Do NOT send a new chat message.
+        #
+        # Only save feedback and show
+        # a tiny Telegram callback toast.
 
         saved = feedback_current_track(
             user_id,
@@ -4111,7 +4006,6 @@ def handle_callback(
 
         if saved:
 
-            # Telegram popup only.
             answer_callback(
                 callback_id,
                 "❤️",
@@ -4121,19 +4015,19 @@ def handle_callback(
 
             answer_callback(
                 callback_id,
-                "No track",
+                "⚠️",
             )
 
         return
 
-
     # ========================================================
     # NOT FOR ME
-    #
-    # NO NEW MESSAGE
     # ========================================================
 
     if data == "skip_track":
+
+        # IMPORTANT:
+        # Do NOT send a new chat message.
 
         saved = feedback_current_track(
             user_id,
@@ -4142,7 +4036,6 @@ def handle_callback(
 
         if saved:
 
-            # Telegram popup only.
             answer_callback(
                 callback_id,
                 "😴",
@@ -4152,14 +4045,13 @@ def handle_callback(
 
             answer_callback(
                 callback_id,
-                "No track",
+                "⚠️",
             )
 
         return
 
-
     # ========================================================
-    # NEXT
+    # NORMAL NEXT
     # ========================================================
 
     if data == "next_music":
@@ -4181,7 +4073,6 @@ def handle_callback(
             )
 
         return
-
 
     # ========================================================
     # START RADIO
@@ -4207,7 +4098,6 @@ def handle_callback(
 
         return
 
-
     # ========================================================
     # RADIO NEXT
     # ========================================================
@@ -4232,7 +4122,6 @@ def handle_callback(
 
         return
 
-
     # ========================================================
     # STOP RADIO
     # ========================================================
@@ -4250,7 +4139,6 @@ def handle_callback(
         )
 
         return
-
 
     # ========================================================
     # CHANGE MOOD
@@ -4270,14 +4158,13 @@ def handle_callback(
             (
                 "🎛 MOOD SELECTOR\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                "What are you feeling right now?"
+                "What are you feeling?"
             ),
 
             mood_menu(),
         )
 
         return
-
 
     answer_callback(
         callback_id
@@ -4329,7 +4216,6 @@ def handle_message(
         text
     )
 
-
     # ========================================================
     # START
     # ========================================================
@@ -4344,18 +4230,14 @@ def handle_message(
                 "🎧 NOT YOUR VIBE\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
                 "Your personal music space.\n\n"
-                "Pick a mood and I'll send "
-                "a track that fits your moment.\n\n"
-                "❤️ = Like\n"
-                "😴 = Not for me\n"
-                "📻 = Personal Radio"
+                "Choose a mood or start "
+                "Personal Radio immediately."
             ),
 
-            mood_menu(),
+            start_menu(),
         )
 
         return
-
 
     # ========================================================
     # MOOD
@@ -4370,14 +4252,13 @@ def handle_message(
             (
                 "🎛 MOOD SELECTOR\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                "What are you feeling right now?"
+                "What are you feeling?"
             ),
 
             mood_menu(),
         )
 
         return
-
 
     # ========================================================
     # NEXT
@@ -4404,7 +4285,6 @@ def handle_message(
 
         return
 
-
     # ========================================================
     # RADIO
     # ========================================================
@@ -4425,14 +4305,13 @@ def handle_message(
 
             send_message(
                 chat_id,
-                "⏳ Your Radio is already loading.",
+                "⏳ Radio is already loading.",
             )
 
         return
 
-
     # ========================================================
-    # STOP RADIO
+    # STOP
     # ========================================================
 
     if command == "/stop":
@@ -4449,9 +4328,8 @@ def handle_message(
 
         return
 
-
     # ========================================================
-    # MY TASTE
+    # TASTE
     # ========================================================
 
     if command in {
@@ -4470,7 +4348,6 @@ def handle_message(
             )
 
         return
-
 
     # ========================================================
     # USERS
@@ -4503,7 +4380,6 @@ def handle_message(
 
         return
 
-
     # ========================================================
     # STATS
     # ========================================================
@@ -4521,7 +4397,6 @@ def handle_message(
             )
 
         return
-
 
     # ========================================================
     # TELEGRAM STATUS
@@ -4570,7 +4445,6 @@ def handle_message(
 
         return
 
-
     # ========================================================
     # HELP
     # ========================================================
@@ -4589,7 +4463,7 @@ def handle_message(
                 "/next → Next track\n"
                 "/radio → Personal Radio\n"
                 "/stop → Stop Radio\n"
-                "/taste → Your taste profile\n"
+                "/taste → Your taste\n"
                 "/users → User count (Admin)\n"
                 "/stats → Bot statistics (Admin)\n"
                 "/telegram → Telegram status (Admin)"
@@ -4600,7 +4474,7 @@ def handle_message(
 
 
 # ============================================================
-# UPDATE
+# UPDATE HANDLER
 # ============================================================
 
 def handle_update(
@@ -4738,7 +4612,7 @@ def webhook():
 
 
 # ============================================================
-# WEBHOOK
+# WEBHOOK SETUP
 # ============================================================
 
 def setup_webhook() -> None:
@@ -4751,7 +4625,7 @@ def setup_webhook() -> None:
         logger.warning(
             (
                 "Webhook not configured: "
-                "BOT_TOKEN or RENDER_EXTERNAL_URL missing"
+                "BOT_TOKEN or Render URL missing"
             )
         )
 
@@ -4824,6 +4698,22 @@ def startup() -> bool:
     logger.info(
         "=========================================="
     )
+
+    if not BOT_TOKEN:
+
+        logger.error(
+            "❌ BOT_TOKEN is missing"
+        )
+
+        return False
+
+    if not DATABASE_URL:
+
+        logger.error(
+            "❌ DATABASE_URL is missing"
+        )
+
+        return False
 
     try:
 
