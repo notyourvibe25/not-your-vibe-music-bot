@@ -1,5 +1,5 @@
-Flask
-requests
-psycopg2-binary
-Telethon
+Flask>=2.3,<4
+requests>=2.31,<3
+Telethon>=1.44,<2
+psycopg2-binary>=2.9,<3
 gunicorn
