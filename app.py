@@ -167,9 +167,23 @@ TRACK_CANDIDATE_LIMIT = env_int(
 )
 AUTO_SCAN_INTERVAL = env_int(
     "AUTO_SCAN_INTERVAL",
+    1800,
     300,
-    60,
-    3600,
+    21600,
+)
+# The initial scan reads all history (0 = no limit). Periodic scan only checks
+# recent messages because the real-time Telethon watcher handles new uploads.
+INITIAL_SCAN_LIMIT = env_int(
+    "INITIAL_SCAN_LIMIT",
+    0,
+    0,
+    100000,
+)
+PERIODIC_SCAN_LIMIT = env_int(
+    "PERIODIC_SCAN_LIMIT",
+    200,
+    20,
+    10000,
 )
 AI_BATCH_SIZE = env_int(
     "AI_BATCH_SIZE",
@@ -252,7 +266,7 @@ MOOD_CHANNELS = {
     ),
     "hype": env_text(
         "HYPE_CHANNEL",
-        "",
+        "-1004427220481",
     ),
     "dark": env_text(
         "DARK_CHANNEL",
@@ -310,6 +324,84 @@ pending_users_lock = threading.Lock()
 http_local = threading.local()
 CHANNEL_MOOD_MAP: dict[str, str] = {}
 CHANNEL_ENTITY_MAP: dict[str, Any] = {}
+
+telethon_status_lock = threading.Lock()
+telethon_status: dict[str, Any] = {
+    "state": "STARTING",
+    "detail": "Worker has not connected yet.",
+    "updated_at": int(time.time()),
+}
+channel_scan_status: dict[str, dict[str, Any]] = {
+    mood: {
+        "configured": bool(MOOD_CHANNELS.get(mood)),
+        "state": "WAITING",
+        "checked": 0,
+        "saved": 0,
+        "last_scan": 0,
+        "error": "",
+    }
+    for mood in MOODS
+}
+
+
+def set_telethon_status(state: str, detail: str = "") -> None:
+    with telethon_status_lock:
+        telethon_status["state"] = state
+        telethon_status["detail"] = detail
+        telethon_status["updated_at"] = int(time.time())
+
+
+def set_channel_scan_status(
+    mood: str,
+    state: str,
+    checked: int = 0,
+    saved: int = 0,
+    error: str = "",
+) -> None:
+    if mood not in channel_scan_status:
+        return
+    channel_scan_status[mood].update(
+        {
+            "configured": bool(MOOD_CHANNELS.get(mood)),
+            "state": state,
+            "checked": checked,
+            "saved": saved,
+            "last_scan": int(time.time()),
+            "error": error[:300],
+        }
+    )
+
+
+def telethon_status_text() -> str:
+    with telethon_status_lock:
+        state = str(telethon_status["state"])
+        detail = str(telethon_status["detail"])
+
+    configured = sum(
+        1 for mood in MOODS if MOOD_CHANNELS.get(mood)
+    )
+    lines = [
+        "📡  TELEGRAM CHANNEL SCANNER",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Telethon: {state}",
+        f"Channels configured: {configured}/8",
+        f"Detail: {detail or '-'}",
+        "",
+        "SCAN STATUS",
+    ]
+    for mood in MOODS:
+        info = channel_scan_status[mood]
+        if not info["configured"]:
+            lines.append(f"{MOOD_NAMES[mood]} → MISSING CONFIG")
+        elif info["state"] == "FAILED":
+            lines.append(f"{MOOD_NAMES[mood]} → FAILED")
+        else:
+            lines.append(
+                f"{MOOD_NAMES[mood]} → {info['state']} | "
+                f"checked={info['checked']} | saved={info['saved']}"
+            )
+    return "\n".join(lines)
 # ============================================================
 # DATABASE
 # ============================================================
@@ -1512,10 +1604,7 @@ def get_pending_ai_tracks(
                 """
                 SELECT *
                 FROM tracks
-                WHERE ai_status IN(
-                    'pending',
-                    'failed'
-                )
+                WHERE ai_status='pending'
                 ORDER BY id ASC
                 LIMIT %s
                 """,
@@ -1619,110 +1708,95 @@ def save_telethon_message(
 async def scan_one_channel(
     mood: str,
     channel_value: str,
+    limit: Optional[int] = None,
 ) -> int:
-    if (
-        not channel_value
-        or telethon_client is None
-    ):
+    """Resolve one configured channel and save its music messages.
+
+    `limit=None` scans full history. A numeric limit is used only for the
+    periodic backup scan; real-time events capture newly posted tracks.
+    """
+    if mood not in MOODS:
         return 0
+    if not channel_value:
+        set_channel_scan_status(mood, "MISSING")
+        logger.error("%s channel is missing from Render Environment", mood.upper())
+        return 0
+    if telethon_client is None or not telethon_ready.is_set():
+        set_channel_scan_status(mood, "WAITING", error="Telethon is not connected")
+        return 0
+
+    checked = 0
+    saved = 0
+    set_channel_scan_status(mood, "SCANNING")
     try:
-        lookup: Any
         raw = channel_value.strip()
         if raw.startswith("@"):
-            lookup = raw
+            lookup: Any = raw
         elif raw.lstrip("-").isdigit():
             lookup = int(raw)
         else:
             lookup = raw
-        entity = await (
-            telethon_client.get_entity(
-                lookup
-            )
-        )
-        normalized = normalize_channel_id(
-            entity
-        )
-        if normalized:
-            CHANNEL_MOOD_MAP[
-                normalized
-            ] = mood
-            CHANNEL_ENTITY_MAP[
-                normalized
-            ] = entity
-        found = 0
+
+        entity = await telethon_client.get_entity(lookup)
+        normalized = normalize_channel_id(entity)
+        if not normalized:
+            raise ValueError("Could not determine the resolved channel ID")
+
+        # Store both the configured reference and the resolved numeric ID so
+        # the real-time watcher works for usernames and numeric channel IDs.
+        CHANNEL_MOOD_MAP[normalized] = mood
+        CHANNEL_ENTITY_MAP[normalized] = entity
+
         logger.info(
-            "🔎 Scanning %s channel...",
-            mood.upper(),
+            "Scanning %s | config=%s | resolved=%s | limit=%s",
+            mood.upper(), raw, normalized, "all" if limit is None else limit,
         )
-        async for message in (
-            telethon_client.iter_messages(
-                entity
-            )
-        ):
+        async for message in telethon_client.iter_messages(entity, limit=limit):
+            checked += 1
             try:
-                if save_telethon_message(
-                    mood,
-                    entity,
-                    message,
-                ):
-                    found += 1
+                if save_telethon_message(mood, entity, message):
+                    saved += 1
             except Exception:
-                logger.exception(
-                    "Message save failed"
-                )
-        logger.info(
-            (
-                "🔎 %s scan completed | "
-                "new/updated=%s"
-            ),
-            mood.upper(),
-            found,
-        )
-        return found
-    except Exception:
-        logger.exception(
-            "%s channel scan failed",
-            mood.upper(),
-        )
-        return 0
+                logger.exception("Could not save one %s message", mood.upper())
+
+        set_channel_scan_status(mood, "DONE", checked=checked, saved=saved)
+        logger.info("%s scan done | checked=%s | saved=%s", mood.upper(), checked, saved)
+        return saved
+    except Exception as exc:
+        set_channel_scan_status(mood, "FAILED", checked=checked, saved=saved, error=repr(exc))
+        logger.exception("%s channel scan failed | value=%r", mood.upper(), channel_value)
+        return saved
+
+
 # ============================================================
 # SCAN ALL CHANNELS
 # ============================================================
-async def scan_all_channels() -> None:
+async def scan_all_channels(
+    limit: Optional[int] = None,
+    reason: str = "initial",
+) -> dict[str, int]:
     rebuild_channel_map()
-    logger.info(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    logger.info(
-        "🔎 FULL CHANNEL SCAN STARTED"
-    )
-    logger.info(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
+    configured = [mood for mood in MOODS if MOOD_CHANNELS.get(mood)]
+    missing = [mood for mood in MOODS if not MOOD_CHANNELS.get(mood)]
+
+    logger.info("FULL CHANNEL SCAN | reason=%s | configured=%s/8", reason, len(configured))
+    if missing:
+        logger.error("Missing mood-channel variables: %s", ", ".join(missing))
+        for mood in missing:
+            set_channel_scan_status(mood, "MISSING")
+
+    results: dict[str, int] = {mood: 0 for mood in MOODS}
     for mood in MOODS:
-        channel = MOOD_CHANNELS.get(
-            mood,
-            "",
-        )
+        channel = MOOD_CHANNELS.get(mood, "")
         if not channel:
-            logger.warning(
-                "%s channel not configured",
-                mood.upper(),
-            )
             continue
-        await scan_one_channel(
-            mood,
-            channel,
-        )
-        await asyncio.sleep(1)
-    counts = get_track_counts()
-    logger.info(
-        "📊 CHANNEL TRACK COUNTS: %s",
-        counts,
-    )
-    logger.info(
-        "🔎 FULL CHANNEL SCAN FINISHED"
-    )
+        results[mood] = await scan_one_channel(mood, channel, limit=limit)
+        await asyncio.sleep(0.5)
+
+    logger.info("FULL CHANNEL SCAN FINISHED | reason=%s | saved=%s", reason, results)
+    return results
+
+
 # ============================================================
 # REAL-TIME NEW SONG WATCHER
 # ============================================================
@@ -1830,7 +1904,10 @@ async def periodic_scanner() -> None:
             logger.info(
                 "⏰ Periodic channel rescan..."
             )
-            await scan_all_channels()
+            await scan_all_channels(
+                limit=PERIODIC_SCAN_LIMIT,
+                reason="periodic",
+            )
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1844,73 +1921,82 @@ async def periodic_scanner() -> None:
 def telethon_worker() -> None:
     global telethon_client
 
-    if not TELETHON_API_ID or not TELETHON_API_HASH or not TELETHON_SESSION:
-        logger.error("❌ Telethon configuration missing")
+    missing = []
+    if not TELETHON_API_ID:
+        missing.append("TELETHON_API_ID")
+    if not TELETHON_API_HASH:
+        missing.append("TELETHON_API_HASH")
+    if not TELETHON_SESSION:
+        missing.append("TELETHON_SESSION")
+    if missing:
+        detail = "Missing Render variables: " + ", ".join(missing)
+        set_telethon_status("CONFIG_ERROR", detail)
+        logger.error("Telethon not started: %s", detail)
         return
 
     try:
         api_id = int(TELETHON_API_ID)
     except (TypeError, ValueError):
-        logger.error("❌ TELETHON_API_ID must be numeric")
+        set_telethon_status("CONFIG_ERROR", "TELETHON_API_ID must be a number")
+        logger.error("TELETHON_API_ID must be numeric")
         return
 
     async def runner() -> None:
         global telethon_client
-
         while True:
-            client = None
-            scanner_task = None
-
+            client: Optional[TelegramClient] = None
+            scanner_task: Optional[asyncio.Task[Any]] = None
             try:
-                logger.info("🔌 Creating Telethon client...")
-
+                set_telethon_status("CONNECTING", "Connecting with the supplied StringSession")
                 client = TelegramClient(
                     StringSession(TELETHON_SESSION),
                     api_id,
                     TELETHON_API_HASH,
-                    connection_retries=None,
+                    connection_retries=5,
                     retry_delay=5,
                     request_retries=5,
                     timeout=30,
                     auto_reconnect=True,
                     flood_sleep_threshold=60,
                 )
-
                 telethon_client = client
                 register_telethon_events(client)
-
-                logger.info("🔌 Connecting Telethon...")
                 await client.connect()
 
                 if not client.is_connected():
-                    raise ConnectionError("Telethon connect() returned disconnected")
-
+                    raise ConnectionError("Telethon connect() completed without a connection")
                 if not await client.is_user_authorized():
-                    logger.error("❌ Telethon session is unauthorized")
+                    set_telethon_status(
+                        "AUTH_ERROR",
+                        "StringSession is unauthorized. Create a new authorized session.",
+                    )
+                    logger.error("Telethon StringSession is unauthorized")
                     return
 
+                me = await client.get_me()
+                account_name = (
+                    getattr(me, "username", None)
+                    or getattr(me, "first_name", None)
+                    or "authorized account"
+                )
                 telethon_ready.set()
-                logger.info("🟢 TELETHON CONNECTED")
+                set_telethon_status("CONNECTED", f"Logged in as {account_name}; initial 8-channel scan started")
+                logger.info("TELETHON CONNECTED as %s", account_name)
 
-                try:
-                    await scan_all_channels()
-                except Exception:
-                    logger.exception("Initial channel scan failed")
-
+                await scan_all_channels(
+                    limit=None if INITIAL_SCAN_LIMIT == 0 else INITIAL_SCAN_LIMIT,
+                    reason="initial",
+                )
+                set_telethon_status("CONNECTED", f"Watcher active; {sum(1 for m in MOODS if MOOD_CHANNELS.get(m))}/8 channels configured")
                 scanner_task = asyncio.create_task(periodic_scanner())
-                logger.info("👀 Real-time watcher ACTIVE")
-
                 await client.run_until_disconnected()
-
             except asyncio.CancelledError:
                 raise
-
-            except Exception:
-                logger.exception("⚠️ Telethon connection error")
-
+            except Exception as exc:
+                set_telethon_status("DISCONNECTED", f"{type(exc).__name__}: {str(exc)[:240]}")
+                logger.exception("Telethon connection error")
             finally:
                 telethon_ready.clear()
-
                 if scanner_task is not None:
                     scanner_task.cancel()
                     try:
@@ -1918,29 +2004,30 @@ def telethon_worker() -> None:
                     except asyncio.CancelledError:
                         pass
                     except Exception:
-                        pass
-
+                        logger.exception("Periodic scanner cleanup error")
                 if client is not None:
                     try:
                         if client.is_connected():
                             await client.disconnect()
                     except Exception:
-                        pass
-
+                        logger.exception("Telethon disconnect error")
                 if telethon_client is client:
                     telethon_client = None
 
-            logger.warning("🔄 Telethon disconnected. Reconnecting in %s seconds...", TELETHON_RECONNECT_DELAY)
-            await asyncio.sleep(max(2, TELETHON_RECONNECT_DELAY))
+            # AUTH_ERROR needs a newly generated session, not an endless retry.
+            with telethon_status_lock:
+                terminal_auth_error = telethon_status["state"] == "AUTH_ERROR"
+            if terminal_auth_error:
+                return
+            logger.warning("Telethon disconnected; reconnecting in %s seconds", TELETHON_RECONNECT_DELAY)
+            await asyncio.sleep(TELETHON_RECONNECT_DELAY)
 
-    while True:
-        try:
-            asyncio.run(runner())
-            return
-        except Exception:
-            telethon_ready.clear()
-            logger.exception("❌ Telethon worker crashed. Restarting...")
-            time.sleep(max(2, TELETHON_RECONNECT_DELAY))
+    try:
+        asyncio.run(runner())
+    except Exception as exc:
+        telethon_ready.clear()
+        set_telethon_status("WORKER_ERROR", f"{type(exc).__name__}: {str(exc)[:240]}")
+        logger.exception("Telethon worker stopped")
 
 
 def start_telethon_worker() -> None:
@@ -3651,19 +3738,7 @@ def handle_message(
             return
         send_message(
             chat_id,
-            (
-                "📡  TELEGRAM CHANNEL SCANNER\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                + (
-                    "🟢 Telethon: CONNECTED\n"
-                    "👀 Watcher: ACTIVE\n"
-                    "🚀 New songs: AUTO SAVE\n"
-                    "🔄 Reconnect: ON"
-                    if telethon_ready.is_set()
-                    else
-                    "🔴 Telethon: DISCONNECTED"
-                )
-            ),
+            telethon_status_text(),
         )
         return
     # ========================================================
@@ -3921,4 +3996,4 @@ if __name__ == "__main__":
         port=port,
         threaded=True,
         use_reloader=False,
-)
+    )
