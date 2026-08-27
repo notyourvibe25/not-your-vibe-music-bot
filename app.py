@@ -1247,7 +1247,6 @@ def openai_request(
                 "model": OPENAI_MODEL,
                 "instructions": instructions,
                 "input": input_text,
-                "temperature": 0.2,
             },
             timeout=OPENAI_TIMEOUT,
         )
@@ -1564,6 +1563,35 @@ def get_ai_status() -> dict[str, int]:
             "Could not get AI status"
         )
     return result
+def reset_failed_ai_tracks() -> int:
+    """Reset old failed scans so tracks that failed because of a temporary API
+    request error can be analyzed again after the configuration is fixed.
+    """
+    try:
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+            cursor.execute(
+                """
+                UPDATE tracks
+                SET ai_status='pending',
+                    ai_error=NULL
+                WHERE ai_status='failed'
+                """
+            )
+            count = cursor.rowcount
+            if count:
+                logger.info(
+                    "🤖 Reset %s previously failed AI tracks to pending",
+                    count,
+                )
+            return count
+    except Exception:
+        logger.exception("Could not reset failed AI tracks")
+        return 0
+
+
 def get_pending_ai_tracks(
     limit: int,
 ) -> list[dict[str, Any]]:
@@ -3953,6 +3981,10 @@ def startup() -> bool:
     # --------------------------------------------------------
     try:
         init_db()
+        # Previous deployment marked tracks as failed because the OpenAI
+        # request included an unsupported `temperature` parameter.
+        # Put those tracks back into the AI queue after the fix.
+        reset_failed_ai_tracks()
     except Exception:
         logger.exception(
             "❌ PostgreSQL initialization failed"
