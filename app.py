@@ -1157,6 +1157,49 @@ def get_track(
 
 
 # ============================================================
+# SAVE TELETHON MUSIC MESSAGE
+# ============================================================
+def save_telethon_message(
+    mood: str,
+    entity: Any,
+    message: Any,
+) -> bool:
+    """Save one audio/video message from a configured mood channel.
+
+    This is deliberately independent of AI metadata: the source channel defines
+    the mood, while the caption/file name provides Artist and Track title.
+    """
+    if mood not in MOODS or not is_music_message(message):
+        return False
+
+    channel_id = normalize_channel_id(entity)
+    message_id = getattr(message, "id", None)
+    if not channel_id or not isinstance(message_id, int):
+        return False
+
+    raw_text = message_music_text(message)
+    artist, title = extract_artist_title(raw_text)
+    track_id = save_track(
+        mood=mood,
+        channel_id=channel_id,
+        message_id=message_id,
+        artist=artist,
+        title=title,
+        raw_text=raw_text,
+    )
+    if track_id is not None:
+        logger.debug(
+            "Track saved | mood=%s | id=%s | %s - %s",
+            mood,
+            track_id,
+            artist,
+            title,
+        )
+        return True
+    return False
+
+
+# ============================================================
 # SCAN ONE CHANNEL
 # ============================================================
 async def scan_one_channel(
