@@ -1,16 +1,21 @@
 import os
 import json
 import time
+import random
 import sqlite3
 import logging
 import threading
-import requests
 
+import requests
 from flask import Flask, request
 
-# OpenAI
 from openai import OpenAI
 from openai import RateLimitError, APIError
+
+# Telethon
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
 
 # =========================================================
 # LOGGING
@@ -25,21 +30,19 @@ logger = logging.getLogger("not-your-vibe-bot")
 
 
 # =========================================================
-# APP
+# FLASK
 # =========================================================
 
 app = Flask(__name__)
 
 
 # =========================================================
-# ENVIRONMENT VARIABLES
+# ENV
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Example:
-# @notyourvibemp3collection
 SOURCE_CHANNEL = os.getenv(
     "SOURCE_CHANNEL",
     "@notyourvibemp3collection"
@@ -47,11 +50,35 @@ SOURCE_CHANNEL = os.getenv(
 
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 
-# Render gives this automatically
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# Database
+# =========================================================
+# TELETHON ENV
+# =========================================================
+
+# Telegram API ID
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
+
+# Telegram API HASH
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+
+# Telethon StringSession
+#
+# Render မှာ historical channel scan လုပ်ဖို့
+# StringSession ထည့်ထားတာ အကောင်းဆုံး။
+#
+TELETHON_SESSION = os.getenv(
+    "TELETHON_SESSION"
+)
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
 DB_FILE = "music.db"
+
+db_lock = threading.Lock()
 
 
 # =========================================================
@@ -60,11 +87,9 @@ DB_FILE = "music.db"
 
 OPENAI_MODEL = "gpt-5-mini"
 
-# AI request delay
 AI_DELAY = 1.0
 
-# Number of tracks processed per scan batch
-SCAN_BATCH_SIZE = 20
+IMPORT_BATCH_SIZE = 100
 
 
 # =========================================================
@@ -82,24 +107,37 @@ MOODS = [
     "melodic"
 ]
 
+
 MOOD_NAMES = {
+
     "sad": "😢 SAD",
+
     "love": "❤️ LOVE",
+
     "chill": "🌙 CHILL",
+
     "hype": "🔥 HYPE",
+
     "dark": "🖤 DARK",
+
     "energetic": "⚡ ENERGETIC",
+
     "night": "🚗 NIGHT DRIVE",
+
     "melodic": "🌌 MELODIC"
 }
 
 
 # =========================================================
-# TELEGRAM API
+# TELEGRAM BOT API
 # =========================================================
 
 if not BOT_TOKEN:
-    logger.warning("BOT_TOKEN is missing")
+
+    logger.warning(
+        "BOT_TOKEN is missing"
+    )
+
 
 TELEGRAM_API = (
     f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -108,15 +146,17 @@ TELEGRAM_API = (
 )
 
 
-def telegram_request(method, data=None):
-    """
-    Safe Telegram API request.
-    """
+def telegram_request(
+    method,
+    data=None
+):
 
     if not TELEGRAM_API:
+
         return None
 
     try:
+
         response = requests.post(
             f"{TELEGRAM_API}/{method}",
             data=data or {},
@@ -126,6 +166,7 @@ def telegram_request(method, data=None):
         result = response.json()
 
         if not result.get("ok"):
+
             logger.error(
                 "Telegram API error: %s",
                 result
@@ -134,21 +175,35 @@ def telegram_request(method, data=None):
         return result
 
     except Exception:
+
         logger.exception(
             "Telegram request failed: %s",
             method
         )
+
         return None
 
 
-def send_message(chat_id, text, reply_markup=None):
+# =========================================================
+# SEND MESSAGE
+# =========================================================
+
+def send_message(
+    chat_id,
+    text,
+    reply_markup=None
+):
+
     data = {
         "chat_id": chat_id,
         "text": text
     }
 
     if reply_markup:
-        data["reply_markup"] = json.dumps(reply_markup)
+
+        data["reply_markup"] = json.dumps(
+            reply_markup
+        )
 
     return telegram_request(
         "sendMessage",
@@ -156,14 +211,15 @@ def send_message(chat_id, text, reply_markup=None):
     )
 
 
+# =========================================================
+# COPY CHANNEL MESSAGE
+# =========================================================
+
 def copy_channel_message(
     chat_id,
     from_chat_id,
     message_id
 ):
-    """
-    Copy an existing song post from the source channel.
-    """
 
     return telegram_request(
         "copyMessage",
@@ -179,10 +235,8 @@ def copy_channel_message(
 # DATABASE
 # =========================================================
 
-db_lock = threading.Lock()
-
-
 def get_db():
+
     conn = sqlite3.connect(
         DB_FILE,
         check_same_thread=False
@@ -204,6 +258,7 @@ def init_db():
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS tracks (
+
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                 message_id INTEGER UNIQUE NOT NULL,
@@ -219,6 +274,7 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+
             )
             """
         )
@@ -226,6 +282,7 @@ def init_db():
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
+
                 user_id INTEGER PRIMARY KEY,
 
                 username TEXT DEFAULT '',
@@ -233,18 +290,22 @@ def init_db():
                 first_name TEXT DEFAULT '',
 
                 last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+
             )
             """
         )
 
         conn.commit()
+
         conn.close()
 
-    logger.info("Database initialized")
+    logger.info(
+        "Database initialized"
+    )
 
 
 # =========================================================
-# USER DATABASE
+# USERS
 # =========================================================
 
 def save_user(user):
@@ -257,8 +318,13 @@ def save_user(user):
     if not user_id:
         return
 
-    username = user.get("username") or ""
-    first_name = user.get("first_name") or ""
+    username = user.get(
+        "username"
+    ) or ""
+
+    first_name = user.get(
+        "first_name"
+    ) or ""
 
     with db_lock:
 
@@ -274,9 +340,13 @@ def save_user(user):
             VALUES (?, ?, ?)
 
             ON CONFLICT(user_id)
+
             DO UPDATE SET
+
                 username = excluded.username,
+
                 first_name = excluded.first_name,
+
                 last_seen = CURRENT_TIMESTAMP
             """,
             (
@@ -287,11 +357,30 @@ def save_user(user):
         )
 
         conn.commit()
+
         conn.close()
 
 
+def get_user_count():
+
+    with db_lock:
+
+        conn = get_db()
+
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM users
+            """
+        ).fetchone()
+
+        conn.close()
+
+    return row["count"]
+
+
 # =========================================================
-# TRACK DATABASE
+# TRACK SAVE
 # =========================================================
 
 def save_track(
@@ -313,12 +402,19 @@ def save_track(
                 moods,
                 ai_status
             )
-            VALUES (?, ?, ?, '[]', 'pending')
+
+            VALUES (
+                ?, ?, ?, '[]', 'pending'
+            )
 
             ON CONFLICT(message_id)
+
             DO UPDATE SET
+
                 title = excluded.title,
+
                 caption = excluded.caption,
+
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -329,6 +425,7 @@ def save_track(
         )
 
         conn.commit()
+
         conn.close()
 
 
@@ -352,36 +449,6 @@ def get_track(message_id):
     return row
 
 
-def update_track_moods(
-    message_id,
-    moods,
-    status="classified"
-):
-
-    with db_lock:
-
-        conn = get_db()
-
-        conn.execute(
-            """
-            UPDATE tracks
-            SET
-                moods = ?,
-                ai_status = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE message_id = ?
-            """,
-            (
-                json.dumps(moods),
-                status,
-                message_id
-            )
-        )
-
-        conn.commit()
-        conn.close()
-
-
 def get_all_tracks():
 
     with db_lock:
@@ -401,24 +468,43 @@ def get_all_tracks():
     return rows
 
 
-def get_pending_tracks():
+def update_track_moods(
+    message_id,
+    moods,
+    status="classified"
+):
 
     with db_lock:
 
         conn = get_db()
 
-        rows = conn.execute(
+        conn.execute(
             """
-            SELECT *
-            FROM tracks
-            WHERE ai_status != 'classified'
-            ORDER BY id ASC
-            """
-        ).fetchall()
+            UPDATE tracks
+
+            SET
+
+                moods = ?,
+
+                ai_status = ?,
+
+                updated_at = CURRENT_TIMESTAMP
+
+            WHERE message_id = ?
+            """,
+            (
+                json.dumps(
+                    moods,
+                    ensure_ascii=False
+                ),
+                status,
+                message_id
+            )
+        )
+
+        conn.commit()
 
         conn.close()
-
-    return rows
 
 
 # =========================================================
@@ -426,6 +512,7 @@ def get_pending_tracks():
 # =========================================================
 
 openai_client = None
+
 
 if OPENAI_API_KEY:
 
@@ -448,8 +535,8 @@ if OPENAI_API_KEY:
 else:
 
     logger.warning(
-        "OPENAI_API_KEY not found. "
-        "AI classification disabled."
+        "OPENAI_API_KEY missing. "
+        "AI disabled."
     )
 
 
@@ -457,21 +544,15 @@ else:
 # AI CLASSIFIER
 # =========================================================
 
-def classify_music(title, caption):
-
-    """
-    AI classifies a song into one or more
-    predefined moods.
-
-    IMPORTANT:
-    If OpenAI quota is exhausted,
-    this function DOES NOT crash the bot.
-    """
+def classify_music(
+    title,
+    caption
+):
 
     if not openai_client:
 
         logger.warning(
-            "AI unavailable: OPENAI_API_KEY missing"
+            "AI unavailable"
         )
 
         return []
@@ -487,36 +568,36 @@ Caption:
 
 
     instructions = f"""
-You are the music mood classifier for
-NOT YOUR VIBE MUSIC.
+You are the music mood classifier
+for NOT YOUR VIBE MUSIC.
 
-Classify the track using ONLY these moods:
+Use ONLY these moods:
 
 {", ".join(MOODS)}
 
-Rules:
+Return ONLY valid JSON.
 
-1. Return ONLY valid JSON.
-2. JSON must contain a key named "moods".
-3. "moods" must be an array.
-4. Use one or more moods.
-5. Never create new mood names.
-6. Do not explain anything.
-7. Judge based on title, artist, genre,
-   lyrics/caption information and overall
-   musical feeling when available.
-
-Example:
+Format:
 
 {{
   "moods": ["melodic", "love"]
 }}
+
+Rules:
+
+1. Use only allowed moods.
+2. Return one or more moods.
+3. Never invent mood names.
+4. No explanation.
+5. Judge from title, artist,
+   genre, caption and musical feeling.
 """
 
 
     try:
 
         response = openai_client.responses.create(
+
             model=OPENAI_MODEL,
 
             instructions=instructions,
@@ -524,44 +605,70 @@ Example:
             input=text
         )
 
-        raw = response.output_text.strip()
+
+        raw = (
+            response.output_text
+            or ""
+        ).strip()
+
 
         logger.info(
             "AI response: %s",
             raw
         )
 
-        data = json.loads(raw)
 
-        moods = data.get("moods", [])
+        data = json.loads(
+            raw
+        )
 
-        if not isinstance(moods, list):
+
+        moods = data.get(
+            "moods",
+            []
+        )
+
+
+        if not isinstance(
+            moods,
+            list
+        ):
+
             return []
 
-        valid_moods = []
+
+        valid = []
+
 
         for mood in moods:
 
-            mood = str(mood).lower().strip()
+            mood = (
+                str(mood)
+                .lower()
+                .strip()
+            )
 
             if mood in MOODS:
-                valid_moods.append(mood)
 
-        # Remove duplicates
-        valid_moods = list(
-            dict.fromkeys(valid_moods)
-        )
+                if mood not in valid:
 
-        return valid_moods
+                    valid.append(
+                        mood
+                    )
+
+
+        return valid
+
 
     except RateLimitError:
 
         logger.error(
-            "OpenAI quota exceeded. "
+            "OPENAI QUOTA EXCEEDED. "
             "AI classification skipped."
         )
 
         return []
+
 
     except APIError:
 
@@ -571,6 +678,7 @@ Example:
 
         return []
 
+
     except json.JSONDecodeError:
 
         logger.error(
@@ -578,6 +686,7 @@ Example:
         )
 
         return []
+
 
     except Exception:
 
@@ -592,24 +701,37 @@ Example:
 # CLASSIFY ONE TRACK
 # =========================================================
 
-def classify_track(track):
+def classify_track(
+    track
+):
 
-    message_id = track["message_id"]
+    message_id = track[
+        "message_id"
+    ]
 
-    title = track["title"] or ""
+    title = (
+        track["title"]
+        or ""
+    )
 
-    caption = track["caption"] or ""
+    caption = (
+        track["caption"]
+        or ""
+    )
+
 
     logger.info(
-        "AI scanning message_id=%s title=%s",
+        "AI scanning %s | %s",
         message_id,
         title
     )
+
 
     moods = classify_music(
         title,
         caption
     )
+
 
     if moods:
 
@@ -620,16 +742,13 @@ def classify_track(track):
         )
 
         logger.info(
-            "Classified %s -> %s",
+            "CLASSIFIED %s -> %s",
             message_id,
             moods
         )
 
     else:
 
-        # Important:
-        # Don't mark it permanently classified
-        # when AI failed.
         update_track_moods(
             message_id,
             [],
@@ -641,13 +760,17 @@ def classify_track(track):
             message_id
         )
 
-    time.sleep(AI_DELAY)
+
+    time.sleep(
+        AI_DELAY
+    )
+
 
     return moods
 
 
 # =========================================================
-# FULL RESCAN
+# FULL AI RESCAN
 # =========================================================
 
 rescan_lock = threading.Lock()
@@ -659,25 +782,24 @@ def full_rescan():
 
     global rescan_running
 
-    if rescan_running:
-
-        logger.warning(
-            "Full rescan already running"
-        )
-
-        return
 
     with rescan_lock:
 
         if rescan_running:
+
+            logger.warning(
+                "Rescan already running"
+            )
+
             return
 
         rescan_running = True
 
+
     try:
 
         logger.info(
-            "===================================="
+            "================================"
         )
 
         logger.info(
@@ -685,53 +807,73 @@ def full_rescan():
         )
 
         logger.info(
-            "===================================="
+            "================================"
         )
+
 
         tracks = get_all_tracks()
 
-        total = len(tracks)
+
+        total = len(
+            tracks
+        )
+
+
+        success = 0
+
+        failed = 0
+
 
         logger.info(
-            "Total tracks in database: %s",
+            "Database tracks: %s",
             total
         )
 
-        success = 0
-        failed = 0
 
-        for index, track in enumerate(tracks, 1):
+        for index, track in enumerate(
+            tracks,
+            1
+        ):
 
             logger.info(
-                "Rescan %s/%s",
+                "RESCAN %s/%s",
                 index,
                 total
             )
 
-            moods = classify_track(track)
+
+            moods = classify_track(
+                track
+            )
+
 
             if moods:
+
                 success += 1
+
             else:
+
                 failed += 1
 
+
         logger.info(
-            "===================================="
+            "================================"
         )
 
         logger.info(
-            "FULL RESCAN FINISHED"
+            "FULL AI RESCAN FINISHED"
         )
 
         logger.info(
-            "Success: %s | Pending/Failed: %s",
+            "Success=%s Pending=%s",
             success,
             failed
         )
 
         logger.info(
-            "===================================="
+            "================================"
         )
+
 
     except Exception:
 
@@ -739,14 +881,11 @@ def full_rescan():
             "Full rescan crashed"
         )
 
+
     finally:
 
         rescan_running = False
 
-
-# =========================================================
-# START FULL RESCAN IN BACKGROUND
-# =========================================================
 
 def start_full_rescan():
 
@@ -757,134 +896,296 @@ def start_full_rescan():
 
     thread.start()
 
-    logger.info(
-        "Full rescan thread started"
+
+# =========================================================
+# TELETHON
+# =========================================================
+
+telethon_client = None
+
+telethon_ready = False
+
+
+def init_telethon():
+
+    global telethon_client
+    global telethon_ready
+
+
+    if not TELEGRAM_API_ID:
+
+        logger.warning(
+            "TELEGRAM_API_ID missing"
+        )
+
+        return False
+
+
+    if not TELEGRAM_API_HASH:
+
+        logger.warning(
+            "TELEGRAM_API_HASH missing"
+        )
+
+        return False
+
+
+    if not TELETHON_SESSION:
+
+        logger.warning(
+            "TELETHON_SESSION missing. "
+            "Historical import disabled."
+        )
+
+        return False
+
+
+    try:
+
+        telethon_client = TelegramClient(
+
+            StringSession(
+                TELETHON_SESSION
+            ),
+
+            int(
+                TELEGRAM_API_ID
+            ),
+
+            TELEGRAM_API_HASH
+        )
+
+
+        telethon_client.start()
+
+
+        telethon_ready = True
+
+
+        logger.info(
+            "Telethon connected"
+        )
+
+
+        return True
+
+
+    except Exception:
+
+        logger.exception(
+            "Telethon initialization failed"
+        )
+
+        return False
+
+
+# =========================================================
+# EXTRACT TELETHON MESSAGE
+# =========================================================
+
+def telethon_message_text(
+    message
+):
+
+    text = (
+        message.message
+        or ""
+    )
+
+    return text
+
+
+def get_telethon_title(
+    message
+):
+
+    text = telethon_message_text(
+        message
     )
 
 
+    lines = [
+
+        x.strip()
+
+        for x in text.splitlines()
+
+        if x.strip()
+    ]
+
+
+    if lines:
+
+        return lines[0]
+
+
+    return "Unknown Track"
+
+
 # =========================================================
-# ADMIN COMMAND
+# IMPORT OLD CHANNEL TRACKS
 # =========================================================
 
-def is_admin(user_id):
+import_running = False
 
-    if not ADMIN_USER_ID:
-        return False
+import_lock = threading.Lock()
+
+
+def import_old_tracks():
+
+    global import_running
+
+
+    with import_lock:
+
+        if import_running:
+
+            logger.warning(
+                "Import already running"
+            )
+
+            return
+
+        import_running = True
+
 
     try:
-        return int(user_id) == int(
-            ADMIN_USER_ID
+
+        if not telethon_ready:
+
+            logger.error(
+                "Telethon is not ready"
+            )
+
+            return
+
+
+        logger.info(
+            "================================"
         )
+
+        logger.info(
+            "OLD CHANNEL IMPORT STARTED"
+        )
+
+        logger.info(
+            "================================"
+        )
+
+
+        imported = 0
+
+        skipped = 0
+
+
+        entity = (
+            telethon_client.get_entity(
+                SOURCE_CHANNEL
+            )
+        )
+
+
+        for message in telethon_client.iter_messages(
+            entity,
+            reverse=True
+        ):
+
+            if not message:
+
+                continue
+
+
+            message_id = (
+                message.id
+            )
+
+
+            existing = get_track(
+                message_id
+            )
+
+
+            if existing:
+
+                skipped += 1
+
+                continue
+
+
+            caption = (
+                message.message
+                or ""
+            )
+
+
+            title = get_telethon_title(
+                message
+            )
+
+
+            save_track(
+                message_id=message_id,
+                title=title,
+                caption=caption
+            )
+
+
+            imported += 1
+
+
+            logger.info(
+                "Imported old track: %s | %s",
+                message_id,
+                title
+            )
+
+
+            # Don't immediately call AI here.
+            # First import everything.
+            #
+            # After import:
+            # /rescan
+
+
+        logger.info(
+            "================================"
+        )
+
+        logger.info(
+            "OLD CHANNEL IMPORT FINISHED"
+        )
+
+        logger.info(
+            "Imported=%s Skipped=%s",
+            imported,
+            skipped
+        )
+
+        logger.info(
+            "================================"
+        )
+
 
     except Exception:
-        return False
 
-
-def handle_admin_command(
-    chat_id,
-    user_id,
-    text
-):
-
-    if not is_admin(user_id):
-        return False
-
-    command = text.strip().lower()
-
-    if command == "/rescan":
-
-        if rescan_running:
-
-            send_message(
-                chat_id,
-                "⏳ Full AI Rescan is already running."
-            )
-
-        else:
-
-            send_message(
-                chat_id,
-                "🔄 Full AI Rescan started.\n\n"
-                "အဟောင်း Track တွေကို AI နဲ့ "
-                "ပြန်စစ်နေပါတယ်။"
-            )
-
-            start_full_rescan()
-
-        return True
-
-
-    if command == "/rescan_status":
-
-        tracks = get_all_tracks()
-
-        classified = 0
-        pending = 0
-
-        for track in tracks:
-
-            if track["ai_status"] == "classified":
-                classified += 1
-            else:
-                pending += 1
-
-        status = (
-            "🔎 AI RESCAN STATUS\n\n"
-            f"🎵 Total: {len(tracks)}\n"
-            f"✅ Classified: {classified}\n"
-            f"⏳ Pending: {pending}\n\n"
-            f"🔄 Running: "
-            f"{'YES' if rescan_running else 'NO'}"
+        logger.exception(
+            "Historical import failed"
         )
 
-        send_message(
-            chat_id,
-            status
-        )
 
-        return True
+    finally:
+
+        import_running = False
 
 
-    if command == "/stats":
+def start_import():
 
-        tracks = get_all_tracks()
+    thread = threading.Thread(
+        target=import_old_tracks,
+        daemon=True
+    )
 
-        users = get_user_count()
-
-        classified = sum(
-            1
-            for track in tracks
-            if track["ai_status"] == "classified"
-        )
-
-        send_message(
-            chat_id,
-            "📊 NOT YOUR VIBE BOT\n\n"
-            f"👤 Users: {users}\n"
-            f"🎵 Tracks: {len(tracks)}\n"
-            f"🤖 AI Classified: {classified}\n"
-            f"⏳ Pending: "
-            f"{len(tracks) - classified}"
-        )
-
-        return True
-
-    return False
-
-
-def get_user_count():
-
-    with db_lock:
-
-        conn = get_db()
-
-        row = conn.execute(
-            "SELECT COUNT(*) AS count FROM users"
-        ).fetchone()
-
-        conn.close()
-
-    return row["count"]
+    thread.start()
 
 
 # =========================================================
@@ -894,7 +1195,9 @@ def get_user_count():
 def mood_keyboard():
 
     return {
+
         "inline_keyboard": [
+
             [
                 {
                     "text": MOOD_NAMES["sad"],
@@ -905,6 +1208,7 @@ def mood_keyboard():
                     "callback_data": "mood:love"
                 }
             ],
+
             [
                 {
                     "text": MOOD_NAMES["chill"],
@@ -915,6 +1219,7 @@ def mood_keyboard():
                     "callback_data": "mood:hype"
                 }
             ],
+
             [
                 {
                     "text": MOOD_NAMES["dark"],
@@ -925,6 +1230,7 @@ def mood_keyboard():
                     "callback_data": "mood:energetic"
                 }
             ],
+
             [
                 {
                     "text": MOOD_NAMES["night"],
@@ -946,12 +1252,17 @@ def mood_keyboard():
 def music_buttons():
 
     return {
+
         "inline_keyboard": [
+
             [
                 {
                     "text": "⏭ NEXT",
                     "callback_data": "next"
-                },
+                }
+            ],
+
+            [
                 {
                     "text": "🔄 CHANGE MOOD",
                     "callback_data": "change_mood"
@@ -962,31 +1273,76 @@ def music_buttons():
 
 
 # =========================================================
-# GET MUSIC BY MOOD
+# USER MOOD MEMORY
 # =========================================================
 
-def get_tracks_by_mood(mood):
+user_moods = {}
+
+user_moods_lock = threading.Lock()
+
+
+def set_user_mood(
+    user_id,
+    mood
+):
+
+    with user_moods_lock:
+
+        user_moods[
+            int(user_id)
+        ] = mood
+
+
+def get_user_mood(
+    user_id
+):
+
+    with user_moods_lock:
+
+        return user_moods.get(
+            int(user_id)
+        )
+
+
+# =========================================================
+# GET TRACKS BY MOOD
+# =========================================================
+
+def get_tracks_by_mood(
+    mood
+):
 
     if mood not in MOODS:
+
         return []
+
 
     rows = get_all_tracks()
 
+
     results = []
+
 
     for row in rows:
 
         try:
+
             moods = json.loads(
-                row["moods"] or "[]"
+                row["moods"]
+                or "[]"
             )
 
         except Exception:
+
             moods = []
+
 
         if mood in moods:
 
-            results.append(row)
+            results.append(
+                row
+            )
+
 
     return results
 
@@ -994,9 +1350,6 @@ def get_tracks_by_mood(mood):
 # =========================================================
 # SEND RANDOM MUSIC
 # =========================================================
-
-import random
-
 
 def send_random_music(
     chat_id,
@@ -1007,255 +1360,800 @@ def send_random_music(
         mood
     )
 
+
     if not tracks:
 
         send_message(
+
             chat_id,
+
             f"😔 {MOOD_NAMES.get(mood, mood)}\n\n"
-            "ဒီ Mood အတွက် Track မတွေ့သေးပါဘူး။"
+            "ဒီ Mood အတွက် Track မတွေ့သေးပါဘူး။\n\n"
+            "AI classification မပြီးသေးတာ "
+            "ဖြစ်နိုင်ပါတယ်။"
+
         )
 
         return
 
-    track = random.choice(tracks)
+
+    track = random.choice(
+        tracks
+    )
+
 
     result = copy_channel_message(
+
         chat_id=chat_id,
+
         from_chat_id=SOURCE_CHANNEL,
-        message_id=track["message_id"]
+
+        message_id=track[
+            "message_id"
+        ]
     )
 
-    if not result or not result.get("ok"):
+
+    if not result or not result.get(
+        "ok"
+    ):
 
         send_message(
+
             chat_id,
-            "⚠️ ဒီ Track ကို ပို့လို့မရသေးပါဘူး။"
+
+            "⚠️ ဒီ Track ကို ပို့လို့မရသေးပါဘူး။\n\n"
+            "Bot ကို Source Channel ထဲမှာ "
+            "Administrator အဖြစ် ထည့်ထားတာ "
+            "သေချာစစ်ပါ။"
+
         )
 
         return
 
+
     send_message(
+
         chat_id,
+
         f"🎵 {MOOD_NAMES.get(mood, mood)}",
+
         music_buttons()
+
     )
 
 
 # =========================================================
-# CALLBACK QUERY
+# NEXT MUSIC
 # =========================================================
 
-def answer_callback(callback_id):
+def send_next_music(
+    chat_id,
+    user_id
+):
+
+    mood = get_user_mood(
+        user_id
+    )
+
+
+    if not mood:
+
+        send_message(
+
+            chat_id,
+
+            "🎧 အရင်ဆုံး Mood တစ်ခုရွေးပါ။",
+
+            mood_keyboard()
+
+        )
+
+        return
+
+
+    tracks = get_tracks_by_mood(
+        mood
+    )
+
+
+    if not tracks:
+
+        send_message(
+
+            chat_id,
+
+            "😔 ဒီ Mood မှာ Track မရှိသေးပါဘူး။"
+
+        )
+
+        return
+
+
+    track = random.choice(
+        tracks
+    )
+
+
+    result = copy_channel_message(
+
+        chat_id=chat_id,
+
+        from_chat_id=SOURCE_CHANNEL,
+
+        message_id=track[
+            "message_id"
+        ]
+    )
+
+
+    if not result or not result.get(
+        "ok"
+    ):
+
+        send_message(
+
+            chat_id,
+
+            "⚠️ Track ပို့မရပါဘူး။\n"
+            "Bot ရဲ့ Channel permission ကိုစစ်ပါ။"
+
+        )
+
+        return
+
+
+    send_message(
+
+        chat_id,
+
+        f"🎵 {MOOD_NAMES.get(mood, mood)}",
+
+        music_buttons()
+
+    )
+
+
+# =========================================================
+# CALLBACK ANSWER
+# =========================================================
+
+def answer_callback(
+    callback_id
+):
 
     telegram_request(
+
         "answerCallbackQuery",
+
         {
-            "callback_query_id": callback_id
+            "callback_query_id":
+                callback_id
         }
+
     )
 
 
-def handle_callback(callback):
+# =========================================================
+# CALLBACK HANDLER
+# =========================================================
 
-    callback_id = callback.get("id")
+def handle_callback(
+    callback
+):
 
-    data = callback.get("data", "")
+    callback_id = callback.get(
+        "id"
+    )
 
-    message = callback.get("message") or {}
+    data = callback.get(
+        "data",
+        ""
+    )
 
-    chat = message.get("chat") or {}
 
-    chat_id = chat.get("id")
+    message = callback.get(
+        "message"
+    ) or {}
 
-    user = callback.get("from") or {}
 
-    user_id = user.get("id")
+    chat = message.get(
+        "chat"
+    ) or {}
 
-    answer_callback(callback_id)
 
-    if data.startswith("mood:"):
+    chat_id = chat.get(
+        "id"
+    )
+
+
+    user = callback.get(
+        "from"
+    ) or {}
+
+
+    user_id = user.get(
+        "id"
+    )
+
+
+    answer_callback(
+        callback_id
+    )
+
+
+    # -----------------------------------------------------
+    # MOOD
+    # -----------------------------------------------------
+
+    if data.startswith(
+        "mood:"
+    ):
 
         mood = data.split(
             ":",
             1
         )[1]
 
+
         if mood not in MOODS:
+
             return
 
-        send_random_music(
-            chat_id,
+
+        set_user_mood(
+            user_id,
             mood
         )
 
+
+        send_random_music(
+
+            chat_id,
+
+            mood
+
+        )
+
+
         return
 
+
+    # -----------------------------------------------------
+    # CHANGE MOOD
+    # -----------------------------------------------------
 
     if data == "change_mood":
 
         send_message(
+
             chat_id,
+
             "🎧 Choose your mood:",
+
             mood_keyboard()
+
         )
 
         return
 
+
+    # -----------------------------------------------------
+    # NEXT
+    # -----------------------------------------------------
 
     if data == "next":
 
-        send_message(
+        send_next_music(
+
             chat_id,
-            "🎧 Choose a mood first:",
-            mood_keyboard()
+
+            user_id
+
         )
 
         return
 
 
 # =========================================================
-# TEXT MESSAGE HANDLER
+# ADMIN
 # =========================================================
 
-def handle_message(message):
+def is_admin(
+    user_id
+):
 
-    chat = message.get("chat") or {}
+    if not ADMIN_USER_ID:
 
-    chat_id = chat.get("id")
+        return False
 
-    user = message.get("from") or {}
 
-    user_id = user.get("id")
+    try:
 
-    text = message.get("text") or ""
-
-    save_user(user)
-
-    # Admin commands
-    if text.startswith("/"):
-
-        handled = handle_admin_command(
-            chat_id,
-            user_id,
-            text
+        return int(
+            user_id
+        ) == int(
+            ADMIN_USER_ID
         )
 
+    except Exception:
+
+        return False
+
+
+# =========================================================
+# ADMIN COMMANDS
+# =========================================================
+
+def handle_admin_command(
+    chat_id,
+    user_id,
+    text
+):
+
+    if not is_admin(
+        user_id
+    ):
+
+        return False
+
+
+    command = (
+        text
+        .strip()
+        .lower()
+    )
+
+
+    # -----------------------------------------------------
+    # RESCAN
+    # -----------------------------------------------------
+
+    if command == "/rescan":
+
+        if rescan_running:
+
+            send_message(
+
+                chat_id,
+
+                "⏳ AI Rescan already running."
+
+            )
+
+        else:
+
+            send_message(
+
+                chat_id,
+
+                "🤖 Full AI Rescan စပါပြီ။\n\n"
+                "Database ထဲက Track အားလုံးကို "
+                "AI နဲ့ ပြန်စစ်နေပါတယ်။"
+
+            )
+
+            start_full_rescan()
+
+
+        return True
+
+
+    # -----------------------------------------------------
+    # IMPORT
+    # -----------------------------------------------------
+
+    if command == "/import":
+
+        if import_running:
+
+            send_message(
+
+                chat_id,
+
+                "⏳ Channel import already running."
+
+            )
+
+        else:
+
+            send_message(
+
+                chat_id,
+
+                "📥 Channel အဟောင်း Track တွေကို "
+                "Database ထဲ ပြန်ထည့်နေပါတယ်။\n\n"
+                "ပြီးသွားရင် /rescan လုပ်ပါ။"
+
+            )
+
+            start_import()
+
+
+        return True
+
+
+    # -----------------------------------------------------
+    # STATUS
+    # -----------------------------------------------------
+
+    if command == "/rescan_status":
+
+        tracks = get_all_tracks()
+
+
+        classified = 0
+
+        pending = 0
+
+
+        for track in tracks:
+
+            if track[
+                "ai_status"
+            ] == "classified":
+
+                classified += 1
+
+            else:
+
+                pending += 1
+
+
+        send_message(
+
+            chat_id,
+
+            "🔎 AI STATUS\n\n"
+
+            f"🎵 Total: {len(tracks)}\n"
+
+            f"✅ Classified: {classified}\n"
+
+            f"⏳ Pending: {pending}\n\n"
+
+            f"🤖 AI Running: "
+            f"{'YES' if rescan_running else 'NO'}\n"
+
+            f"📥 Import Running: "
+            f"{'YES' if import_running else 'NO'}"
+
+        )
+
+
+        return True
+
+
+    # -----------------------------------------------------
+    # STATS
+    # -----------------------------------------------------
+
+    if command == "/stats":
+
+        tracks = get_all_tracks()
+
+
+        classified = sum(
+
+            1
+
+            for track in tracks
+
+            if track[
+                "ai_status"
+            ] == "classified"
+
+        )
+
+
+        users = get_user_count()
+
+
+        send_message(
+
+            chat_id,
+
+            "📊 NOT YOUR VIBE MUSIC BOT\n\n"
+
+            f"👤 Users: {users}\n"
+
+            f"🎵 Tracks: {len(tracks)}\n"
+
+            f"🤖 AI Classified: {classified}\n"
+
+            f"⏳ Pending: "
+            f"{len(tracks) - classified}"
+
+        )
+
+
+        return True
+
+
+    # -----------------------------------------------------
+    # ADMIN HELP
+    # -----------------------------------------------------
+
+    if command == "/admin":
+
+        send_message(
+
+            chat_id,
+
+            "🛠 ADMIN COMMANDS\n\n"
+
+            "/import\n"
+            "→ Channel အဟောင်းတွေ DB ထဲထည့်\n\n"
+
+            "/rescan\n"
+            "→ DB ထဲက Track အားလုံးကို AI ပြန်စစ်\n\n"
+
+            "/rescan_status\n"
+            "→ AI status ကြည့်\n\n"
+
+            "/stats\n"
+            "→ User / Track statistics"
+
+        )
+
+
+        return True
+
+
+    return False
+
+
+# =========================================================
+# MESSAGE HANDLER
+# =========================================================
+
+def handle_message(
+    message
+):
+
+    chat = message.get(
+        "chat"
+    ) or {}
+
+
+    chat_id = chat.get(
+        "id"
+    )
+
+
+    user = message.get(
+        "from"
+    ) or {}
+
+
+    user_id = user.get(
+        "id"
+    )
+
+
+    text = message.get(
+        "text"
+    ) or ""
+
+
+    save_user(
+        user
+    )
+
+
+    # Admin
+    if text.startswith(
+        "/"
+    ):
+
+        handled = handle_admin_command(
+
+            chat_id,
+
+            user_id,
+
+            text
+
+        )
+
+
         if handled:
+
             return
 
+
+    # Start
     if text == "/start":
 
         send_message(
+
             chat_id,
-            "🎧 Welcome to NOT YOUR VIBE MUSIC BOT\n\n"
-            "Choose your mood 👇",
+
+            "🎧 Welcome to "
+            "NOT YOUR VIBE MUSIC BOT\n\n"
+
+            "Mood တစ်ခုရွေးပြီး "
+            "Music နားထောင်ပါ 👇",
+
             mood_keyboard()
+
         )
 
         return
 
+
+    # Mood
     if text == "/mood":
 
         send_message(
+
             chat_id,
+
             "🎧 Choose your mood:",
+
             mood_keyboard()
+
         )
 
         return
 
 
 # =========================================================
-# CHANNEL POST HANDLER
+# CHANNEL TITLE
 # =========================================================
 
-def extract_channel_title(message):
+def extract_channel_title(
+    message
+):
 
     caption = (
+
         message.get("caption")
+
         or message.get("text")
+
         or ""
+
     )
 
-    # Use first line as title
+
     lines = [
+
         line.strip()
+
         for line in caption.splitlines()
+
         if line.strip()
+
     ]
 
+
     if lines:
+
         return lines[0]
+
 
     return "Unknown Track"
 
 
-def handle_channel_post(message):
+# =========================================================
+# CHANNEL POST
+# =========================================================
 
-    chat = message.get("chat") or {}
+def handle_channel_post(
+    message
+):
 
-    chat_username = chat.get("username")
+    chat = message.get(
+        "chat"
+    ) or {}
 
-    chat_id = chat.get("id")
 
-    message_id = message.get("message_id")
+    chat_username = chat.get(
+        "username"
+    )
+
+
+    message_id = message.get(
+        "message_id"
+    )
+
 
     if not message_id:
+
         return
 
-    # Only process configured source channel
-    source_username = SOURCE_CHANNEL.lstrip("@").lower()
 
+    source_username = (
+
+        SOURCE_CHANNEL
+        .lstrip("@")
+        .lower()
+
+    )
+
+
+    # Public channel check
     if chat_username:
 
-        if chat_username.lower() != source_username:
+        if (
+            chat_username.lower()
+            != source_username
+        ):
 
             return
 
+
     caption = (
+
         message.get("caption")
+
         or message.get("text")
+
         or ""
+
     )
+
 
     title = extract_channel_title(
         message
     )
 
+
     save_track(
-        message_id=message_id,
-        title=title,
-        caption=caption
+
+        message_id,
+
+        title,
+
+        caption
+
     )
+
 
     logger.info(
-        "New channel track added: %s | %s",
+
+        "New channel track saved: %s | %s",
+
         message_id,
+
         title
+
     )
 
-    # AI classification in background
+
+    # AI in background
     thread = threading.Thread(
+
         target=classify_new_track,
+
         args=(message_id,),
+
         daemon=True
+
     )
+
 
     thread.start()
 
 
 # =========================================================
-# NEW TRACK AI CLASSIFICATION
+# NEW TRACK CLASSIFICATION
 # =========================================================
 
-def classify_new_track(message_id):
+def classify_new_track(
+    message_id
+):
 
     track = get_track(
         message_id
     )
 
+
     if not track:
+
         return
+
 
     classify_track(
         track
@@ -1278,12 +2176,12 @@ def webhook():
             silent=True
         ) or {}
 
-        logger.info(
-            "Telegram update received"
-        )
 
         # Normal message
-        message = update.get("message")
+        message = update.get(
+            "message"
+        )
+
 
         if message:
 
@@ -1291,10 +2189,12 @@ def webhook():
                 message
             )
 
+
         # Callback
         callback = update.get(
             "callback_query"
         )
+
 
         if callback:
 
@@ -1302,10 +2202,12 @@ def webhook():
                 callback
             )
 
+
         # Channel post
         channel_post = update.get(
             "channel_post"
         )
+
 
         if channel_post:
 
@@ -1313,9 +2215,11 @@ def webhook():
                 channel_post
             )
 
+
         return {
             "ok": True
         }
+
 
     except Exception:
 
@@ -1323,13 +2227,14 @@ def webhook():
             "Webhook error"
         )
 
+
         return {
             "ok": False
         }, 200
 
 
 # =========================================================
-# HEALTH CHECK
+# HOME
 # =========================================================
 
 @app.route(
@@ -1343,6 +2248,10 @@ def home():
     )
 
 
+# =========================================================
+# HEALTH
+# =========================================================
+
 @app.route(
     "/health",
     methods=["GET"]
@@ -1350,9 +2259,21 @@ def home():
 def health():
 
     return {
+
         "status": "ok",
-        "ai": bool(openai_client),
-        "rescan_running": rescan_running
+
+        "ai": bool(
+            openai_client
+        ),
+
+        "telethon": telethon_ready,
+
+        "rescan_running":
+            rescan_running,
+
+        "import_running":
+            import_running
+
     }
 
 
@@ -1370,22 +2291,51 @@ def set_webhook():
 
         return
 
+
     webhook_url = (
+
         RENDER_URL.rstrip("/")
+
         + "/webhook"
+
     )
 
+
     result = telegram_request(
+
         "setWebhook",
+
         {
-            "url": webhook_url
+            "url":
+                webhook_url
         }
+
     )
+
 
     logger.info(
         "Webhook result: %s",
         result
     )
+
+
+# =========================================================
+# STARTUP
+# =========================================================
+
+def startup_tasks():
+
+    time.sleep(
+        3
+    )
+
+
+    # Telegram webhook
+    set_webhook()
+
+
+    # Telethon
+    init_telethon()
 
 
 # =========================================================
@@ -1395,25 +2345,47 @@ def set_webhook():
 if __name__ == "__main__":
 
     logger.info(
-        "Starting NOT YOUR VIBE MUSIC BOT"
+        "================================"
     )
+
+    logger.info(
+        "STARTING NOT YOUR VIBE MUSIC BOT"
+    )
+
+    logger.info(
+        "================================"
+    )
+
 
     init_db()
 
-    # Set webhook after Flask starts
-    threading.Timer(
-        3.0,
-        set_webhook
-    ).start()
+
+    startup_thread = threading.Thread(
+
+        target=startup_tasks,
+
+        daemon=True
+
+    )
+
+
+    startup_thread.start()
+
 
     port = int(
+
         os.getenv(
             "PORT",
             "10000"
         )
+
     )
 
+
     app.run(
+
         host="0.0.0.0",
+
         port=port
-    )
+
+)
