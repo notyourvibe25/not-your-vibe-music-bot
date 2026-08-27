@@ -3981,10 +3981,47 @@ def startup() -> bool:
     )
     return True
 # ============================================================
+# PROCESS STARTUP
+# ============================================================
+# Gunicorn imports `app:app`; it does not execute the __main__ block.
+# This lock makes the startup path idempotent inside the single Gunicorn worker.
+_background_start_lock = threading.Lock()
+_background_started = False
+
+
+def start_background_services() -> bool:
+    """Start database, webhook, Telethon, and AI workers exactly once per process."""
+    global _background_started
+
+    with _background_start_lock:
+        if _background_started:
+            return True
+        _background_started = True
+
+        try:
+            ready = startup()
+        except Exception:
+            logger.exception("Background service startup crashed")
+            ready = False
+
+        if not ready:
+            # Do not claim a failed startup is healthy; the next process created
+            # by Render/Gunicorn can retry after configuration is corrected.
+            _background_started = False
+        return ready
+
+
+# For `gunicorn app:app`, import happens inside the Gunicorn worker process.
+# Run only one worker and do not add Gunicorn's --preload option.
+if __name__ != "__main__":
+    start_background_services()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
-    startup()
+    start_background_services()
     port = env_int(
         "PORT",
         10000,
@@ -3996,4 +4033,4 @@ if __name__ == "__main__":
         port=port,
         threaded=True,
         use_reloader=False,
-    )
+)
