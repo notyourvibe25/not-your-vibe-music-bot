@@ -53,6 +53,7 @@ def env_int(
     minimum: int,
     maximum: int,
 ) -> int:
+
     raw = env_text(name)
 
     if not raw:
@@ -76,6 +77,7 @@ def env_int(
         name,
         default,
     )
+
     return default
 
 
@@ -83,6 +85,7 @@ def env_bool(
     name: str,
     default: bool = False,
 ) -> bool:
+
     raw = env_text(name).lower()
 
     if not raw:
@@ -104,19 +107,26 @@ BOT_TOKEN = env_text("BOT_TOKEN")
 
 ADMIN_USER_ID = env_text("ADMIN_USER_ID")
 
-DATABASE_URL = env_text("DATABASE_URL")
-
 RENDER_EXTERNAL_URL = env_text("RENDER_EXTERNAL_URL")
 
 if not RENDER_EXTERNAL_URL:
-    hostname = env_text("RENDER_EXTERNAL_HOSTNAME")
+
+    hostname = env_text(
+        "RENDER_EXTERNAL_HOSTNAME"
+    )
 
     if hostname:
-        RENDER_EXTERNAL_URL = f"https://{hostname}"
+        RENDER_EXTERNAL_URL = (
+            f"https://{hostname}"
+        )
 
 
 WEBHOOK_SECRET = env_text(
     "TELEGRAM_WEBHOOK_SECRET"
+)
+
+DATABASE_URL = env_text(
+    "DATABASE_URL"
 )
 
 
@@ -164,11 +174,18 @@ DB_POOL_MAX_CONNECTIONS = env_int(
     30,
 )
 
+RECENT_HISTORY_LIMIT = env_int(
+    "RECENT_HISTORY_LIMIT",
+    40,
+    1,
+    500,
+)
+
 TRACK_CANDIDATE_LIMIT = env_int(
     "TRACK_CANDIDATE_LIMIT",
-    250,
-    20,
-    2000,
+    150,
+    10,
+    1000,
 )
 
 AUTO_SCAN_INTERVAL = env_int(
@@ -199,31 +216,31 @@ DROP_PENDING_UPDATES = env_bool(
 
 
 # ============================================================
-# RADIO SETTINGS
+# RECOMMENDATION SETTINGS
 # ============================================================
 
-# Like mood weight
-LIKE_WEIGHT = 10.0
-
-# Unlike mood weight
-DISLIKE_WEIGHT = -20.0
-
-# Selected mood bonus
-CURRENT_MOOD_WEIGHT = 4.0
-
-# Exploration bonus
-EXPLORATION_WEIGHT = 1.5
-
-# Liked track chance inside a preferred mood
-LIKED_TRACK_CHANCE = 0.78
-
-# Radio history window
-RADIO_HISTORY_LIMIT = env_int(
-    "RADIO_HISTORY_LIMIT",
+# User history အများဆုံး ဘယ်လောက်ကိုကြည့်မလဲ
+RECOMMENDATION_HISTORY_LIMIT = env_int(
+    "RECOMMENDATION_HISTORY_LIMIT",
     100,
     10,
     1000,
 )
+
+# Like signal weight
+LIKE_WEIGHT = 10.0
+
+# Not-for-me signal
+DISLIKE_WEIGHT = -14.0
+
+# Next ကို neutral / slight negative
+NEXT_WEIGHT = -1.5
+
+# Same mood preference
+MOOD_PREFERENCE_WEIGHT = 3.0
+
+# Radio random variation
+RADIO_RANDOMNESS = 8.0
 
 
 # ============================================================
@@ -311,7 +328,7 @@ MOOD_INFO = {
 
 
 # ============================================================
-# 8 MOOD CHANNELS
+# CHANNELS
 # ============================================================
 
 MOOD_CHANNELS = {
@@ -401,12 +418,6 @@ pending_music_lock = threading.Lock()
 
 CHANNEL_MOOD_MAP: dict[str, str] = {}
 
-last_scan_time = 0
-
-last_scan_counts: dict[str, int] = {
-    mood: 0 for mood in MOODS
-}
-
 
 # ============================================================
 # DATABASE URL
@@ -431,6 +442,7 @@ def initialize_db_pool() -> None:
     global db_pool
 
     if not DATABASE_URL:
+
         raise RuntimeError(
             "DATABASE_URL is missing"
         )
@@ -444,19 +456,24 @@ def initialize_db_pool() -> None:
             )
 
             db_pool = ThreadedConnectionPool(
+
                 1,
+
                 DB_POOL_MAX_CONNECTIONS,
+
                 dsn=normalize_database_url(
                     DATABASE_URL
                 ),
+
                 connect_timeout=10,
+
                 application_name=(
                     "not-your-vibe-music-bot"
                 ),
             )
 
             logger.info(
-                "🟢 PostgreSQL pool created"
+                "PostgreSQL connection pool created"
             )
 
 
@@ -552,8 +569,11 @@ def db_cursor(
     )
 
     try:
+
         yield cursor
+
     finally:
+
         cursor.close()
 
 
@@ -568,52 +588,85 @@ def init_db() -> None:
     schema = """
 
     CREATE TABLE IF NOT EXISTS users (
+
         user_id BIGINT PRIMARY KEY,
+
         username TEXT,
+
         first_name TEXT,
+
         last_name TEXT,
+
         first_seen BIGINT NOT NULL,
+
         last_seen BIGINT NOT NULL,
+
         total_requests BIGINT NOT NULL DEFAULT 0
+
     );
 
 
     CREATE TABLE IF NOT EXISTS tracks (
+
         id BIGSERIAL PRIMARY KEY,
+
         mood TEXT NOT NULL,
+
         channel_id TEXT NOT NULL,
+
         message_id BIGINT NOT NULL,
+
         created_at BIGINT NOT NULL,
 
         UNIQUE(channel_id, message_id)
+
     );
 
 
     CREATE TABLE IF NOT EXISTS user_history (
+
         id BIGSERIAL PRIMARY KEY,
+
         user_id BIGINT NOT NULL,
+
         mood TEXT NOT NULL,
+
         channel_id TEXT NOT NULL,
+
         message_id BIGINT NOT NULL,
+
         action TEXT NOT NULL DEFAULT 'served',
+
         sent_at BIGINT NOT NULL
+
     );
 
 
     CREATE TABLE IF NOT EXISTS user_state (
+
         user_id BIGINT PRIMARY KEY,
+
         mood TEXT,
+
         radio_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+
+        radio_index INTEGER NOT NULL DEFAULT 0,
+
         updated_at BIGINT NOT NULL
+
     );
 
 
     CREATE TABLE IF NOT EXISTS track_feedback (
+
         id BIGSERIAL PRIMARY KEY,
 
         user_id BIGINT NOT NULL,
+
         channel_id TEXT NOT NULL,
+
         message_id BIGINT NOT NULL,
+
         mood TEXT NOT NULL,
 
         feedback TEXT NOT NULL,
@@ -625,42 +678,53 @@ def init_db() -> None:
             channel_id,
             message_id
         )
+
     );
 
 
     CREATE TABLE IF NOT EXISTS processed_updates (
+
         update_id BIGINT PRIMARY KEY,
+
         processed_at BIGINT NOT NULL
+
     );
 
 
     CREATE INDEX IF NOT EXISTS
-    idx_tracks_mood
-    ON tracks(mood);
+        idx_tracks_mood
+        ON tracks(mood);
 
 
     CREATE INDEX IF NOT EXISTS
-    idx_history_user
-    ON user_history(
-        user_id,
-        sent_at DESC
-    );
+        idx_history_user
+        ON user_history(
+            user_id,
+            sent_at DESC
+        );
 
 
     CREATE INDEX IF NOT EXISTS
-    idx_feedback_user
-    ON track_feedback(
-        user_id,
-        created_at DESC
-    );
+        idx_feedback_user
+        ON track_feedback(
+            user_id,
+            created_at DESC
+        );
 
 
     CREATE INDEX IF NOT EXISTS
-    idx_feedback_track
-    ON track_feedback(
-        channel_id,
-        message_id
-    );
+        idx_feedback_track
+        ON track_feedback(
+            channel_id,
+            message_id
+        );
+
+
+    CREATE INDEX IF NOT EXISTS
+        idx_processed_updates_time
+        ON processed_updates(
+            processed_at
+        );
 
     """
 
@@ -671,6 +735,7 @@ def init_db() -> None:
 
         cursor.execute(schema)
 
+        # Existing DB হলে নতুন column ထည့်ရန်
         cursor.execute(
             """
             ALTER TABLE user_history
@@ -689,6 +754,14 @@ def init_db() -> None:
 
         cursor.execute(
             """
+            ALTER TABLE user_state
+            ADD COLUMN IF NOT EXISTS radio_index
+            INTEGER NOT NULL DEFAULT 0
+            """
+        )
+
+        cursor.execute(
+            """
             DELETE FROM processed_updates
             WHERE processed_at < %s
             """,
@@ -698,7 +771,7 @@ def init_db() -> None:
         )
 
     logger.info(
-        "🟢 PostgreSQL database ready"
+        "🟢 PostgreSQL database is ready"
     )
 
 
@@ -750,14 +823,15 @@ def claim_update(
     except Exception:
 
         logger.exception(
-            "Could not claim update"
+            "Could not deduplicate update %s",
+            update_id,
         )
 
         return True
 
 
 # ============================================================
-# USERS
+# USER
 # ============================================================
 
 def register_user(
@@ -776,9 +850,9 @@ def register_user(
     ):
         return
 
-    now = int(time.time())
-
     try:
+
+        now = int(time.time())
 
         with (
             db_connection() as connection,
@@ -796,11 +870,19 @@ def register_user(
                     last_seen,
                     total_requests
                 )
-                VALUES(
-                    %s,%s,%s,%s,%s,%s,1
+
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    1
                 )
 
-                ON CONFLICT(user_id)
+                ON CONFLICT (user_id)
+
                 DO UPDATE SET
 
                     username =
@@ -836,6 +918,10 @@ def register_user(
         )
 
 
+# ============================================================
+# USER COUNT
+# ============================================================
+
 def get_users_count() -> int:
 
     try:
@@ -854,14 +940,196 @@ def get_users_count() -> int:
 
             row = cursor.fetchone()
 
-            return int(
-                row["count"]
-            ) if row else 0
+            return (
+                int(row["count"])
+                if row
+                else 0
+            )
 
     except Exception:
 
         logger.exception(
             "Could not count users"
+        )
+
+        return 0
+
+
+# ============================================================
+# TRACK
+# ============================================================
+
+def save_track(
+    mood: str,
+    channel_id: Any,
+    message_id: Any,
+) -> bool:
+
+    if (
+        mood not in MOODS
+        or not channel_id
+        or not message_id
+    ):
+        return False
+
+    try:
+
+        channel_id = str(
+            channel_id
+        )
+
+        message_id = int(
+            message_id
+        )
+
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+
+            cursor.execute(
+                """
+                INSERT INTO tracks(
+                    mood,
+                    channel_id,
+                    message_id,
+                    created_at
+                )
+
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+
+                ON CONFLICT (
+                    channel_id,
+                    message_id
+                )
+
+                DO NOTHING
+
+                RETURNING id
+                """,
+                (
+                    mood,
+                    channel_id,
+                    message_id,
+                    int(time.time()),
+                ),
+            )
+
+            inserted = (
+                cursor.fetchone()
+                is not None
+            )
+
+            if inserted:
+
+                logger.info(
+                    (
+                        "🎵 NEW TRACK | %s | "
+                        "channel=%s | message=%s"
+                    ),
+                    mood.upper(),
+                    channel_id,
+                    message_id,
+                )
+
+            return inserted
+
+    except Exception:
+
+        logger.exception(
+            "Could not save track"
+        )
+
+        return False
+
+
+# ============================================================
+# TRACK COUNTS
+# ============================================================
+
+def get_track_counts() -> dict[str, int]:
+
+    counts = {
+        mood: 0
+        for mood in MOODS
+    }
+
+    try:
+
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+
+            cursor.execute(
+                """
+                SELECT
+                    mood,
+                    COUNT(*) AS count
+                FROM tracks
+                GROUP BY mood
+                """
+            )
+
+            for row in cursor.fetchall():
+
+                mood = row["mood"]
+
+                if mood in counts:
+
+                    counts[mood] = int(
+                        row["count"]
+                    )
+
+    except Exception:
+
+        logger.exception(
+            "Could not collect track counts"
+        )
+
+    return counts
+
+
+def get_track_count(
+    mood: str,
+) -> int:
+
+    if mood not in MOODS:
+        return 0
+
+    try:
+
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM tracks
+                WHERE mood=%s
+                """,
+                (mood,),
+            )
+
+            row = cursor.fetchone()
+
+            return (
+                int(row["count"])
+                if row
+                else 0
+            )
+
+    except Exception:
+
+        logger.exception(
+            "Could not count tracks"
         )
 
         return 0
@@ -876,7 +1144,10 @@ def set_user_mood(
     mood: str,
 ) -> bool:
 
-    if mood not in MOODS:
+    if (
+        not isinstance(user_id, int)
+        or mood not in MOODS
+    ):
         return False
 
     try:
@@ -895,14 +1166,15 @@ def set_user_mood(
                     updated_at
                 )
 
-                VALUES(
+                VALUES (
                     %s,
                     %s,
                     FALSE,
                     %s
                 )
 
-                ON CONFLICT(user_id)
+                ON CONFLICT (user_id)
+
                 DO UPDATE SET
 
                     mood =
@@ -958,6 +1230,7 @@ def get_user_mood(
                 row
                 and row["mood"] in MOODS
             ):
+
                 return row["mood"]
 
     except Exception:
@@ -972,212 +1245,56 @@ def get_user_mood(
 def set_radio_mode(
     user_id: int,
     enabled: bool,
-) -> None:
-
+) -> bool:
+    """Start/stop a Radio session. Starting Radio resets its sequence."""
     try:
-
         with (
             db_connection() as connection,
             db_cursor(connection) as cursor
         ):
-
             cursor.execute(
                 """
                 INSERT INTO user_state(
-                    user_id,
-                    mood,
-                    radio_enabled,
-                    updated_at
+                    user_id, mood, radio_enabled, radio_index, updated_at
                 )
-
-                VALUES(
-                    %s,
-                    NULL,
-                    %s,
-                    %s
-                )
-
-                ON CONFLICT(user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id)
                 DO UPDATE SET
-
-                    radio_enabled =
-                        EXCLUDED.radio_enabled,
-
-                    updated_at =
-                        EXCLUDED.updated_at
+                    radio_enabled = EXCLUDED.radio_enabled,
+                    radio_index = CASE
+                        WHEN EXCLUDED.radio_enabled THEN 0
+                        ELSE user_state.radio_index
+                    END,
+                    updated_at = EXCLUDED.updated_at
                 """,
-                (
-                    user_id,
-                    enabled,
-                    int(time.time()),
-                ),
+                (user_id, None, enabled, 0, int(time.time())),
             )
-
+        return True
     except Exception:
-
-        logger.exception(
-            "Could not change radio mode"
-        )
-
-
-# ============================================================
-# TRACKS
-# ============================================================
-
-def save_track(
-    mood: str,
-    channel_id: Any,
-    message_id: Any,
-) -> bool:
-
-    if (
-        mood not in MOODS
-        or not channel_id
-        or not message_id
-    ):
-        return False
-
-    try:
-
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-
-            cursor.execute(
-                """
-                INSERT INTO tracks(
-                    mood,
-                    channel_id,
-                    message_id,
-                    created_at
-                )
-
-                VALUES(
-                    %s,%s,%s,%s
-                )
-
-                ON CONFLICT(
-                    channel_id,
-                    message_id
-                )
-                DO UPDATE SET
-                    mood = EXCLUDED.mood
-
-                RETURNING id
-                """,
-                (
-                    mood,
-                    str(channel_id),
-                    int(message_id),
-                    int(time.time()),
-                ),
-            )
-
-            inserted = (
-                cursor.fetchone()
-                is not None
-            )
-
-            if inserted:
-
-                logger.info(
-                    "🎵 TRACK | %s | %s | %s",
-                    mood.upper(),
-                    channel_id,
-                    message_id,
-                )
-
-            return inserted
-
-    except Exception:
-
-        logger.exception(
-            "Could not save track"
-        )
-
+        logger.exception("Could not change radio mode")
         return False
 
 
-def get_track_counts() -> dict[str, int]:
-
-    counts = {
-        mood: 0
-        for mood in MOODS
-    }
-
+def get_radio_index(user_id: int) -> int:
     try:
-
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-
-            cursor.execute(
-                """
-                SELECT
-                    mood,
-                    COUNT(*) AS count
-                FROM tracks
-                GROUP BY mood
-                """
-            )
-
-            for row in cursor.fetchall():
-
-                mood = row["mood"]
-
-                if mood in counts:
-
-                    counts[mood] = int(
-                        row["count"]
-                    )
-
-    except Exception:
-
-        logger.exception(
-            "Could not get track counts"
-        )
-
-    return counts
-
-
-def get_track_count(
-    mood: str,
-) -> int:
-
-    if mood not in MOODS:
-        return 0
-
-    try:
-
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-
-            cursor.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM tracks
-                WHERE mood=%s
-                """,
-                (mood,),
-            )
-
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            cursor.execute("SELECT radio_index FROM user_state WHERE user_id=%s", (user_id,))
             row = cursor.fetchone()
-
-            return int(
-                row["count"]
-            ) if row else 0
-
+            return int(row["radio_index"]) if row else 0
     except Exception:
-
-        logger.exception(
-            "Could not count tracks"
-        )
-
+        logger.exception("Could not read radio index")
         return 0
+
+
+def increment_radio_index(user_id: int) -> None:
+    try:
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            cursor.execute(
+                "UPDATE user_state SET radio_index=radio_index+1, updated_at=%s WHERE user_id=%s",
+                (int(time.time()), user_id),
+            )
+    except Exception:
+        logger.exception("Could not increment radio index")
 
 
 # ============================================================
@@ -1192,13 +1309,13 @@ def save_feedback(
     feedback: str,
 ) -> bool:
 
-    if feedback not in {
-        "like",
-        "not_for_me",
-    }:
-        return False
-
-    if mood not in MOODS:
+    if (
+        feedback not in {
+            "like",
+            "not_for_me",
+        }
+        or mood not in MOODS
+    ):
         return False
 
     try:
@@ -1219,11 +1336,16 @@ def save_feedback(
                     created_at
                 )
 
-                VALUES(
-                    %s,%s,%s,%s,%s,%s
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
                 )
 
-                ON CONFLICT(
+                ON CONFLICT (
                     user_id,
                     channel_id,
                     message_id
@@ -1304,93 +1426,8 @@ def get_feedback(
     return None
 
 
-def clear_feedback(
-    user_id: int,
-    channel_id: str,
-    message_id: int,
-) -> bool:
-
-    try:
-
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-
-            cursor.execute(
-                """
-                DELETE FROM track_feedback
-
-                WHERE user_id=%s
-                AND channel_id=%s
-                AND message_id=%s
-                """,
-                (
-                    user_id,
-                    str(channel_id),
-                    int(message_id),
-                ),
-            )
-
-        return True
-
-    except Exception:
-
-        logger.exception(
-            "Could not clear feedback"
-        )
-
-        return False
-
-
-def get_feedback_map(
-    user_id: int,
-) -> dict[tuple[str, int], str]:
-
-    result: dict[
-        tuple[str, int],
-        str
-    ] = {}
-
-    try:
-
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-
-            cursor.execute(
-                """
-                SELECT
-                    channel_id,
-                    message_id,
-                    feedback
-                FROM track_feedback
-                WHERE user_id=%s
-                """,
-                (user_id,),
-            )
-
-            for row in cursor.fetchall():
-
-                result[
-                    (
-                        str(row["channel_id"]),
-                        int(row["message_id"]),
-                    )
-                ] = row["feedback"]
-
-    except Exception:
-
-        logger.exception(
-            "Could not get feedback map"
-        )
-
-    return result
-
-
 # ============================================================
-# USER HISTORY
+# HISTORY
 # ============================================================
 
 def save_history(
@@ -1398,7 +1435,7 @@ def save_history(
     mood: str,
     channel_id: str,
     message_id: int,
-    action: str = "served",
+    action: str,
 ) -> None:
 
     try:
@@ -1419,8 +1456,13 @@ def save_history(
                     sent_at
                 )
 
-                VALUES(
-                    %s,%s,%s,%s,%s,%s
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
                 )
                 """,
                 (
@@ -1440,13 +1482,11 @@ def save_history(
         )
 
 
-def get_served_history(
+def remove_latest_history(
     user_id: int,
-) -> set[tuple[str, int]]:
-
-    result: set[
-        tuple[str, int]
-    ] = set()
+    channel_id: str,
+    message_id: int,
+) -> None:
 
     try:
 
@@ -1457,504 +1497,394 @@ def get_served_history(
 
             cursor.execute(
                 """
-                SELECT
-                    channel_id,
-                    message_id
+                DELETE FROM user_history
 
-                FROM user_history
+                WHERE id = (
 
-                WHERE user_id=%s
-                AND action='served'
+                    SELECT id
+                    FROM user_history
 
-                ORDER BY sent_at DESC, id DESC
+                    WHERE user_id=%s
+                    AND channel_id=%s
+                    AND message_id=%s
 
-                LIMIT %s
+                    ORDER BY id DESC
+
+                    LIMIT 1
+                )
                 """,
                 (
                     user_id,
-                    RADIO_HISTORY_LIMIT,
+                    str(channel_id),
+                    int(message_id),
                 ),
             )
-
-            for row in cursor.fetchall():
-
-                result.add(
-                    (
-                        str(row["channel_id"]),
-                        int(row["message_id"]),
-                    )
-                )
 
     except Exception:
 
         logger.exception(
-            "Could not get history"
+            "Could not remove history"
         )
 
-    return result
-
 
 # ============================================================
-# TRACK CANDIDATES
+# RULE-BASED RECOMMENDATION ENGINE
 # ============================================================
+#
+# NEXT and RADIO deliberately do different jobs:
+# - NEXT stays in the current mood and prioritizes a fresh, non-disliked track.
+# - RADIO chooses a mood from the user's overall Like / Not-for-me / Next history,
+#   then chooses a fresh track from that mood. No AI or song keywords are needed.
+#
 
-def get_tracks_for_mood(
-    mood: str,
-) -> list[tuple[int, str]]:
-
-    if mood not in MOODS:
-        return []
-
-    try:
-
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-
-            cursor.execute(
-                """
-                SELECT
-                    message_id,
-                    channel_id
-
-                FROM tracks
-
-                WHERE mood=%s
-
-                ORDER BY RANDOM()
-
-                LIMIT %s
-                """,
-                (
-                    mood,
-                    TRACK_CANDIDATE_LIMIT,
-                ),
-            )
-
-            return [
-                (
-                    int(row["message_id"]),
-                    str(row["channel_id"]),
-                )
-                for row in cursor.fetchall()
-            ]
-
-    except Exception:
-
-        logger.exception(
-            "Could not get candidate tracks"
-        )
-
-        return []
+TrackChoice = tuple[str, int, str]
 
 
-# ============================================================
-# MOOD PREFERENCE
-# ============================================================
-
-def get_mood_preferences(
+def get_user_preferences(
     user_id: int,
 ) -> dict[str, dict[str, float]]:
-
-    result = {
-        mood: {
-            "like": 0.0,
-            "not_for_me": 0.0,
-        }
+    preferences = {
+        mood: {"like": 0.0, "not_for_me": 0.0, "next": 0.0}
         for mood in MOODS
     }
 
     try:
-
         with (
             db_connection() as connection,
             db_cursor(connection) as cursor
         ):
-
             cursor.execute(
                 """
-                SELECT
-                    mood,
-                    feedback,
-                    COUNT(*) AS count
-
+                SELECT mood, feedback, COUNT(*) AS count
                 FROM track_feedback
-
                 WHERE user_id=%s
-
-                GROUP BY
-                    mood,
-                    feedback
+                GROUP BY mood, feedback
                 """,
                 (user_id,),
             )
-
             for row in cursor.fetchall():
-
                 mood = row["mood"]
                 feedback = row["feedback"]
+                if mood in preferences and feedback in preferences[mood]:
+                    preferences[mood][feedback] = float(row["count"])
 
-                if (
-                    mood in result
-                    and feedback in result[mood]
-                ):
-
-                    result[mood][feedback] = float(
-                        row["count"]
-                    )
-
+            cursor.execute(
+                """
+                SELECT mood, COUNT(*) AS count
+                FROM user_history
+                WHERE user_id=%s AND action='next'
+                GROUP BY mood
+                """,
+                (user_id,),
+            )
+            for row in cursor.fetchall():
+                if row["mood"] in preferences:
+                    preferences[row["mood"]]["next"] = float(row["count"])
     except Exception:
+        logger.exception("Could not calculate user preferences")
 
-        logger.exception(
-            "Could not calculate preferences"
-        )
+    return preferences
 
+
+def calculate_mood_score(
+    preference: dict[str, float],
+    is_current_mood: bool,
+) -> float:
+    """Turn explicit user actions into one comparable mood score."""
+    score = 8.0
+    if is_current_mood:
+        score += MOOD_PREFERENCE_WEIGHT
+    score += preference.get("like", 0.0) * LIKE_WEIGHT
+    score += preference.get("not_for_me", 0.0) * DISLIKE_WEIGHT
+    score += preference.get("next", 0.0) * NEXT_WEIGHT
+    return score
+
+
+def get_recent_tracks(
+    user_id: int,
+    mood: Optional[str] = None,
+) -> set[tuple[str, int]]:
+    result: set[tuple[str, int]] = set()
+    try:
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+            if mood:
+                cursor.execute(
+                    """
+                    SELECT channel_id, message_id
+                    FROM user_history
+                    WHERE user_id=%s AND mood=%s AND action='served'
+                    ORDER BY sent_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (user_id, mood, RECOMMENDATION_HISTORY_LIMIT),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT channel_id, message_id
+                    FROM user_history
+                    WHERE user_id=%s AND action='served'
+                    ORDER BY sent_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (user_id, RECOMMENDATION_HISTORY_LIMIT),
+                )
+            result = {
+                (str(row["channel_id"]), int(row["message_id"]))
+                for row in cursor.fetchall()
+            }
+    except Exception:
+        logger.exception("Could not get recent history")
     return result
 
 
-# ============================================================
-# RADIO MOOD SCORE
-# ============================================================
+def get_feedback_map(
+    user_id: int,
+) -> dict[tuple[str, int], str]:
+    """Fetch all feedback once; avoid one database query per candidate track."""
+    result: dict[tuple[str, int], str] = {}
+    try:
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+            cursor.execute(
+                """
+                SELECT channel_id, message_id, feedback
+                FROM track_feedback
+                WHERE user_id=%s
+                """,
+                (user_id,),
+            )
+            result = {
+                (str(row["channel_id"]), int(row["message_id"])): row["feedback"]
+                for row in cursor.fetchall()
+            }
+    except Exception:
+        logger.exception("Could not get user feedback map")
+    return result
 
-def radio_mood_score(
+
+def get_candidate_tracks(
     mood: str,
-    current_mood: str,
-    preferences: dict[str, dict[str, float]],
-) -> float:
-
-    p = preferences[mood]
-
-    likes = p["like"]
-
-    dislikes = p["not_for_me"]
-
-    score = 1.0
-
-    # User's selected mood gets a small bonus.
-    if mood == current_mood:
-        score += CURRENT_MOOD_WEIGHT
-
-    # Likes are the main signal.
-    score += likes * LIKE_WEIGHT
-
-    # Unlike is a strong negative signal.
-    score += dislikes * DISLIKE_WEIGHT
-
-    # Every available mood gets some exploration.
-    if likes == 0:
-        score += EXPLORATION_WEIGHT
-
-    return max(
-        0.2,
-        score,
-    )
+) -> list[tuple[int, str]]:
+    candidates: list[tuple[int, str]] = []
+    try:
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+            cursor.execute(
+                """
+                SELECT message_id, channel_id
+                FROM tracks
+                WHERE mood=%s
+                ORDER BY RANDOM()
+                LIMIT %s
+                """,
+                (mood, TRACK_CANDIDATE_LIMIT),
+            )
+            candidates = [
+                (int(row["message_id"]), str(row["channel_id"]))
+                for row in cursor.fetchall()
+            ]
+    except Exception:
+        logger.exception("Could not get candidate tracks")
+    return candidates
 
 
-# ============================================================
-# RADIO MOOD
-# ============================================================
+def choose_next_track(
+    user_id: int,
+    mood: str,
+) -> Optional[TrackChoice]:
+    """NEXT remains in the selected mood and strongly avoids repeats/dislikes."""
+    candidates = get_candidate_tracks(mood)
+    if not candidates:
+        return None
+
+    feedback = get_feedback_map(user_id)
+    recent = get_recent_tracks(user_id, mood)
+    allowed = [
+        track for track in candidates
+        if feedback.get((track[1], track[0])) != "not_for_me"
+    ]
+    if not allowed:
+        return None
+
+    fresh = [
+        track for track in allowed
+        if (track[1], track[0]) not in recent
+    ]
+    pool = fresh or allowed
+    message_id, channel_id = random.choice(pool)
+    return mood, message_id, channel_id
+
+
+def get_mood_like_ratios(user_id: int) -> dict[str, float]:
+    """Like ratio = likes / (likes + not-for-me + next).
+
+    Moods with no feedback get 0.0, so actual user taste drives Radio.
+    """
+    prefs = get_user_preferences(user_id)
+    ratios: dict[str, float] = {}
+    for mood in MOODS:
+        p = prefs[mood]
+        total = p["like"] + p["not_for_me"] + p["next"]
+        ratios[mood] = (p["like"] / total) if total > 0 else 0.0
+    return ratios
+
 
 def choose_radio_mood(
     user_id: int,
     current_mood: str,
 ) -> Optional[str]:
+    """
+    Radio is NOT controlled by the selected mood.
 
-    counts = get_track_counts()
-
-    available = [
-        mood
-        for mood in MOODS
-        if counts.get(mood, 0) > 0
-    ]
-
+    First Radio track: always the mood with the user's highest like ratio.
+    Following tracks: weighted mix using each mood's like ratio, while
+    giving the highest-ratio mood the strongest weight.
+    """
+    available = [m for m, count in get_track_counts().items() if count > 0]
     if not available:
         return None
 
-    preferences = get_mood_preferences(
-        user_id
-    )
+    ratios = get_mood_like_ratios(user_id)
+    ordered = sorted(available, key=lambda m: ratios.get(m, 0.0), reverse=True)
+    radio_index = get_radio_index(user_id)
 
-    weights = [
-        radio_mood_score(
-            mood,
-            current_mood,
-            preferences,
-        )
-        for mood in available
-    ]
+    # First track after pressing RADIO: highest like-ratio mood.
+    if radio_index == 0:
+        top_ratio = ratios.get(ordered[0], 0.0)
+        if top_ratio > 0:
+            return ordered[0]
+        # No feedback yet: only then use the selected mood as a neutral fallback.
+        return current_mood if current_mood in available else ordered[0]
 
-    selected = random.choices(
-        available,
-        weights=weights,
-        k=1,
-    )[0]
+    # Subsequent Radio tracks: explore other moods according to like ratio.
+    # Small exploration floor keeps Radio from becoming a single-mood loop.
+    weights = []
+    for mood in available:
+        ratio = ratios.get(mood, 0.0)
+        weights.append(max(0.08, ratio) ** 1.35)
+    return random.choices(available, weights=weights, k=1)[0]
 
-    logger.info(
-        "📻 RADIO MOOD | user=%s | current=%s | selected=%s | weights=%s",
-        user_id,
-        current_mood,
-        selected,
-        dict(
-            zip(
-                available,
-                weights,
-            )
-        ),
-    )
-
-    return selected
-
-
-# ============================================================
-# RADIO TRACK
-# ============================================================
 
 def choose_radio_track(
     user_id: int,
     current_mood: str,
-) -> Optional[
-    tuple[str, int, str]
-]:
-
-    radio_mood = choose_radio_mood(
-        user_id,
-        current_mood,
-    )
-
+) -> Optional[TrackChoice]:
+    """RADIO may change mood, favours liked tracks, and still avoids repetition."""
+    radio_mood = choose_radio_mood(user_id, current_mood)
     if not radio_mood:
         return None
 
-    candidates = get_tracks_for_mood(
-        radio_mood
-    )
-
+    candidates = get_candidate_tracks(radio_mood)
     if not candidates:
         return None
 
-    feedback = get_feedback_map(
-        user_id
-    )
-
-    history = get_served_history(
-        user_id
-    )
-
-    # Never recommend tracks marked Not For Me.
+    feedback = get_feedback_map(user_id)
+    recent = get_recent_tracks(user_id)
     allowed = [
-        track
-        for track in candidates
-        if feedback.get(
-            (
-                track[1],
-                track[0],
-            )
-        ) != "not_for_me"
+        track for track in candidates
+        if feedback.get((track[1], track[0])) != "not_for_me"
     ]
-
     if not allowed:
         return None
 
+    fresh = [
+        track for track in allowed
+        if (track[1], track[0]) not in recent
+    ]
+    pool = fresh or allowed
     liked = [
-        track
-        for track in allowed
-        if feedback.get(
-            (
-                track[1],
-                track[0],
-            )
-        ) == "like"
+        track for track in pool
+        if feedback.get((track[1], track[0])) == "like"
     ]
 
-    unseen = [
-        track
-        for track in allowed
-        if (
-            track[1],
-            track[0],
-        ) not in history
-    ]
+    # Use a liked track more often, but preserve exploration and variety.
+    if liked and random.random() < 0.65:
+        pool = liked
 
-    # --------------------------------------------------------
-    # PRIORITY 1
-    # User liked a track in this mood.
-    # Radio can replay liked tracks.
-    # --------------------------------------------------------
-
-    if liked and random.random() < LIKED_TRACK_CHANCE:
-
-        message_id, channel_id = random.choice(
-            liked
-        )
-
-        return (
-            radio_mood,
-            message_id,
-            channel_id,
-        )
-
-    # --------------------------------------------------------
-    # PRIORITY 2
-    # New / unseen track.
-    # --------------------------------------------------------
-
-    if unseen:
-
-        message_id, channel_id = random.choice(
-            unseen
-        )
-
-        return (
-            radio_mood,
-            message_id,
-            channel_id,
-        )
-
-    # --------------------------------------------------------
-    # PRIORITY 3
-    # Everything allowed.
-    # --------------------------------------------------------
-
-    message_id, channel_id = random.choice(
-        allowed
-    )
-
-    return (
-        radio_mood,
-        message_id,
-        channel_id,
-    )
+    message_id, channel_id = random.choice(pool)
+    return radio_mood, message_id, channel_id
 
 
-# ============================================================
-# NORMAL NEXT
-# ============================================================
-
-def choose_next_track(
+def record_next_signal(
     user_id: int,
     mood: str,
-) -> Optional[
-    tuple[str, int, str]
-]:
-
-    candidates = get_tracks_for_mood(
-        mood
-    )
-
-    if not candidates:
-        return None
-
-    feedback = get_feedback_map(
-        user_id
-    )
-
-    history = get_served_history(
-        user_id
-    )
-
-    allowed = [
-        track
-        for track in candidates
-
-        if feedback.get(
-            (
-                track[1],
-                track[0],
-            )
-        ) != "not_for_me"
-    ]
-
-    if not allowed:
-        return None
-
-    # NEXT strongly prefers unseen tracks.
-    unseen = [
-        track
-        for track in allowed
-
-        if (
-            track[1],
-            track[0],
-        ) not in history
-    ]
-
-    pool = unseen or allowed
-
-    message_id, channel_id = random.choice(
-        pool
-    )
-
-    return (
-        mood,
-        message_id,
-        channel_id,
-    )
-
-
-# ============================================================
-# RESERVATION
-# ============================================================
-
-def reserve_track(
-    user_id: int,
-    choice: Optional[
-        tuple[str, int, str]
-    ],
-) -> Optional[
-    tuple[str, int, str]
-]:
-
-    if not choice:
-        return None
-
-    mood, message_id, channel_id = choice
-
+) -> None:
+    """Record a NEXT action as a light negative signal for Radio mood choice."""
     try:
-
         with (
             db_connection() as connection,
             db_cursor(connection) as cursor
         ):
-
-            # Prevent two simultaneous requests
-            # from selecting the same user state.
-            cursor.execute(
-                "SELECT pg_advisory_xact_lock(%s)",
-                (user_id,),
-            )
-
             cursor.execute(
                 """
                 INSERT INTO user_history(
-                    user_id,
-                    mood,
-                    channel_id,
-                    message_id,
-                    action,
-                    sent_at
-                )
-
-                VALUES(
-                    %s,%s,%s,%s,'served',%s
-                )
+                    user_id, mood, channel_id, message_id, action, sent_at
+                ) VALUES (%s, %s, 'next', 0, 'next', %s)
                 """,
-                (
-                    user_id,
-                    mood,
-                    channel_id,
-                    message_id,
-                    int(time.time()),
-                ),
+                (user_id, mood, int(time.time())),
             )
-
-        return choice
-
     except Exception:
+        logger.exception("Could not save NEXT signal")
 
-        logger.exception(
-            "Could not reserve track"
-        )
 
+# ============================================================
+# TRACK RESERVATION
+# ============================================================
+
+def reserve_next_track(
+    user_id: int,
+    mood: str,
+) -> Optional[TrackChoice]:
+    return reserve_selected_track(
+        user_id,
+        choose_next_track(user_id, mood),
+    )
+
+
+def reserve_radio_track(
+    user_id: int,
+    current_mood: str,
+) -> Optional[TrackChoice]:
+    choice = choose_radio_track(user_id, current_mood)
+    reserved = reserve_selected_track(user_id, choice)
+    if reserved:
+        increment_radio_index(user_id)
+    return reserved
+
+
+def reserve_selected_track(
+    user_id: int,
+    choice: Optional[TrackChoice],
+) -> Optional[TrackChoice]:
+    if not choice:
+        return None
+
+    mood, message_id, channel_id = choice
+    try:
+        with (
+            db_connection() as connection,
+            db_cursor(connection) as cursor
+        ):
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
+            cursor.execute(
+                """
+                INSERT INTO user_history(
+                    user_id, mood, channel_id, message_id, action, sent_at
+                ) VALUES (%s, %s, %s, %s, 'served', %s)
+                """,
+                (user_id, mood, channel_id, message_id, int(time.time())),
+            )
+        return choice
+    except Exception:
+        logger.exception("Could not reserve selected track")
         return None
 
 
@@ -1977,7 +1907,7 @@ def get_http_session() -> requests.Session:
         session.headers.update(
             {
                 "User-Agent":
-                "NOT-YOUR-VIBE-MUSIC-BOT/5.0"
+                    "NOT-YOUR-VIBE-MUSIC-BOT/3.0"
             }
         )
 
@@ -2073,12 +2003,19 @@ def send_message(
 ) -> dict[str, Any]:
 
     data: dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
+
+        "chat_id":
+            chat_id,
+
+        "text":
+            text,
+
+        "disable_web_page_preview":
+            True,
     }
 
     if keyboard is not None:
+
         data["reply_markup"] = keyboard
 
     return telegram(
@@ -2088,33 +2025,17 @@ def send_message(
     )
 
 
-def edit_message_keyboard(
-    chat_id: int,
-    message_id: int,
-    keyboard: dict[str, Any],
-) -> None:
-
-    telegram(
-        "editMessageReplyMarkup",
-        {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "reply_markup": keyboard,
-        },
-        timeout=15,
-    )
-
-
 def answer_callback(
     callback_id: Any,
     text: str = "",
-) -> None:
+) -> dict[str, Any]:
 
-    telegram(
+    return telegram(
         "answerCallbackQuery",
         {
             "callback_query_id":
                 callback_id,
+
             "text":
                 text,
         },
@@ -2131,31 +2052,40 @@ def copy_music(
     return telegram(
         "copyMessage",
         {
-            "chat_id": chat_id,
-            "from_chat_id": channel_id,
-            "message_id": message_id,
+            "chat_id":
+                chat_id,
+
+            "from_chat_id":
+                channel_id,
+
+            "message_id":
+                message_id,
         },
         timeout=30,
     )
 
 
 # ============================================================
-# MOOD MENU
+# PREMIUM MOOD MENU
 # ============================================================
 
 def mood_menu() -> dict[str, Any]:
 
     return {
+
         "inline_keyboard": [
 
             [
                 {
-                    "text": "😢 SAD",
+                    "text":
+                        "😢  SAD",
                     "callback_data":
                         "mood_sad",
                 },
+
                 {
-                    "text": "❤️ LOVE",
+                    "text":
+                        "❤️  LOVE",
                     "callback_data":
                         "mood_love",
                 },
@@ -2163,12 +2093,15 @@ def mood_menu() -> dict[str, Any]:
 
             [
                 {
-                    "text": "🌙 CHILL",
+                    "text":
+                        "🌙  CHILL",
                     "callback_data":
                         "mood_chill",
                 },
+
                 {
-                    "text": "🔥 HYPE",
+                    "text":
+                        "🔥  HYPE",
                     "callback_data":
                         "mood_hype",
                 },
@@ -2176,12 +2109,15 @@ def mood_menu() -> dict[str, Any]:
 
             [
                 {
-                    "text": "🖤 DARK",
+                    "text":
+                        "🖤  DARK",
                     "callback_data":
                         "mood_dark",
                 },
+
                 {
-                    "text": "⚡ ENERGETIC",
+                    "text":
+                        "⚡  ENERGETIC",
                     "callback_data":
                         "mood_energetic",
                 },
@@ -2189,12 +2125,15 @@ def mood_menu() -> dict[str, Any]:
 
             [
                 {
-                    "text": "🚗 NIGHT DRIVE",
+                    "text":
+                        "🚗  NIGHT DRIVE",
                     "callback_data":
                         "mood_night",
                 },
+
                 {
-                    "text": "🌌 MELODIC",
+                    "text":
+                        "🌌  MELODIC",
                     "callback_data":
                         "mood_melodic",
                 },
@@ -2221,19 +2160,18 @@ def music_buttons(
         message_id,
     )
 
-    like_text = (
-        "❤️✓"
-        if feedback == "like"
-        else "❤️"
-    )
+    like_text = "❤️"
 
-    unlike_text = (
-        "😴✓"
-        if feedback == "not_for_me"
-        else "😴"
-    )
+    sleep_text = "😴"
+
+    if feedback == "like":
+        like_text = "❤️✓"
+
+    elif feedback == "not_for_me":
+        sleep_text = "😴✓"
 
     return {
+
         "inline_keyboard": [
 
             [
@@ -2252,7 +2190,7 @@ def music_buttons(
 
                 {
                     "text":
-                        unlike_text,
+                        sleep_text,
 
                     "callback_data":
                         (
@@ -2285,19 +2223,32 @@ def music_buttons(
             [
                 {
                     "text":
-                        "🎛 CHANGE MOOD",
-
+                        "👤 PROFILE",
                     "callback_data":
-                        "change_mood",
+                        "profile",
+                },
+                {
+                    "text":
+                        "🆕 NEW TRACKS",
+                    "callback_data":
+                        "new_tracks",
                 },
             ],
 
+            [
+                {
+                    "text":
+                        "🎛 CHANGE MOOD",
+                    "callback_data":
+                        "change_mood",
+                }
+            ],
         ]
     }
 
 
 # ============================================================
-# MOOD DESCRIPTION
+# MOOD MESSAGE
 # ============================================================
 
 def mood_description(
@@ -2323,155 +2274,62 @@ def send_music(
     mood: str,
     radio: bool = False,
 ) -> None:
-
     if mood not in MOODS:
-
-        send_message(
-            chat_id,
-            "⚠️ Please choose a valid mood.",
-            mood_menu(),
-        )
-
+        send_message(chat_id, "⚠️ Please choose a valid mood.", mood_menu())
         return
-
 
     if get_track_count(mood) <= 0:
-
         send_message(
             chat_id,
-
-            (
-                f"{MOOD_INFO[mood]['name']}\n\n"
-                "⚠️ No tracks available yet."
-            ),
-
+            f"{MOOD_INFO[mood]['name']}\n\n⚠️ No tracks available for this mood yet.",
             mood_menu(),
         )
-
         return
 
-
-    if radio:
-
-        choice = choose_radio_track(
-            user_id,
-            mood,
-        )
-
-    else:
-
-        choice = choose_next_track(
-            user_id,
-            mood,
-        )
-
-
-    reserved = reserve_track(
-        user_id,
-        choice,
+    reserved = (
+        reserve_radio_track(user_id, mood)
+        if radio
+        else reserve_next_track(user_id, mood)
     )
-
-
     if not reserved:
-
         send_message(
             chat_id,
-
-            (
-                "⚠️ Couldn't find a track "
-                "right now.\n\n"
-                "Try again."
-            ),
-
-            music_buttons(
-                user_id,
-                "",
-                0,
-                mood,
-            ),
+            "⚠️ I couldn't find a new track right now. Try NEXT again shortly.",
+            music_buttons(user_id, "", 0, mood),
         )
-
         return
-
 
     selected_mood, message_id, channel_id = reserved
-
-
-    result = copy_music(
-        chat_id,
-        channel_id,
-        message_id,
-    )
-
-
+    result = copy_music(chat_id, channel_id, message_id)
     if not result.get("ok"):
-
+        remove_latest_history(user_id, channel_id, message_id)
         send_message(
             chat_id,
-
-            (
-                "⚠️ This track could not "
-                "be delivered."
-            ),
-
-            music_buttons(
-                user_id,
-                channel_id,
-                message_id,
-                selected_mood,
-            ),
+            "⚠️ This track can't be delivered right now. Please try NEXT.",
+            music_buttons(user_id, "", 0, selected_mood),
         )
-
         return
 
-
-    if radio:
-
-        header = "📻 YOUR RADIO"
-
-        description = (
-            "Personalized from your "
-            "❤️ Likes and 😴 Not-for-me choices."
-        )
-
-    else:
-
-        header = "🎧 NOW PLAYING"
-
-        description = (
-            MOOD_INFO[
-                selected_mood
-            ]["description"]
-        )
-
-
+    header = "📻 YOUR RADIO" if radio else "🎧 NOW PLAYING"
     text = (
         f"{header}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"{MOOD_INFO[selected_mood]['name']}\n\n"
-        f"{description}\n\n"
+        f"{MOOD_INFO[selected_mood]['name']}\n"
+        f"{MOOD_INFO[selected_mood]['description']}\n\n"
         "Enjoy the vibe. ✨"
     )
-
-
     send_message(
         chat_id,
         text,
-
-        music_buttons(
-            user_id,
-            channel_id,
-            message_id,
-            selected_mood,
-        ),
+        music_buttons(user_id, channel_id, message_id, selected_mood),
     )
 
 
 # ============================================================
-# MUSIC WORKER
+# WORKER
 # ============================================================
 
-def music_worker(
+def music_request_worker(
     chat_id: int,
     user_id: int,
     mood: str,
@@ -2502,16 +2360,17 @@ def music_worker(
             )
 
 
-def schedule_music(
+def schedule_music_request(
     chat_id: int,
     user_id: int,
     mood: str,
-    radio: bool,
+    radio: bool = False,
 ) -> bool:
 
     with pending_music_lock:
 
         if user_id in pending_music_users:
+
             return False
 
         pending_music_users.add(
@@ -2521,10 +2380,15 @@ def schedule_music(
     try:
 
         music_executor.submit(
-            music_worker,
+
+            music_request_worker,
+
             chat_id,
+
             user_id,
+
             mood,
+
             radio,
         )
 
@@ -2546,7 +2410,7 @@ def schedule_music(
 
 
 # ============================================================
-# TELETHON CHANNEL HELPERS
+# TELETHON
 # ============================================================
 
 def normalize_channel_id(
@@ -2591,7 +2455,7 @@ def normalize_config_channel(
     return None
 
 
-def rebuild_channel_map() -> None:
+def rebuild_channel_mood_map() -> None:
 
     CHANNEL_MOOD_MAP.clear()
 
@@ -2613,14 +2477,10 @@ def rebuild_channel_map() -> None:
             ] = mood
 
     logger.info(
-        "📡 Channel map: %s",
+        "Channel map: %s",
         CHANNEL_MOOD_MAP,
     )
 
-
-# ============================================================
-# MUSIC MESSAGE DETECTION
-# ============================================================
 
 def is_music_message(
     message: Any,
@@ -2691,10 +2551,6 @@ def is_music_message(
     )
 
 
-# ============================================================
-# SAVE TELETHON MESSAGE
-# ============================================================
-
 def save_telethon_message(
     mood: str,
     entity: Any,
@@ -2727,7 +2583,7 @@ def save_telethon_message(
 
 
 # ============================================================
-# SCAN ONE CHANNEL
+# SCAN CHANNEL
 # ============================================================
 
 async def scan_one_channel(
@@ -2741,7 +2597,7 @@ async def scan_one_channel(
     ):
 
         logger.warning(
-            "⚠️ %s channel not configured",
+            "%s channel not configured",
             mood.upper(),
         )
 
@@ -2749,9 +2605,7 @@ async def scan_one_channel(
 
     try:
 
-        if channel_value.lstrip(
-            "-"
-        ).isdigit():
+        if channel_value.lstrip("-").isdigit():
 
             lookup: Any = int(
                 channel_value
@@ -2761,14 +2615,11 @@ async def scan_one_channel(
 
             lookup = channel_value
 
-
         entity = await telethon_client.get_entity(
             lookup
         )
 
-
         found = 0
-
 
         async for message in (
             telethon_client.iter_messages(
@@ -2781,8 +2632,8 @@ async def scan_one_channel(
                 entity,
                 message,
             ):
-                found += 1
 
+                found += 1
 
         logger.info(
             "🔎 %s scan complete | detected=%s",
@@ -2802,25 +2653,13 @@ async def scan_one_channel(
         return 0
 
 
-# ============================================================
-# SCAN ALL CHANNELS
-# ============================================================
-
 async def scan_all_channels() -> None:
 
-    global last_scan_time
-    global last_scan_counts
-
-    rebuild_channel_map()
+    rebuild_channel_mood_map()
 
     logger.info(
         "🔎 Starting full channel scan..."
     )
-
-    result = {
-        mood: 0
-        for mood in MOODS
-    }
 
     for mood in MOODS:
 
@@ -2831,29 +2670,23 @@ async def scan_all_channels() -> None:
 
         if channel:
 
-            result[mood] = await scan_one_channel(
+            await scan_one_channel(
                 mood,
                 channel,
             )
 
         await asyncio.sleep(
-            0.5
+            1
         )
 
-    last_scan_counts = result
-
-    last_scan_time = int(
-        time.time()
-    )
-
     logger.info(
-        "📊 TRACK COUNTS: %s",
+        "📊 Tracks: %s",
         get_track_counts(),
     )
 
 
 # ============================================================
-# REAL-TIME WATCHER
+# REAL-TIME CHANNEL WATCHER
 # ============================================================
 
 def register_telethon_events(
@@ -2918,7 +2751,7 @@ def register_telethon_events(
 
                 logger.info(
                     (
-                        "🚀 NEW TRACK | "
+                        "🚀 REAL-TIME NEW SONG | "
                         "%s | message=%s"
                     ),
                     mood.upper(),
@@ -2985,18 +2818,16 @@ def telethon_worker() -> None:
         )
     ):
 
-        logger.error(
+        logger.warning(
             (
-                "❌ Telethon cannot start. "
+                "Telethon not started. "
                 "Missing API_ID/API_HASH/SESSION."
             )
         )
 
         return
 
-
-    rebuild_channel_map()
-
+    rebuild_channel_mood_map()
 
     try:
 
@@ -3012,7 +2843,7 @@ def telethon_worker() -> None:
 
             TELETHON_API_HASH,
 
-            connection_retries=10,
+            connection_retries=5,
 
             retry_delay=5,
 
@@ -3029,17 +2860,15 @@ def telethon_worker() -> None:
 
         return
 
-
     register_telethon_events(
         telethon_client
     )
 
-
     async def runner() -> None:
 
-        scanner_task = None
-
         while True:
+
+            scanner_task = None
 
             try:
 
@@ -3048,7 +2877,6 @@ def telethon_worker() -> None:
                 )
 
                 await telethon_client.connect()
-
 
                 if not await (
                     telethon_client
@@ -3059,42 +2887,32 @@ def telethon_worker() -> None:
                         "❌ Telethon unauthorized"
                     )
 
-                    telethon_ready.clear()
-
                     return
-
 
                 telethon_ready.set()
 
-
                 logger.info(
-                    "🟢 TELETHON CONNECTED"
+                    "🟢 Telethon CONNECTED"
                 )
 
-
                 await scan_all_channels()
-
 
                 scanner_task = asyncio.create_task(
                     periodic_scanner()
                 )
 
-
                 logger.info(
-                    "👀 Channel watcher ACTIVE"
+                    "👀 Real-time watcher ACTIVE"
                 )
-
 
                 await (
                     telethon_client
                     .run_until_disconnected()
                 )
 
-
             except asyncio.CancelledError:
 
                 raise
-
 
             except Exception:
 
@@ -3102,32 +2920,18 @@ def telethon_worker() -> None:
                     "Telethon connection error"
                 )
 
-
             finally:
 
                 telethon_ready.clear()
-
 
                 if scanner_task:
 
                     scanner_task.cancel()
 
                     try:
-
                         await scanner_task
-
-                    except (
-                        asyncio.CancelledError
-                    ):
-
-                        pass
-
                     except Exception:
-
                         pass
-
-                    scanner_task = None
-
 
                 try:
 
@@ -3147,20 +2951,17 @@ def telethon_worker() -> None:
                         "Telethon disconnect error"
                     )
 
-
             logger.warning(
                 (
-                    "🔄 Telethon reconnecting "
+                    "🔄 Reconnecting Telethon "
                     "in %s seconds..."
                 ),
                 TELETHON_RECONNECT_DELAY,
             )
 
-
             await asyncio.sleep(
                 TELETHON_RECONNECT_DELAY
             )
-
 
     try:
 
@@ -3178,10 +2979,6 @@ def telethon_worker() -> None:
 
         telethon_ready.clear()
 
-
-# ============================================================
-# START TELETHON
-# ============================================================
 
 def start_telethon_worker() -> None:
 
@@ -3216,39 +3013,15 @@ def is_admin(
 ) -> bool:
 
     return bool(
+
         ADMIN_USER_ID
+
         and user_id is not None
+
         and str(user_id)
         == ADMIN_USER_ID
     )
 
-
-# ============================================================
-# FORMAT UPTIME
-# ============================================================
-
-def format_time(
-    timestamp: int,
-) -> str:
-
-    if not timestamp:
-        return "Never"
-
-    try:
-
-        return time.strftime(
-            "%Y-%m-%d %H:%M:%S UTC",
-            time.gmtime(timestamp),
-        )
-
-    except Exception:
-
-        return "Unknown"
-
-
-# ============================================================
-# ADMIN STATS
-# ============================================================
 
 def send_stats(
     chat_id: int,
@@ -3266,96 +3039,21 @@ def send_stats(
 
         return
 
-
     counts = get_track_counts()
 
     total_tracks = sum(
         counts.values()
     )
 
-
-    try:
-
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-
-            cursor.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM track_feedback
-                WHERE feedback='like'
-                """
-            )
-
-            like_row = cursor.fetchone()
-
-            total_likes = int(
-                like_row["count"]
-            ) if like_row else 0
-
-
-            cursor.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM track_feedback
-                WHERE feedback='not_for_me'
-                """
-            )
-
-            dislike_row = cursor.fetchone()
-
-            total_dislikes = int(
-                dislike_row["count"]
-            ) if dislike_row else 0
-
-
-            cursor.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM user_history
-                WHERE action='served'
-                """
-            )
-
-            served_row = cursor.fetchone()
-
-            total_served = int(
-                served_row["count"]
-            ) if served_row else 0
-
-    except Exception:
-
-        logger.exception(
-            "Could not collect statistics"
-        )
-
-        total_likes = 0
-        total_dislikes = 0
-        total_served = 0
-
-
     lines = [
 
         "📊 NOT YOUR VIBE",
-        "━━━━━━━━━━━━━━━━━━",
-
+        "━━━━━━━━━━━━━━━━",
         "",
-
         f"👥 Users: {get_users_count()}",
-
         f"🎵 Tracks: {total_tracks}",
-
-        f"▶️ Served: {total_served}",
-
-        f"❤️ Likes: {total_likes}",
-
-        f"😴 Not for me: {total_dislikes}",
-
         "",
     ]
-
 
     for mood in MOODS:
 
@@ -3366,47 +3064,23 @@ def send_stats(
             )
         )
 
-
     lines.extend(
         [
-
             "",
-
             (
                 "🟢 PostgreSQL: ONLINE"
                 if db_pool is not None
                 else
                 "🔴 PostgreSQL: OFFLINE"
             ),
-
             (
                 "🟢 Telethon: CONNECTED"
                 if telethon_ready.is_set()
                 else
                 "🔴 Telethon: DISCONNECTED"
             ),
-
-            (
-                "🟢 Channel Watcher: ACTIVE"
-                if telethon_ready.is_set()
-                else
-                "🔴 Channel Watcher: STOPPED"
-            ),
-
-            "",
-
-            f"🔎 Last scan: "
-            f"{format_time(last_scan_time)}",
-
-            "",
-
-            "🤖 AI: DISABLED",
-
-            "📻 Radio: LIKE-BASED",
-
         ]
     )
-
 
     send_message(
         chat_id,
@@ -3439,7 +3113,7 @@ def extract_command(
 
 
 # ============================================================
-# FEEDBACK CALLBACK PARSER
+# CALLBACK HELPERS
 # ============================================================
 
 def parse_feedback_callback(
@@ -3457,9 +3131,7 @@ def parse_feedback_callback(
         return None
 
     action = parts[0]
-
     mood = parts[1]
-
     channel_id = parts[2]
 
     try:
@@ -3472,7 +3144,6 @@ def parse_feedback_callback(
 
         return None
 
-
     if action not in {
         "like",
         "notme",
@@ -3480,10 +3151,8 @@ def parse_feedback_callback(
 
         return None
 
-
     if mood not in MOODS:
         return None
-
 
     return (
         action,
@@ -3494,7 +3163,109 @@ def parse_feedback_callback(
 
 
 # ============================================================
-# CALLBACK HANDLER
+# USER PROFILE / NEW TRACKS
+# ============================================================
+
+def navigation_buttons() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🎛 CHANGE MOOD", "callback_data": "change_mood"},
+                {"text": "🆕 NEW TRACKS", "callback_data": "new_tracks"},
+            ],
+        ]
+    }
+
+
+def profile_text(user_id: int) -> str:
+    try:
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            cursor.execute(
+                "SELECT username, first_name, last_name, total_requests FROM users WHERE user_id=%s",
+                (user_id,),
+            )
+            user = cursor.fetchone() or {}
+            cursor.execute("SELECT COUNT(*) AS n FROM track_feedback WHERE user_id=%s AND feedback='like'", (user_id,))
+            likes = int(cursor.fetchone()["n"])
+            cursor.execute("SELECT COUNT(*) AS n FROM track_feedback WHERE user_id=%s AND feedback='not_for_me'", (user_id,))
+            dislikes = int(cursor.fetchone()["n"])
+            cursor.execute("SELECT COUNT(*) AS n FROM user_history WHERE user_id=%s AND action='served'", (user_id,))
+            played = int(cursor.fetchone()["n"])
+
+        ratios = get_mood_like_ratios(user_id)
+        best = max(MOODS, key=lambda m: ratios.get(m, 0.0))
+        best_ratio = ratios.get(best, 0.0)
+        username = user.get("username")
+        display = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x).strip() or "Music Lover"
+        return (
+            "👤 YOUR PROFILE\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"Name: {display}\n"
+            f"Username: @{username if username else '—'}\n\n"
+            f"🎵 Tracks played: {played}\n"
+            f"❤️ Likes: {likes}\n"
+            f"😴 Not for me: {dislikes}\n\n"
+            f"🏆 Top mood: {MOOD_INFO[best]['name']}\n"
+            f"📊 Like ratio: {best_ratio * 100:.0f}%"
+        )
+    except Exception:
+        logger.exception("Could not build profile")
+        return "👤 YOUR PROFILE\n━━━━━━━━━━━━━━━━━━\n\nProfile is temporarily unavailable."
+
+
+def get_latest_tracks_per_channel(limit: int = 5) -> list[tuple[str, str, int, int]]:
+    """Return newest five indexed tracks from each configured mood channel."""
+    rows: list[tuple[str, str, int, int]] = []
+    try:
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            for mood in MOODS:
+                channel_id = MOOD_CHANNELS.get(mood)
+                if not channel_id:
+                    continue
+                cursor.execute(
+                    """
+                    SELECT mood, channel_id, message_id, created_at
+                    FROM tracks
+                    WHERE channel_id=%s
+                    ORDER BY message_id DESC
+                    LIMIT %s
+                    """,
+                    (str(channel_id), limit),
+                )
+                for row in cursor.fetchall():
+                    rows.append((row["mood"], str(row["channel_id"]), int(row["message_id"]), int(row["created_at"])))
+    except Exception:
+        logger.exception("Could not load new tracks")
+    return rows
+
+
+def new_tracks_message() -> tuple[str, dict[str, Any]]:
+    """Build a compact per-channel list; buttons let users open a specific new track."""
+    rows = get_latest_tracks_per_channel(5)
+    keyboard = []
+    lines = ["🆕 NEW TRACKS", "━━━━━━━━━━━━━━━━━━", "", "Latest 5 tracks from each mood channel:"]
+    grouped: dict[str, list[tuple[str, int]]] = {m: [] for m in MOODS}
+    for mood, channel_id, message_id, _ in rows:
+        grouped.setdefault(mood, []).append((channel_id, message_id))
+
+    for mood in MOODS:
+        items = grouped.get(mood, [])
+        if not items:
+            continue
+        lines += ["", MOOD_INFO[mood]["name"]]
+        for i, (channel_id, message_id) in enumerate(items, 1):
+            lines.append(f"• #{message_id}")
+            keyboard.append([{"text": f"{MOOD_INFO[mood]['name']} • #{message_id}", "callback_data": f"new:{mood}:{channel_id}:{message_id}"}])
+
+    if len(lines) == 4:
+        lines += ["", "No new tracks are indexed yet."]
+
+    keyboard.append([{"text": "👤 PROFILE", "callback_data": "profile"}, {"text": "🎛 CHANGE MOOD", "callback_data": "change_mood"}])
+    return "\n".join(lines), {"inline_keyboard": keyboard}
+
+
+# ============================================================
+# CALLBACK
 # ============================================================
 
 def handle_callback(
@@ -3533,39 +3304,31 @@ def handle_callback(
         "id"
     )
 
-    telegram_message_id = message.get(
-        "message_id"
-    )
-
-
-    if not isinstance(
-        chat_id,
-        int,
+    if (
+        not isinstance(
+            chat_id,
+            int,
+        )
+        or not isinstance(
+            user_id,
+            int,
+        )
     ):
         return
-
-    if not isinstance(
-        user_id,
-        int,
-    ):
-        return
-
 
     register_user(
         user
     )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # MOOD
-    # ========================================================
+    # --------------------------------------------------------
 
     if data.startswith(
         "mood_"
     ):
 
         mood = data[5:]
-
 
         if mood not in MOODS:
 
@@ -3576,7 +3339,6 @@ def handle_callback(
 
             return
 
-
         if not set_user_mood(
             user_id,
             mood,
@@ -3584,19 +3346,17 @@ def handle_callback(
 
             answer_callback(
                 callback_id,
-                "Could not save mood",
+                "Please try again",
             )
 
             return
-
 
         answer_callback(
             callback_id,
             f"{MOOD_INFO[mood]['name']} ✓",
         )
 
-
-        schedule_music(
+        schedule_music_request(
             chat_id,
             user_id,
             mood,
@@ -3605,15 +3365,15 @@ def handle_callback(
 
         return
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # LIKE / NOT FOR ME
-    # ========================================================
+    # --------------------------------------------------------
 
-    feedback_data = parse_feedback_callback(
-        data
+    feedback_data = (
+        parse_feedback_callback(
+            data
+        )
     )
-
 
     if feedback_data:
 
@@ -3624,13 +3384,11 @@ def handle_callback(
             message_id,
         ) = feedback_data
 
-
-        new_feedback = (
+        feedback = (
             "like"
             if action == "like"
             else "not_for_me"
         )
-
 
         current = get_feedback(
             user_id,
@@ -3638,20 +3396,47 @@ def handle_callback(
             message_id,
         )
 
+        # Same button နှိပ်ရင်
+        # feedback ကို neutral ပြန်ထား
+        if current == feedback:
 
-        # Same button = clear feedback.
-        if current == new_feedback:
+            try:
 
-            clear_feedback(
-                user_id,
-                channel_id,
-                message_id,
-            )
+                with (
+                    db_connection() as connection,
+                    db_cursor(connection) as cursor
+                ):
 
-            answer_callback(
-                callback_id,
-                "Feedback cleared",
-            )
+                    cursor.execute(
+                        """
+                        DELETE FROM track_feedback
+
+                        WHERE user_id=%s
+                        AND channel_id=%s
+                        AND message_id=%s
+                        """,
+                        (
+                            user_id,
+                            channel_id,
+                            message_id,
+                        ),
+                    )
+
+                answer_callback(
+                    callback_id,
+                    "Feedback cleared",
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Could not clear feedback"
+                )
+
+                answer_callback(
+                    callback_id,
+                    "Try again",
+                )
 
         else:
 
@@ -3660,10 +3445,10 @@ def handle_callback(
                 channel_id,
                 message_id,
                 mood,
-                new_feedback,
+                feedback,
             ):
 
-                if new_feedback == "like":
+                if feedback == "like":
 
                     answer_callback(
                         callback_id,
@@ -3674,7 +3459,7 @@ def handle_callback(
 
                     answer_callback(
                         callback_id,
-                        "😴 Radio will avoid this",
+                        "😴 Got it — less like this",
                     )
 
             else:
@@ -3684,41 +3469,58 @@ def handle_callback(
                     "Could not save feedback",
                 )
 
-
-        # Refresh the buttons so
-        # ❤️✓ / 😴✓ changes immediately.
-        if (
-            isinstance(
-                telegram_message_id,
-                int,
-            )
-        ):
-
-            edit_message_keyboard(
-                chat_id,
-                telegram_message_id,
-
-                music_buttons(
-                    user_id,
-                    channel_id,
-                    message_id,
-                    mood,
-                ),
-            )
-
         return
 
+    # --------------------------------------------------------
+    # PROFILE
+    # --------------------------------------------------------
 
-    # ========================================================
+    if data == "profile":
+        answer_callback(callback_id, "👤 Your profile")
+        send_message(chat_id, profile_text(user_id), navigation_buttons())
+        return
+
+    # --------------------------------------------------------
+    # NEW TRACKS
+    # --------------------------------------------------------
+
+    if data == "new_tracks":
+        answer_callback(callback_id, "🆕 Loading new tracks...")
+        text, markup = new_tracks_message()
+        send_message(chat_id, text, markup)
+        return
+
+    # --------------------------------------------------------
+    # PLAY A NEW TRACK
+    # --------------------------------------------------------
+
+    if data.startswith("new:"):
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            _, mood, channel_id, message_id = parts
+            if mood in MOODS:
+                try:
+                    mid = int(message_id)
+                    result = copy_music(chat_id, channel_id, mid)
+                    if result.get("ok"):
+                        save_history(user_id, mood, channel_id, mid, "served")
+                        answer_callback(callback_id, "🎵 Playing new track")
+                        send_message(chat_id, f"🆕 NEW TRACK\n━━━━━━━━━━━━━━━━━━\n\n{MOOD_INFO[mood]['name']}\n{MOOD_INFO[mood]['description']}", music_buttons(user_id, channel_id, mid, mood))
+                    else:
+                        answer_callback(callback_id, "⚠️ Could not deliver track")
+                except ValueError:
+                    answer_callback(callback_id, "Invalid track")
+        return
+
+    # --------------------------------------------------------
     # NEXT
-    # ========================================================
+    # --------------------------------------------------------
 
     if data == "next_music":
 
         mood = get_user_mood(
             user_id
         )
-
 
         if not mood:
 
@@ -3735,39 +3537,43 @@ def handle_callback(
 
             return
 
+        set_radio_mode(user_id, False)
 
-        if schedule_music(
+        if schedule_music_request(
             chat_id,
             user_id,
             mood,
             False,
         ):
 
+            record_next_signal(
+                user_id,
+                mood,
+            )
+
             answer_callback(
                 callback_id,
-                "⏭ Finding next track...",
+                "⏭ Finding your next track...",
             )
 
         else:
 
             answer_callback(
                 callback_id,
-                "⏳ Preparing...",
+                "⏳ Preparing a track...",
             )
 
         return
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # RADIO
-    # ========================================================
+    # --------------------------------------------------------
 
     if data == "radio":
 
         mood = get_user_mood(
             user_id
         )
-
 
         if not mood:
 
@@ -3778,20 +3584,18 @@ def handle_callback(
 
             send_message(
                 chat_id,
-                "📻 Choose your starting mood 👇",
+                "🎧 Choose your mood 👇",
                 mood_menu(),
             )
 
             return
-
 
         set_radio_mode(
             user_id,
             True,
         )
 
-
-        if schedule_music(
+        if schedule_music_request(
             chat_id,
             user_id,
             mood,
@@ -3800,7 +3604,7 @@ def handle_callback(
 
             answer_callback(
                 callback_id,
-                "📻 Personalized Radio...",
+                "📻 Your Radio is ready...",
             )
 
         else:
@@ -3812,10 +3616,9 @@ def handle_callback(
 
         return
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # CHANGE MOOD
-    # ========================================================
+    # --------------------------------------------------------
 
     if data == "change_mood":
 
@@ -3825,6 +3628,7 @@ def handle_callback(
         )
 
         send_message(
+
             chat_id,
 
             (
@@ -3838,14 +3642,13 @@ def handle_callback(
 
         return
 
-
     answer_callback(
         callback_id
     )
 
 
 # ============================================================
-# MESSAGE HANDLER
+# MESSAGE
 # ============================================================
 
 def handle_message(
@@ -3870,33 +3673,28 @@ def handle_message(
         "id"
     )
 
-
     if not isinstance(
         chat_id,
         int,
     ):
         return
 
-
     register_user(
         user
     )
-
 
     text = (
         message.get("text")
         or ""
     ).strip()
 
-
     command = extract_command(
         text
     )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # START
-    # ========================================================
+    # --------------------------------------------------------
 
     if command == "/start":
 
@@ -3910,11 +3708,8 @@ def handle_message(
                 "Your music.\n"
                 "Your mood.\n"
                 "Your radio.\n\n"
-                "❤️ Like what you love.\n"
-                "😴 Mark what you don't want.\n\n"
-                "📻 Radio will learn from "
-                "your choices.\n\n"
-                "Choose a mood 👇"
+                "Choose a mood and let the music "
+                "find you. ✨"
             ),
 
             mood_menu(),
@@ -3922,10 +3717,9 @@ def handle_message(
 
         return
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # MOOD
-    # ========================================================
+    # --------------------------------------------------------
 
     if command == "/mood":
 
@@ -3944,24 +3738,22 @@ def handle_message(
 
         return
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # NEXT
-    # ========================================================
+    # --------------------------------------------------------
 
     if command == "/next":
 
-        if not isinstance(
-            user_id,
-            int,
-        ):
-            return
-
-
-        mood = get_user_mood(
-            user_id
+        mood = (
+            get_user_mood(
+                user_id
+            )
+            if isinstance(
+                user_id,
+                int,
+            )
+            else None
         )
-
 
         if not mood:
 
@@ -3973,65 +3765,124 @@ def handle_message(
 
             return
 
-
-        schedule_music(
+        if schedule_music_request(
             chat_id,
             user_id,
             mood,
             False,
-        )
+        ):
+
+            record_next_signal(
+                user_id,
+                mood,
+            )
+
+        else:
+
+            send_message(
+                chat_id,
+                "⏳ Finding your next track...",
+            )
 
         return
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # RADIO
-    # ========================================================
+    # --------------------------------------------------------
 
     if command == "/radio":
 
-        if not isinstance(
-            user_id,
-            int,
-        ):
-            return
-
-
-        mood = get_user_mood(
-            user_id
+        mood = (
+            get_user_mood(
+                user_id
+            )
+            if isinstance(
+                user_id,
+                int,
+            )
+            else None
         )
-
 
         if not mood:
 
             send_message(
                 chat_id,
-                "📻 Choose your starting mood 👇",
+                "📻 Choose a mood first 👇",
                 mood_menu(),
             )
 
             return
-
 
         set_radio_mode(
             user_id,
             True,
         )
 
-
-        schedule_music(
+        if not schedule_music_request(
             chat_id,
             user_id,
             mood,
             True,
-        )
+        ):
+
+            send_message(
+                chat_id,
+                "⏳ Your Radio is preparing...",
+            )
 
         return
 
+    # --------------------------------------------------------
+    # PROFILE
+    # --------------------------------------------------------
 
-    # ========================================================
+    if command == "/profile":
+        send_message(chat_id, profile_text(user_id), navigation_buttons())
+        return
+
+    # --------------------------------------------------------
+    # NEW TRACKS
+    # --------------------------------------------------------
+
+    if command == "/new":
+        text, markup = new_tracks_message()
+        send_message(chat_id, text, markup)
+        return
+
+    # --------------------------------------------------------
+    # USERS
+    # --------------------------------------------------------
+
+    if command == "/users":
+
+        if is_admin(
+            user_id
+        ):
+
+            send_message(
+
+                chat_id,
+
+                (
+                    "👥 USER STATISTICS\n"
+                    "━━━━━━━━━━━━━━━━\n\n"
+                    f"Total users: "
+                    f"{get_users_count()}"
+                ),
+            )
+
+        else:
+
+            send_message(
+                chat_id,
+                "❌ Admin only.",
+            )
+
+        return
+
+    # --------------------------------------------------------
     # STATS
-    # ========================================================
+    # --------------------------------------------------------
 
     if command == "/stats":
 
@@ -4047,41 +3898,9 @@ def handle_message(
 
         return
 
-
-    # ========================================================
-    # USERS
-    # ========================================================
-
-    if command == "/users":
-
-        if is_admin(
-            user_id
-        ):
-
-            send_message(
-                chat_id,
-
-                (
-                    "👥 USER STATISTICS\n"
-                    "━━━━━━━━━━━━━━━━━━\n\n"
-                    f"Total users: "
-                    f"{get_users_count()}"
-                ),
-            )
-
-        else:
-
-            send_message(
-                chat_id,
-                "❌ Admin only.",
-            )
-
-        return
-
-
-    # ========================================================
-    # TELEGRAM STATUS
-    # ========================================================
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
 
     if command == "/telegram":
 
@@ -4094,10 +3913,7 @@ def handle_message(
                 "❌ Admin only.",
             )
 
-            return
-
-
-        if telethon_ready.is_set():
+        elif telethon_ready.is_set():
 
             send_message(
 
@@ -4109,9 +3925,7 @@ def handle_message(
                     "📡 Channel watcher: ACTIVE\n"
                     "🔄 Auto reconnect: ON\n"
                     f"⏰ Backup scan: every "
-                    f"{AUTO_SCAN_INTERVAL // 60} minutes\n\n"
-                    f"🔎 Last scan:\n"
-                    f"{format_time(last_scan_time)}"
+                    f"{AUTO_SCAN_INTERVAL // 60} minutes"
                 ),
             )
 
@@ -4122,20 +3936,16 @@ def handle_message(
                 chat_id,
 
                 (
-                    "🔴 TELETHON DISCONNECTED\n"
-                    "━━━━━━━━━━━━━━━━━━\n\n"
-                    "🔄 Reconnect loop: ON\n"
-                    "📡 Channel watcher: STOPPED\n\n"
-                    "Check Render logs."
+                    "🔴 TELETHON DISCONNECTED\n\n"
+                    "Please check Render logs."
                 ),
             )
 
         return
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # HELP
-    # ========================================================
+    # --------------------------------------------------------
 
     if command == "/help":
 
@@ -4146,25 +3956,16 @@ def handle_message(
             (
                 "🎧 NOT YOUR VIBE MUSIC\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-
                 "/start → Start\n"
                 "/mood → Choose mood\n"
                 "/next → Next track\n"
                 "/radio → Personalized Radio\n"
-                "/telegram → Telethon status\n"
-                "/stats → Statistics (Admin)\n"
-                "/users → Users (Admin)\n"
-                "/help → Help\n\n"
-
-                "❤️ Like → Tell Radio what you love\n"
-                "😴 → Tell Radio what to avoid\n\n"
-
-                "📻 Radio uses your Likes.\n"
-                "No AI required."
+                "/users → User count (Admin)\n"
+                "/stats → Bot statistics (Admin)\n"
+                "/telegram → Channel watcher status\n"
+                "/help → Help"
             ),
         )
-
-        return
 
 
 # ============================================================
@@ -4182,11 +3983,9 @@ def handle_update(
     ):
         return
 
-
     callback = update.get(
         "callback_query"
     )
-
 
     if isinstance(
         callback,
@@ -4199,11 +3998,9 @@ def handle_update(
 
         return
 
-
     message = update.get(
         "message"
     )
-
 
     if isinstance(
         message,
@@ -4251,7 +4048,6 @@ def health():
 
         db_ok = False
 
-
     if db_ok:
 
         return (
@@ -4259,78 +4055,11 @@ def health():
             200,
         )
 
-
     return (
         "Database not ready",
         503,
     )
 
-
-# ============================================================
-# STATUS JSON
-# ============================================================
-
-@app.route("/status")
-def status():
-
-    db_ok = False
-
-    try:
-
-        if db_pool is not None:
-
-            with (
-                db_connection() as connection,
-                db_cursor(connection) as cursor
-            ):
-
-                cursor.execute(
-                    "SELECT 1"
-                )
-
-                db_ok = True
-
-    except Exception:
-
-        db_ok = False
-
-
-    return {
-
-        "bot": "online",
-
-        "ai": False,
-
-        "database":
-            "online"
-            if db_ok
-            else
-            "offline",
-
-        "telethon":
-            "connected"
-            if telethon_ready.is_set()
-            else
-            "disconnected",
-
-        "channel_watcher":
-            "active"
-            if telethon_ready.is_set()
-            else
-            "stopped",
-
-        "tracks":
-            get_track_counts(),
-
-        "last_scan":
-            last_scan_time,
-
-    }
-
-
-# ============================================================
-# WEBHOOK
-# ============================================================
 
 @app.route(
     "/webhook",
@@ -4339,16 +4068,12 @@ def status():
 def webhook():
 
     if (
-
         WEBHOOK_SECRET
-
         and request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token",
             "",
         )
-
         != WEBHOOK_SECRET
-
     ):
 
         return (
@@ -4356,13 +4081,11 @@ def webhook():
             403,
         )
 
-
     try:
 
         update = request.get_json(
             silent=True
         )
-
 
         if isinstance(
             update,
@@ -4373,13 +4096,11 @@ def webhook():
                 update
             )
 
-
     except Exception:
 
         logger.exception(
             "Webhook processing error"
         )
-
 
     return (
         "OK",
@@ -4400,20 +4121,19 @@ def setup_webhook() -> None:
 
         logger.warning(
             (
-                "Webhook not configured. "
-                "BOT_TOKEN or RENDER_EXTERNAL_URL missing."
+                "Webhook not configured: "
+                "BOT_TOKEN or RENDER_EXTERNAL_URL missing"
             )
         )
 
         return
 
-
     payload: dict[str, Any] = {
 
         "url":
             (
-                RENDER_EXTERNAL_URL.rstrip("/")
-                + "/webhook"
+                f"{RENDER_EXTERNAL_URL.rstrip('/')}"
+                "/webhook"
             ),
 
         "allowed_updates":
@@ -4429,20 +4149,20 @@ def setup_webhook() -> None:
             WEBHOOK_MAX_CONNECTIONS,
     }
 
-
     if WEBHOOK_SECRET:
 
         payload[
             "secret_token"
         ] = WEBHOOK_SECRET
 
-
     result = telegram(
+
         "setWebhook",
+
         payload,
+
         timeout=20,
     )
-
 
     if result.get("ok"):
 
@@ -4469,22 +4189,18 @@ def startup() -> bool:
     )
 
     logger.info(
-        "🎧 NOT YOUR VIBE MUSIC BOT v5"
+        "🎧 NOT YOUR VIBE MUSIC BOT"
     )
 
     logger.info(
-        "📻 LIKE-BASED RADIO"
-    )
-
-    logger.info(
-        "🤖 AI DISABLED"
+        "🚀 Starting..."
     )
 
     logger.info(
         "========================================"
     )
 
-
+    # Environment check
     if not BOT_TOKEN:
 
         logger.error(
@@ -4493,7 +4209,6 @@ def startup() -> bool:
 
         return False
 
-
     if not DATABASE_URL:
 
         logger.error(
@@ -4501,7 +4216,6 @@ def startup() -> bool:
         )
 
         return False
-
 
     try:
 
@@ -4515,36 +4229,12 @@ def startup() -> bool:
 
         return False
 
-
-    # --------------------------------------------------------
-    # AI deliberately removed.
-    # --------------------------------------------------------
-
-    logger.info(
-        "🟡 AI: DISABLED"
-    )
-
-    logger.info(
-        "📻 Radio: LIKE-BASED"
-    )
-
-
-    # --------------------------------------------------------
-    # Webhook
-    # --------------------------------------------------------
-
     setup_webhook()
-
-
-    # --------------------------------------------------------
-    # Telethon
-    # --------------------------------------------------------
 
     start_telethon_worker()
 
-
     logger.info(
-        "🟢 BOT SERVER READY"
+        "🟢 Bot server is ready"
     )
 
     return True
@@ -4556,12 +4246,7 @@ def startup() -> bool:
 
 if __name__ == "__main__":
 
-    if not startup():
-
-        raise SystemExit(
-            1
-        )
-
+    startup()
 
     port = env_int(
         "PORT",
@@ -4569,7 +4254,6 @@ if __name__ == "__main__":
         1,
         65535,
     )
-
 
     app.run(
 
