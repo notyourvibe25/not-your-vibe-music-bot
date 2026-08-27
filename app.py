@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import json
 import logging
 import os
 import random
@@ -98,22 +97,8 @@ WEBHOOK_SECRET = env_text(
 DATABASE_URL = env_text(
     "DATABASE_URL"
 )
-# ============================================================
-# OPENAI
-# ============================================================
-OPENAI_API_KEY = env_text(
-    "OPENAI_API_KEY"
-)
-OPENAI_MODEL = env_text(
-    "OPENAI_MODEL",
-    "gpt-5-mini",
-)
-OPENAI_TIMEOUT = env_int(
-    "OPENAI_TIMEOUT",
-    40,
-    10,
-    120,
-)
+
+
 # ============================================================
 # TELETHON
 #
@@ -184,18 +169,6 @@ PERIODIC_SCAN_LIMIT = env_int(
     200,
     20,
     10000,
-)
-AI_BATCH_SIZE = env_int(
-    "AI_BATCH_SIZE",
-    10,
-    1,
-    30,
-)
-AI_SCAN_INTERVAL = env_int(
-    "AI_SCAN_INTERVAL",
-    8,
-    2,
-    60,
 )
 TELETHON_RECONNECT_DELAY = env_int(
     "TELETHON_RECONNECT_DELAY",
@@ -380,20 +353,11 @@ def telethon_status_text() -> str:
     configured = sum(
         1 for mood in MOODS if MOOD_CHANNELS.get(mood)
     )
-    state_label = {
-        "CONNECTED": "🟢 CONNECTED",
-        "CONNECTING": "🟡 CONNECTING",
-        "RECONNECTING": "🟡 RECONNECTING",
-        "AUTH_ERROR": "🔴 AUTH ERROR",
-        "CONFIG_ERROR": "🔴 CONFIG ERROR",
-        "WORKER_ERROR": "🔴 WORKER ERROR",
-        "STOPPED": "🔴 STOPPED",
-    }.get(state, state)
     lines = [
         "📡  TELEGRAM CHANNEL SCANNER",
         "━━━━━━━━━━━━━━━━━━",
         "",
-        f"Telethon: {state_label}",
+        f"Telethon: {state}",
         f"Channels configured: {configured}/8",
         f"Detail: {detail or '-'}",
         "",
@@ -512,14 +476,13 @@ def db_cursor(
 # DATABASE SCHEMA AND LEGACY MIGRATIONS
 # ============================================================
 def init_db() -> None:
-    """Create current tables and upgrade databases created by earlier bot versions.
+    """Create the no-AI schema and safely upgrade earlier bot databases.
 
-    Important: indexes that depend on newer columns are created only after
-    ALTER TABLE migrations succeed. `CREATE TABLE IF NOT EXISTS` does not add
-    columns to a table that already exists.
+    Legacy AI columns are deliberately left in place when they already exist;
+    they are no longer read, written, or required, so no music/user data is
+    deleted during the conversion.
     """
     initialize_db_pool()
-
     base_schema = """
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
@@ -538,14 +501,6 @@ def init_db() -> None:
         artist TEXT,
         title TEXT,
         raw_text TEXT,
-        ai_status TEXT NOT NULL DEFAULT 'pending',
-        ai_mood TEXT,
-        ai_genres TEXT,
-        ai_energy INTEGER,
-        ai_valence INTEGER,
-        ai_profile TEXT,
-        ai_scanned_at BIGINT,
-        ai_error TEXT,
         created_at BIGINT NOT NULL,
         UNIQUE(channel_id, message_id)
     );
@@ -580,68 +535,28 @@ def init_db() -> None:
         processed_at BIGINT NOT NULL
     );
     """
-
     migrations = [
-        # tracks columns from the AI-enabled release
         "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS artist TEXT",
         "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS title TEXT",
         "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS raw_text TEXT",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_status TEXT",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_mood TEXT",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_genres TEXT",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_energy INTEGER",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_valence INTEGER",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_profile TEXT",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_scanned_at BIGINT",
-        "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_error TEXT",
-        # Required by the newer Like/Unlike and history code.
         "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS track_id BIGINT",
     ]
-
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood)",
-        "CREATE INDEX IF NOT EXISTS idx_tracks_ai_status ON tracks(ai_status)",
         "CREATE INDEX IF NOT EXISTS idx_history_user_time ON user_history(user_id, sent_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_feedback_user ON track_feedback(user_id, feedback)",
     ]
-
     with db_connection() as connection, db_cursor(connection) as cursor:
-        # 1. Create missing tables. This is harmless on existing databases.
         cursor.execute(base_schema)
-
-        # 2. Upgrade old tables before any SQL references the new columns.
         for statement in migrations:
             cursor.execute(statement)
-
-        # 3. Normalize an ai_status column that existed but allowed NULL.
-        cursor.execute(
-            "UPDATE tracks SET ai_status='pending' WHERE ai_status IS NULL"
-        )
-        # Retry tracks that failed under an older/broken AI request.
-        # This runs only at process startup; tracks that fail again stay
-        # failed until the next restart instead of retrying forever.
-        reset_failed = cursor.execute(
-            "UPDATE tracks SET ai_status='pending', ai_error=NULL WHERE ai_status='failed'"
-        )
-        logger.info("AI startup retry reset completed for previously failed tracks")
-        cursor.execute(
-            "ALTER TABLE tracks ALTER COLUMN ai_status SET DEFAULT 'pending'"
-        )
-        cursor.execute(
-            "ALTER TABLE tracks ALTER COLUMN ai_status SET NOT NULL"
-        )
-
-        # 4. Only now are dependent indexes safe to create.
         for statement in indexes:
             cursor.execute(statement)
-
         cursor.execute(
             "DELETE FROM processed_updates WHERE processed_at < %s",
             (int(time.time()) - 604800,),
         )
-
-    logger.info("PostgreSQL database ready; legacy migration completed")
-
+    logger.info("PostgreSQL database ready; no-AI schema migration completed")
 
 # ============================================================
 # UPDATE DEDUPLICATION
@@ -1171,12 +1086,10 @@ def save_track(
                     artist,
                     title,
                     raw_text,
-                    ai_status,
                     created_at
                 )
                 VALUES(
-                    %s,%s,%s,%s,%s,%s,
-                    'pending',%s
+                    %s,%s,%s,%s,%s,%s,%s
                 )
                 ON CONFLICT(
                     channel_id,
@@ -1241,61 +1154,8 @@ def get_track(
             "Could not get track"
         )
         return None
-# ============================================================
-# AI DISABLED
-# ============================================================
-# Radio recommendations are now fully database-driven. OpenAI is not used.
-def ai_status_text() -> str:
-    return (
-        "🤖  AI SCANNER\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "⚪ DISABLED\n\n"
-        "AI is not used by this version.\n"
-        "📻 Radio uses your Like history + mood preference weights.\n"
-        "No OpenAI quota or API key is required."
-    )
 
-def get_ai_status() -> dict[str, int]:
-    return {"total": 0, "done": 0, "pending": 0, "failed": 0}
-# ============================================================
-# TELETHON MESSAGE SAVE
-# ============================================================
-def save_telethon_message(
-    mood: str,
-    entity: Any,
-    message: Any,
-) -> bool:
-    if not is_music_message(
-        message
-    ):
-        return False
-    channel_id = normalize_channel_id(
-        entity
-    )
-    message_id = getattr(
-        message,
-        "id",
-        None,
-    )
-    if not channel_id or not message_id:
-        return False
-    raw_text = message_music_text(
-        message
-    )
-    artist, title = (
-        extract_artist_title(
-            raw_text
-        )
-    )
-    track_id = save_track(
-        mood,
-        channel_id,
-        int(message_id),
-        artist,
-        title,
-        raw_text,
-    )
-    return track_id is not None
+
 # ============================================================
 # SCAN ONE CHANNEL
 # ============================================================
@@ -1513,12 +1373,6 @@ async def periodic_scanner() -> None:
 # TELETHON WORKER
 # ============================================================
 def telethon_worker() -> None:
-    """Keep one Telethon client alive and reconnect it after transient failures.
-
-    A normal disconnect and an exception both enter the same reconnect loop.
-    Authentication/configuration errors are terminal because retrying the same
-    StringSession cannot fix them.
-    """
     global telethon_client
 
     missing = []
@@ -1543,41 +1397,29 @@ def telethon_worker() -> None:
 
     async def runner() -> None:
         global telethon_client
-
         while True:
             client: Optional[TelegramClient] = None
             scanner_task: Optional[asyncio.Task[Any]] = None
             try:
-                set_telethon_status(
-                    "CONNECTING",
-                    "Connecting with the supplied StringSession",
-                )
-                logger.info("📡 Telethon connecting...")
-
+                set_telethon_status("CONNECTING", "Connecting with the supplied StringSession")
                 client = TelegramClient(
                     StringSession(TELETHON_SESSION),
                     api_id,
                     TELETHON_API_HASH,
-                    connection_retries=8,
+                    connection_retries=5,
                     retry_delay=5,
-                    request_retries=8,
+                    request_retries=5,
                     timeout=30,
                     auto_reconnect=True,
                     flood_sleep_threshold=60,
                 )
-
                 telethon_client = client
                 register_telethon_events(client)
-
                 await client.connect()
 
                 if not client.is_connected():
-                    raise ConnectionError(
-                        "Telethon connect() completed without a connection"
-                    )
-
+                    raise ConnectionError("Telethon connect() completed without a connection")
                 if not await client.is_user_authorized():
-                    telethon_ready.clear()
                     set_telethon_status(
                         "AUTH_ERROR",
                         "StringSession is unauthorized. Create a new authorized session.",
@@ -1591,57 +1433,24 @@ def telethon_worker() -> None:
                     or getattr(me, "first_name", None)
                     or "authorized account"
                 )
-
                 telethon_ready.set()
-                set_telethon_status(
-                    "CONNECTED",
-                    f"Logged in as {account_name}; initial channel scan started",
-                )
-                logger.info("🟢 TELETHON CONNECTED as %s", account_name)
+                set_telethon_status("CONNECTED", f"Logged in as {account_name}; initial 8-channel scan started")
+                logger.info("TELETHON CONNECTED as %s", account_name)
 
                 await scan_all_channels(
                     limit=None if INITIAL_SCAN_LIMIT == 0 else INITIAL_SCAN_LIMIT,
                     reason="initial",
                 )
-
-                set_telethon_status(
-                    "CONNECTED",
-                    f"Watcher active; {sum(1 for m in MOODS if MOOD_CHANNELS.get(m))}/8 channels configured",
-                )
+                set_telethon_status("CONNECTED", f"Watcher active; {sum(1 for m in MOODS if MOOD_CHANNELS.get(m))}/8 channels configured")
                 scanner_task = asyncio.create_task(periodic_scanner())
-
-                # Blocks until Telethon is actually disconnected.
                 await client.run_until_disconnected()
-
-                # run_until_disconnected() can return without raising when the
-                # connection closes. Mark it explicitly so the UI does not
-                # falsely show CONNECTED during the reconnect delay.
-                telethon_ready.clear()
-                set_telethon_status(
-                    "RECONNECTING",
-                    f"Connection closed; retrying in {TELETHON_RECONNECT_DELAY}s",
-                )
-                logger.warning(
-                    "🔴 Telethon connection closed; reconnecting in %s seconds",
-                    TELETHON_RECONNECT_DELAY,
-                )
-
             except asyncio.CancelledError:
-                telethon_ready.clear()
-                set_telethon_status("STOPPED", "Worker cancelled")
                 raise
-
             except Exception as exc:
-                telethon_ready.clear()
-                set_telethon_status(
-                    "RECONNECTING",
-                    f"{type(exc).__name__}: {str(exc)[:200]} | retrying in {TELETHON_RECONNECT_DELAY}s",
-                )
-                logger.exception("Telethon connection error; will reconnect")
-
+                set_telethon_status("DISCONNECTED", f"{type(exc).__name__}: {str(exc)[:240]}")
+                logger.exception("Telethon connection error")
             finally:
                 telethon_ready.clear()
-
                 if scanner_task is not None:
                     scanner_task.cancel()
                     try:
@@ -1650,37 +1459,28 @@ def telethon_worker() -> None:
                         pass
                     except Exception:
                         logger.exception("Periodic scanner cleanup error")
-
                 if client is not None:
                     try:
                         if client.is_connected():
                             await client.disconnect()
                     except Exception:
-                        logger.exception("Telethon disconnect cleanup error")
-
+                        logger.exception("Telethon disconnect error")
                 if telethon_client is client:
                     telethon_client = None
 
-            # AUTH_ERROR is terminal: a new StringSession is required.
+            # AUTH_ERROR needs a newly generated session, not an endless retry.
             with telethon_status_lock:
                 terminal_auth_error = telethon_status["state"] == "AUTH_ERROR"
             if terminal_auth_error:
                 return
-
-            set_telethon_status(
-                "RECONNECTING",
-                f"Waiting {TELETHON_RECONNECT_DELAY}s before reconnect",
-            )
+            logger.warning("Telethon disconnected; reconnecting in %s seconds", TELETHON_RECONNECT_DELAY)
             await asyncio.sleep(TELETHON_RECONNECT_DELAY)
 
     try:
         asyncio.run(runner())
     except Exception as exc:
         telethon_ready.clear()
-        set_telethon_status(
-            "WORKER_ERROR",
-            f"{type(exc).__name__}: {str(exc)[:240]}",
-        )
+        set_telethon_status("WORKER_ERROR", f"{type(exc).__name__}: {str(exc)[:240]}")
         logger.exception("Telethon worker stopped")
 
 
@@ -1952,183 +1752,163 @@ def get_recent_track_ids(
     except Exception:
         return set()
 # ============================================================
-# NORMAL TRACK RESERVATION
+# RULE-BASED RECOMMENDATION
 # ============================================================
-def reserve_track(
+# Normal mood mode prioritizes songs the user has not received in the selected
+# mood. Liked songs can return occasionally so favourites are not forgotten.
+NORMAL_LIKED_REPLAY_PERCENT = env_int(
+    "NORMAL_LIKED_REPLAY_PERCENT", 20, 0, 60
+)
+# Radio crosses all moods. This percentage controls replay of a user's liked
+# song; the rest of Radio favours fresh songs from preferred moods.
+RADIO_LIKED_REPLAY_PERCENT = env_int(
+    "RADIO_LIKED_REPLAY_PERCENT", 35, 0, 75
+)
+
+
+def _track_pools(
+    cursor: Any,
     user_id: int,
     mood: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return fresh, liked-replay, and safe fallback tracks for one mood."""
+    cursor.execute(
+        """
+        SELECT
+            t.*,
+            COALESCE(f.feedback, '') AS user_feedback,
+            EXISTS(
+                SELECT 1 FROM user_history h
+                WHERE h.user_id=%s AND h.track_id=t.id
+            ) AS was_sent,
+            EXISTS(
+                SELECT 1 FROM user_history h
+                WHERE h.user_id=%s AND h.track_id=t.id
+                ORDER BY h.sent_at DESC, h.id DESC
+                LIMIT 1
+            ) AS has_history
+        FROM tracks t
+        LEFT JOIN track_feedback f
+            ON f.track_id=t.id AND f.user_id=%s
+        WHERE t.mood=%s
+        AND COALESCE(f.feedback, '') <> 'unlike'
+        ORDER BY RANDOM()
+        LIMIT %s
+        """,
+        (user_id, user_id, user_id, mood, TRACK_CANDIDATE_LIMIT),
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    fresh = [row for row in rows if not row["was_sent"]]
+    liked = [row for row in rows if row["user_feedback"] == "like"]
+    fallback = [row for row in rows if row["user_feedback"] != "unlike"]
+    return fresh, liked, fallback
+
+
+def _choose_track(
+    fresh: list[dict[str, Any]],
+    liked: list[dict[str, Any]],
+    fallback: list[dict[str, Any]],
+    liked_replay_percent: int,
 ) -> Optional[dict[str, Any]]:
+    """Prefer fresh tracks while allowing a controlled favourite replay share."""
+    if liked and random.randrange(100) < liked_replay_percent:
+        return random.choice(liked)
+    if fresh:
+        return random.choice(fresh)
+    if liked:
+        return random.choice(liked)
+    if fallback:
+        return random.choice(fallback)
+    return None
+
+
+def reserve_track(user_id: int, mood: str) -> Optional[dict[str, Any]]:
+    """NEXT: only use the user's selected mood channel."""
     if mood not in MOODS:
         return None
     try:
-        with db_connection() as connection:
-            with db_cursor(connection) as cursor:
-                cursor.execute(
-                    """
-                    SELECT pg_advisory_xact_lock(%s)
-                    """,
-                    (user_id,),
-                )
-                recent_ids = get_recent_track_ids(
-                    user_id,
-                    RECENT_HISTORY_LIMIT,
-                )
-                cursor.execute(
-                    """
-                    SELECT *
-                    FROM tracks
-                    WHERE mood=%s
-                    ORDER BY RANDOM()
-                    LIMIT %s
-                    """,
-                    (
-                        mood,
-                        TRACK_CANDIDATE_LIMIT,
-                    ),
-                )
-                rows = [
-                    dict(row)
-                    for row in cursor.fetchall()
-                ]
-                if not rows:
-                    return None
-                unliked = get_user_unlikes(
-                    user_id
-                )
-                candidates = [
-                    row
-                    for row in rows
-                    if (
-                        int(row["id"])
-                        not in recent_ids
-                        and int(row["id"])
-                        not in unliked
-                    )
-                ]
-                if not candidates:
-                    candidates = [
-                        row
-                        for row in rows
-                        if int(row["id"])
-                        not in unliked
-                    ]
-                if not candidates:
-                    candidates = rows
-                track = random.choice(
-                    candidates
-                )
-                save_history(
-                    user_id,
-                    track,
-                )
-                return track
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
+            fresh, liked, fallback = _track_pools(cursor, user_id, mood)
+            track = _choose_track(
+                fresh, liked, fallback, NORMAL_LIKED_REPLAY_PERCENT
+            )
+            if track:
+                save_history(user_id, track)
+            return track
     except Exception:
-        logger.exception(
-            "Could not reserve track"
-        )
+        logger.exception("Could not reserve selected-mood track")
         return None
-# ============================================================
-# PERSONAL RADIO — LIKE + MOOD WEIGHTED
-# ============================================================
-def reserve_radio_track(
-    user_id: int,
-) -> Optional[dict[str, Any]]:
-    """Pick a Radio track using only the user's Like/Unlike history.
 
-    Radio has no manual mood filter. Instead, each mood gets a weight from
-    how many liked tracks the user has in that mood. Higher-liked moods are
-    recommended more often, while every mood with likes still gets a chance.
-    Recent tracks and explicit unlikes are excluded. Liked tracks may return
-    again after their recent-history cooldown.
-    """
+
+def get_radio_mood_preferences(user_id: int) -> dict[str, dict[str, int]]:
+    """Return per-mood Like/Unlike counts. Every mood retains a base weight."""
+    preferences = {mood: {"likes": 0, "unlikes": 0, "weight": 1} for mood in MOODS}
     try:
-        likes = get_user_likes(user_id, 200)
-        if not likes:
-            return None
-
-        recent_ids = get_recent_track_ids(user_id, RECENT_HISTORY_LIMIT)
-        unlikes = get_user_unlikes(user_id, 500)
-        liked_ids = {int(x["id"]) for x in likes}
-
-        # Mood preference comes ONLY from liked tracks.
-        mood_counts = {mood: 0 for mood in MOODS}
-        for track in likes:
-            mood = str(track.get("mood") or "").lower()
-            if mood in mood_counts:
-                mood_counts[mood] += 1
-
-        active_moods = [m for m in MOODS if mood_counts[m] > 0]
-        if not active_moods:
-            return None
-
-        # Weight = like count, with a small floor so less-liked moods remain
-        # discoverable. This naturally gives more tracks to the most-liked mood.
-        weights = {m: max(1, mood_counts[m]) for m in active_moods}
-
-        # Fetch a broad pool from only moods the user has liked.
-        placeholders = ",".join(["%s"] * len(active_moods))
-        params: list[Any] = list(active_moods)
-        params.extend([list(unlikes) or [-1], TRACK_CANDIDATE_LIMIT * 8])
-
-        with db_connection() as connection:
-            with db_cursor(connection) as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT *
-                    FROM tracks
-                    WHERE mood IN ({placeholders})
-                    AND id <> ALL(%s)
-                    ORDER BY RANDOM()
-                    LIMIT %s
-                    """,
-                    tuple(params),
-                )
-                pool = [dict(row) for row in cursor.fetchall()]
-
-        # Strongly prefer tracks that haven't been sent recently.
-        candidates = [
-            t for t in pool
-            if int(t["id"]) not in recent_ids
-            and int(t["id"]) not in unlikes
-        ]
-
-        if not candidates:
-            # If all available tracks are in recent history, keep unlikes
-            # excluded but allow older history as a final fallback.
-            candidates = [
-                t for t in pool
-                if int(t["id"]) not in unlikes
-            ]
-        if not candidates:
-            return None
-
-        # Score each candidate:
-        # - mood popularity is the main factor
-        # - liked tracks get a bonus so they can reappear after cooldown
-        # - unseen tracks remain available for discovery
-        scored: list[tuple[dict[str, Any], float]] = []
-        for track in candidates:
-            mood = str(track.get("mood") or "").lower()
-            base = float(weights.get(mood, 1))
-            if int(track["id"]) in liked_ids:
-                base *= 1.35
-            # Small random factor prevents the same highest-score track from
-            # dominating every Radio request.
-            score = base * random.uniform(0.85, 1.15)
-            scored.append((track, score))
-
-        scored.sort(key=lambda item: item[1], reverse=True)
-        top_n = min(
-            max(8, len(scored) // 4),
-            len(scored),
-        )
-        chosen = random.choice(scored[:top_n])[0]
-
-        save_history(user_id, chosen)
-        return chosen
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    t.mood,
+                    COUNT(*) FILTER (WHERE f.feedback='like') AS likes,
+                    COUNT(*) FILTER (WHERE f.feedback='unlike') AS unlikes
+                FROM track_feedback f
+                JOIN tracks t ON t.id=f.track_id
+                WHERE f.user_id=%s
+                GROUP BY t.mood
+                """,
+                (user_id,),
+            )
+            for row in cursor.fetchall():
+                mood = row["mood"]
+                if mood not in preferences:
+                    continue
+                likes = int(row["likes"] or 0)
+                unlikes = int(row["unlikes"] or 0)
+                # Base 1 gives all moods a chance. Each Like has strong
+                # influence, while Unlike reduces (but never removes) chance.
+                preferences[mood] = {
+                    "likes": likes,
+                    "unlikes": unlikes,
+                    "weight": max(1, 1 + (likes * 5) - (unlikes * 2)),
+                }
     except Exception:
-        logger.exception("Could not reserve radio track")
+        logger.exception("Could not calculate Radio mood preferences")
+    return preferences
+
+
+def _weighted_mood_order(preferences: Mapping[str, Mapping[str, int]]) -> list[str]:
+    """Create a non-repeating random order with Like-heavy moods first on average."""
+    remaining = list(MOODS)
+    ordered: list[str] = []
+    while remaining:
+        weights = [max(1, int(preferences[mood]["weight"])) for mood in remaining]
+        selected = random.choices(remaining, weights=weights, k=1)[0]
+        ordered.append(selected)
+        remaining.remove(selected)
+    return ordered
+
+
+def reserve_radio_track(user_id: int) -> Optional[dict[str, Any]]:
+    """RADIO: mix moods according to Likes, while always retaining variety."""
+    preferences = get_radio_mood_preferences(user_id)
+    try:
+        with db_connection() as connection, db_cursor(connection) as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
+            for mood in _weighted_mood_order(preferences):
+                fresh, liked, fallback = _track_pools(cursor, user_id, mood)
+                track = _choose_track(
+                    fresh, liked, fallback, RADIO_LIKED_REPLAY_PERCENT
+                )
+                if track:
+                    track["radio_weight"] = preferences[mood]["weight"]
+                    save_history(user_id, track)
+                    return track
+            return None
+    except Exception:
+        logger.exception("Could not reserve personalized Radio track")
         return None
+
 # ============================================================
 # TELEGRAM HTTP
 # ============================================================
@@ -2403,11 +2183,7 @@ def send_track(
         track.get("title")
         or "Unknown Track"
     )
-    mood = (
-        track.get("ai_mood")
-        or track.get("mood")
-        or "melodic"
-    )
+    mood = track.get("mood") or "melodic"
     if radio:
         text = (
             "📻  MY RADIO\n"
@@ -2415,7 +2191,7 @@ def send_track(
             f"🎧 {artist}\n"
             f"🎵 {title}\n\n"
             f"{MOOD_NAMES.get(mood, mood)}\n\n"
-            "✨ Recommended from your Like history."
+            "❤️ Selected from your Like-based Radio."
         )
     else:
         text = (
@@ -2593,136 +2369,70 @@ def is_admin(
         == ADMIN_USER_ID
     )
 # ============================================================
-# AI STATUS MESSAGE
+# STATUS REPORTING
 # ============================================================
-def ai_status_text() -> str:
-    status = get_ai_status()
-    total = status["total"]
-    done = status["done"]
-    pending = status["pending"]
-    failed = status["failed"]
-    if total:
-        progress = (
-            done / total
-        ) * 100
-    else:
-        progress = 0
-    if pending == 0:
-        if failed == 0:
-            state = "🟢 COMPLETED"
-        else:
-            state = "🟡 COMPLETED WITH ERRORS"
-    else:
-        state = "🔄 SCANNING"
-    ai_online = bool(
-        OPENAI_API_KEY
-    )
-    return (
-        "🤖  AI SCANNER\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"{state}\n\n"
-        f"🎵 Total: {total}\n"
-        f"✅ Analyzed: {done}\n"
-        f"⏳ Pending: {pending}\n"
-        f"❌ Failed: {failed}\n\n"
-        f"📊 Progress: {progress:.1f}%\n\n"
-        + (
-            "🟢 OpenAI: ONLINE"
-            if ai_online
-            else
-            "🔴 OpenAI: NOT CONFIGURED"
+def user_radio_status_text(user_id: int) -> str:
+    preferences = get_radio_mood_preferences(user_id)
+    mood = get_user_mood(user_id)
+    likes_total = sum(item["likes"] for item in preferences.values())
+    lines = [
+        "📻  MY RADIO STATUS",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"🎛 Current mood: {MOOD_NAMES.get(mood, 'Not selected')}",
+        f"📻 Radio: {'ON' if is_radio_active(user_id) else 'OFF'}",
+        f"❤️ Total Likes: {likes_total}",
+        "",
+        "YOUR MOOD WEIGHTS",
+    ]
+    for item_mood in MOODS:
+        info = preferences[item_mood]
+        lines.append(
+            f"{MOOD_NAMES[item_mood]} → ❤️ {info['likes']} | "
+            f"😴 {info['unlikes']} | weight {info['weight']}"
         )
-    )
-# ============================================================
-# ADMIN STATUS
-# ============================================================
-def admin_status_text() -> str:
-    with telethon_status_lock:
-        state = str(telethon_status.get("state") or "UNKNOWN")
-        detail = str(telethon_status.get("detail") or "-")
-        updated_at = int(telethon_status.get("updated_at") or 0)
-    label = {
-        "CONNECTED": "🟢 CONNECTED",
-        "CONNECTING": "🟡 CONNECTING",
-        "RECONNECTING": "🟡 RECONNECTING",
-        "AUTH_ERROR": "🔴 AUTH ERROR",
-        "CONFIG_ERROR": "🔴 CONFIG ERROR",
-        "WORKER_ERROR": "🔴 WORKER ERROR",
-        "STOPPED": "🔴 STOPPED",
-    }.get(state, f"⚪ {state}")
-    age = int(time.time()) - updated_at if updated_at else -1
-    return (
-        "👑  ADMIN BOT STATUS\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"📡 Telethon: {label}\n"
-        f"📝 Detail: {detail}\n"
-        f"🕒 Status age: {age}s\n\n"
-        "🤖 AI: DISABLED\n"
-        "📻 Radio: LIKE/MOOD WEIGHTED\n"
-        f"👥 Users: {get_users_count()}"
-    )
+    lines.extend([
+        "",
+        "Radio mixes all moods. More Likes = more chance.",
+        "Every mood keeps a small chance for variety.",
+    ])
+    return "\n".join(lines)
 
-# ============================================================
-# ADMIN STATS
-# ============================================================
-def send_stats(
-    chat_id: int,
-    user_id: int,
-) -> None:
+
+def send_stats(chat_id: int, user_id: int) -> None:
     if not is_admin(user_id):
-        send_message(
-            chat_id,
-            "❌ Admin only.",
-        )
+        send_message(chat_id, "❌ Admin only.")
         return
     counts = get_track_counts()
-    total = sum(
-        counts.values()
-    )
-    text = [
-        "💎  NOT YOUR VIBE",
+    total = sum(counts.values())
+    with telethon_status_lock:
+        telethon_state = str(telethon_status["state"])
+        telethon_detail = str(telethon_status["detail"])
+    lines = [
+        "💎  NOT YOUR VIBE — ADMIN STATUS",
         "━━━━━━━━━━━━━━━━━━",
         "",
         f"👥 Users: {get_users_count()}",
         f"🎵 Total Tracks: {total}",
+        f"📡 Telethon: {telethon_state}",
+        f"📝 Detail: {telethon_detail or '-'}",
         "",
-        "📡 MOODS",
-        "",
+        "MOOD CHANNEL TRACKS",
     ]
     for mood in MOODS:
-        text.append(
-            (
-                f"{MOOD_NAMES[mood]} "
-                f"→ {counts[mood]}"
-            )
+        scan = channel_scan_status[mood]
+        lines.append(
+            f"{MOOD_NAMES[mood]} → {counts[mood]} tracks | {scan['state']}"
         )
-    text.extend(
-        [
-            "",
-            "━━━━━━━━━━━━━━━━━━",
-            "",
-            "🤖 AI: DISABLED",
-            "📻 Radio: Like/Mood weighted recommendation",
-            "",
-            "━━━━━━━━━━━━━━━━━━",
-            "",
-            (
-                "🟢 Telethon: CONNECTED"
-                if telethon_ready.is_set()
-                else
-                (
-                    "🟡 Telethon: RECONNECTING"
-                    if telethon_status.get("state") in {"CONNECTING", "RECONNECTING"}
-                    else
-                    "🔴 Telethon: DISCONNECTED"
-                )
-            ),
-        ]
-    )
-    send_message(
-        chat_id,
-        "\n".join(text),
-    )
+    lines.extend([
+        "",
+        "Rule-based Radio: ON",
+        "AI/OpenAI: removed",
+        "",
+        "Admin commands: /stats, /telegram",
+    ])
+    send_message(chat_id, "\n".join(lines))
+
 # ============================================================
 # CALLBACK
 # ============================================================
@@ -2903,11 +2613,12 @@ def handle_callback(
                 "📻  MY RADIO\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
                 "Your Personal Radio is ON. ✨\n\n"
-                "❤️ Your Like history\n"
-                "📊 Like အများဆုံး Mood ကို ပိုဦးစားပေးမယ်\n"
-                "🚫 Recent tracks မပို့ဘူး\n\n"
-                "Like လုပ်ထားတဲ့ Mood တွေကို အချိုးကျရောပြီး\n"
-                "track ရွေးပေးပါမယ်။"
+                "❤️ Liked tracks\n"
+                "🎧 Listening history\n"
+                "🎛 Mood preference\n"
+                "🎲 Like-weighted mood mix\n\n"
+                "အားလုံးကိုအသုံးပြုပြီး "
+                "နောက်ထပ် track ရွေးပေးပါမယ်။"
             ),
         )
         if not schedule_radio(
@@ -3078,7 +2789,7 @@ def handle_message(
                 "🎛 Choose your mood\n"
                 "❤️ Like what you love\n"
                 "😴 Skip what you don't like\n"
-                "📻 Let AI build your Personal Radio\n\n"
+                "📻 Let your Likes build your Personal Radio\n\n"
                 "👇 SELECT YOUR MOOD"
             ),
             mood_menu(),
@@ -3160,9 +2871,10 @@ def handle_message(
                 "━━━━━━━━━━━━━━━━━━\n\n"
                 "Personal Radio is ON. ✨\n\n"
                 "❤️ Your Likes\n"
-                "📊 Like အများဆုံး Mood ကို ပိုဦးစားပေးမယ်\n"
-                "🚫 Recent tracks မပို့ဘူး\n\n"
-                "Like လုပ်ထားတဲ့ Mood တွေကို အချိုးကျရောပြီး\n"
+                "🎧 Your History\n"
+                "🎛 Your Mood\n"
+                "🎲 Like-weighted mood mix\n\n"
+                "အားလုံးကိုအသုံးပြုပြီး "
                 "music ရွေးပေးပါမယ်။"
             ),
         )
@@ -3234,26 +2946,17 @@ def handle_message(
             )
         return
     # ========================================================
-    # AI STATUS
+    # PERSONAL RADIO STATUS
     # ========================================================
-    if command in (
-        "/scan",
-        "/aistatus",
-    ):
-        if not is_admin(
-            user_id
-        ):
-            send_message(
-                chat_id,
-                "❌ Admin only.",
-            )
+    if command in ("/status", "/radiostatus"):
+        if not isinstance(user_id, int):
             return
-        send_stats(chat_id, user_id)
+        send_message(chat_id, user_radio_status_text(user_id))
         return
     # ========================================================
     # TELETHON
     # ========================================================
-    if command in ("/telegram", "/status"):
+    if command == "/telegram":
         if not is_admin(
             user_id
         ):
@@ -3264,7 +2967,7 @@ def handle_message(
             return
         send_message(
             chat_id,
-            admin_status_text() + "\n\n" + telethon_status_text(),
+            telethon_status_text(),
         )
         return
     # ========================================================
@@ -3286,7 +2989,7 @@ def handle_message(
                 "👑 ADMIN\n"
                 "/users → User count\n"
                 "/stats → Bot statistics\n"
-                "/scan → Admin system status\n"
+                "/scan → AI scan status\n"
                 "/telegram → Telethon status"
             ),
         )
@@ -3448,7 +3151,7 @@ def startup() -> bool:
         "========================================"
     )
     logger.info(
-        "💎 NOT YOUR VIBE MUSIC BOT v5 - PERSONAL RADIO"
+        "💎 NOT YOUR VIBE MUSIC BOT v4"
     )
     logger.info(
         "========================================"
@@ -3477,12 +3180,6 @@ def startup() -> bool:
         )
         return False
     # --------------------------------------------------------
-    # AI
-    # --------------------------------------------------------
-    logger.info(
-        "⚪ OpenAI disabled. Radio uses Like/Mood recommendation only."
-    )
-    # --------------------------------------------------------
     # Webhook
     # --------------------------------------------------------
     setup_webhook()
@@ -3504,7 +3201,7 @@ _background_started = False
 
 
 def start_background_services() -> bool:
-    """Start database, webhook, Telethon, and AI workers exactly once per process."""
+    """Start database, webhook, and the Telethon scanner once per process."""
     global _background_started
 
     with _background_start_lock:
