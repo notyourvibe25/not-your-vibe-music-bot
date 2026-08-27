@@ -380,11 +380,20 @@ def telethon_status_text() -> str:
     configured = sum(
         1 for mood in MOODS if MOOD_CHANNELS.get(mood)
     )
+    state_label = {
+        "CONNECTED": "🟢 CONNECTED",
+        "CONNECTING": "🟡 CONNECTING",
+        "RECONNECTING": "🟡 RECONNECTING",
+        "AUTH_ERROR": "🔴 AUTH ERROR",
+        "CONFIG_ERROR": "🔴 CONFIG ERROR",
+        "WORKER_ERROR": "🔴 WORKER ERROR",
+        "STOPPED": "🔴 STOPPED",
+    }.get(state, state)
     lines = [
         "📡  TELEGRAM CHANNEL SCANNER",
         "━━━━━━━━━━━━━━━━━━",
         "",
-        f"Telethon: {state}",
+        f"Telethon: {state_label}",
         f"Channels configured: {configured}/8",
         f"Detail: {detail or '-'}",
         "",
@@ -608,6 +617,13 @@ def init_db() -> None:
         cursor.execute(
             "UPDATE tracks SET ai_status='pending' WHERE ai_status IS NULL"
         )
+        # Retry tracks that failed under an older/broken AI request.
+        # This runs only at process startup; tracks that fail again stay
+        # failed until the next restart instead of retrying forever.
+        reset_failed = cursor.execute(
+            "UPDATE tracks SET ai_status='pending', ai_error=NULL WHERE ai_status='failed'"
+        )
+        logger.info("AI startup retry reset completed for previously failed tracks")
         cursor.execute(
             "ALTER TABLE tracks ALTER COLUMN ai_status SET DEFAULT 'pending'"
         )
@@ -1226,443 +1242,21 @@ def get_track(
         )
         return None
 # ============================================================
-# AI API
+# AI DISABLED
 # ============================================================
-def openai_request(
-    instructions: str,
-    input_text: str,
-) -> Optional[str]:
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        response = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers={
-                "Authorization":
-                    f"Bearer {OPENAI_API_KEY}",
-                "Content-Type":
-                    "application/json",
-            },
-            json={
-                "model": OPENAI_MODEL,
-                "instructions": instructions,
-                "input": input_text,
-            },
-            timeout=OPENAI_TIMEOUT,
-        )
-        if response.status_code >= 400:
-            logger.warning(
-                "OpenAI API error %s: %s",
-                response.status_code,
-                response.text[:500],
-            )
-            return None
-        data = response.json()
-        output_text = data.get(
-            "output_text"
-        )
-        if isinstance(
-            output_text,
-            str,
-        ):
-            return output_text.strip()
-        # Fallback parser.
-        outputs = data.get(
-            "output",
-            [],
-        )
-        pieces = []
-        for item in outputs:
-            for content in item.get(
-                "content",
-                [],
-            ):
-                text = content.get(
-                    "text"
-                )
-                if text:
-                    pieces.append(text)
-        result = "\n".join(
-            pieces
-        ).strip()
-        return result or None
-    except Exception:
-        logger.exception(
-            "OpenAI request failed"
-        )
-        return None
-# ============================================================
-# AI SONG ANALYSIS
-# ============================================================
-def ai_analyze_track(
-    artist: str,
-    title: str,
-) -> Optional[dict[str, Any]]:
-    instructions = """
-You are the music analysis engine for NOT YOUR VIBE MUSIC.
-Analyze songs using ONLY the artist name and song title.
-Do not invent facts.
-Return ONLY valid JSON.
-Schema:
-{
-  "mood": "sad|love|chill|hype|dark|energetic|night|melodic",
-  "genres": ["genre1", "genre2"],
-  "energy": 1,
-  "valence": 1,
-  "profile": "short description"
-}
-energy:
-1 = extremely calm
-10 = extremely energetic
-valence:
-1 = very sad/dark
-10 = very happy/uplifting
-Important:
-The mood must be exactly one of the eight allowed moods.
-The profile should describe the musical feeling/style useful for
-personal music recommendation.
-Never create a fake song.
-"""
-    prompt = (
-        f"Artist: {artist}\n"
-        f"Title: {title}"
+# Radio recommendations are now fully database-driven. OpenAI is not used.
+def ai_status_text() -> str:
+    return (
+        "🤖  AI SCANNER\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "⚪ DISABLED\n\n"
+        "AI is not used by this version.\n"
+        "📻 Radio uses your Like history + mood preference weights.\n"
+        "No OpenAI quota or API key is required."
     )
-    result = openai_request(
-        instructions,
-        prompt,
-    )
-    if not result:
-        return None
-    try:
-        # Remove accidental markdown fences.
-        result = result.strip()
-        result = re.sub(
-            r"^```(?:json)?",
-            "",
-            result,
-            flags=re.I,
-        )
-        result = re.sub(
-            r"```$",
-            "",
-            result,
-        ).strip()
-        data = json.loads(result)
-        mood = data.get(
-            "mood"
-        )
-        if mood not in MOODS:
-            mood = "melodic"
-        genres = data.get(
-            "genres",
-            [],
-        )
-        if not isinstance(
-            genres,
-            list,
-        ):
-            genres = []
-        genres = [
-            str(x)[:80]
-            for x in genres[:8]
-        ]
-        try:
-            energy = int(
-                data.get(
-                    "energy",
-                    5,
-                )
-            )
-        except Exception:
-            energy = 5
-        try:
-            valence = int(
-                data.get(
-                    "valence",
-                    5,
-                )
-            )
-        except Exception:
-            valence = 5
-        energy = max(
-            1,
-            min(10, energy),
-        )
-        valence = max(
-            1,
-            min(10, valence),
-        )
-        profile = str(
-            data.get(
-                "profile",
-                "",
-            )
-        )[:1000]
-        return {
-            "mood": mood,
-            "genres": genres,
-            "energy": energy,
-            "valence": valence,
-            "profile": profile,
-        }
-    except Exception:
-        logger.warning(
-            "AI returned invalid JSON: %s",
-            result[:500],
-        )
-        return None
-# ============================================================
-# AI UPDATE
-# ============================================================
-def mark_ai_success(
-    track_id: int,
-    analysis: dict[str, Any],
-) -> None:
-    try:
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-            cursor.execute(
-                """
-                UPDATE tracks
-                SET
-                    ai_status='done',
-                    ai_mood=%s,
-                    ai_genres=%s,
-                    ai_energy=%s,
-                    ai_valence=%s,
-                    ai_profile=%s,
-                    ai_scanned_at=%s,
-                    ai_error=NULL
-                WHERE id=%s
-                """,
-                (
-                    analysis["mood"],
-                    json.dumps(
-                        analysis["genres"],
-                        ensure_ascii=False,
-                    ),
-                    analysis["energy"],
-                    analysis["valence"],
-                    analysis["profile"],
-                    int(time.time()),
-                    track_id,
-                ),
-            )
-    except Exception:
-        logger.exception(
-            "Could not save AI analysis"
-        )
-def mark_ai_failed(
-    track_id: int,
-    error: str,
-) -> None:
-    try:
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-            cursor.execute(
-                """
-                UPDATE tracks
-                SET
-                    ai_status='failed',
-                    ai_error=%s
-                WHERE id=%s
-                """,
-                (
-                    error[:1000],
-                    track_id,
-                ),
-            )
-    except Exception:
-        logger.exception(
-            "Could not save AI failure"
-        )
-# ============================================================
-# AI SCAN ONE
-# ============================================================
-def scan_track_with_ai(
-    track: Mapping[str, Any],
-) -> bool:
-    track_id = int(
-        track["id"]
-    )
-    artist = (
-        track.get("artist")
-        or "Unknown Artist"
-    )
-    title = (
-        track.get("title")
-        or "Unknown Track"
-    )
-    analysis = ai_analyze_track(
-        artist,
-        title,
-    )
-    if not analysis:
-        mark_ai_failed(
-            track_id,
-            "AI analysis failed",
-        )
-        return False
-    mark_ai_success(
-        track_id,
-        analysis,
-    )
-    logger.info(
-        (
-            "🤖 AI SCAN DONE | "
-            "%s - %s | mood=%s"
-        ),
-        artist,
-        title,
-        analysis["mood"],
-    )
-    return True
-# ============================================================
-# AI SCAN STATUS
-# ============================================================
+
 def get_ai_status() -> dict[str, int]:
-    result = {
-        "total": 0,
-        "done": 0,
-        "pending": 0,
-        "failed": 0,
-    }
-    try:
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-            cursor.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER(
-                        WHERE ai_status='done'
-                    ) AS done,
-                    COUNT(*) FILTER(
-                        WHERE ai_status='pending'
-                    ) AS pending,
-                    COUNT(*) FILTER(
-                        WHERE ai_status='failed'
-                    ) AS failed
-                FROM tracks
-                """
-            )
-            row = cursor.fetchone()
-            if row:
-                for key in result:
-                    result[key] = int(
-                        row[key] or 0
-                    )
-    except Exception:
-        logger.exception(
-            "Could not get AI status"
-        )
-    return result
-def reset_failed_ai_tracks() -> int:
-    """Reset old failed scans so tracks that failed because of a temporary API
-    request error can be analyzed again after the configuration is fixed.
-    """
-    try:
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-            cursor.execute(
-                """
-                UPDATE tracks
-                SET ai_status='pending',
-                    ai_error=NULL
-                WHERE ai_status='failed'
-                """
-            )
-            count = cursor.rowcount
-            if count:
-                logger.info(
-                    "🤖 Reset %s previously failed AI tracks to pending",
-                    count,
-                )
-            return count
-    except Exception:
-        logger.exception("Could not reset failed AI tracks")
-        return 0
-
-
-def get_pending_ai_tracks(
-    limit: int,
-) -> list[dict[str, Any]]:
-    try:
-        with (
-            db_connection() as connection,
-            db_cursor(connection) as cursor
-        ):
-            cursor.execute(
-                """
-                SELECT *
-                FROM tracks
-                WHERE ai_status='pending'
-                ORDER BY id ASC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            return [
-                dict(row)
-                for row in cursor.fetchall()
-            ]
-    except Exception:
-        logger.exception(
-            "Could not get AI pending tracks"
-        )
-        return []
-# ============================================================
-# BACKGROUND AI SCANNER
-# ============================================================
-def ai_scanner_worker() -> None:
-    if not OPENAI_API_KEY:
-        logger.warning(
-            "🤖 AI scanner disabled: OPENAI_API_KEY missing"
-        )
-        return
-    logger.info(
-        "🤖 AI scanner started"
-    )
-    while True:
-        try:
-            tracks = get_pending_ai_tracks(
-                AI_BATCH_SIZE
-            )
-            if not tracks:
-                time.sleep(
-                    AI_SCAN_INTERVAL
-                )
-                continue
-            for track in tracks:
-                try:
-                    scan_track_with_ai(
-                        track
-                    )
-                except Exception:
-                    logger.exception(
-                        "AI track scan failed"
-                    )
-                time.sleep(1)
-        except Exception:
-            logger.exception(
-                "AI scanner error"
-            )
-            time.sleep(10)
-def start_ai_scanner() -> None:
-    thread = threading.Thread(
-        target=ai_scanner_worker,
-        name="ai-scanner",
-        daemon=True,
-    )
-    thread.start()
+    return {"total": 0, "done": 0, "pending": 0, "failed": 0}
 # ============================================================
 # TELETHON MESSAGE SAVE
 # ============================================================
@@ -1919,6 +1513,12 @@ async def periodic_scanner() -> None:
 # TELETHON WORKER
 # ============================================================
 def telethon_worker() -> None:
+    """Keep one Telethon client alive and reconnect it after transient failures.
+
+    A normal disconnect and an exception both enter the same reconnect loop.
+    Authentication/configuration errors are terminal because retrying the same
+    StringSession cannot fix them.
+    """
     global telethon_client
 
     missing = []
@@ -1943,29 +1543,41 @@ def telethon_worker() -> None:
 
     async def runner() -> None:
         global telethon_client
+
         while True:
             client: Optional[TelegramClient] = None
             scanner_task: Optional[asyncio.Task[Any]] = None
             try:
-                set_telethon_status("CONNECTING", "Connecting with the supplied StringSession")
+                set_telethon_status(
+                    "CONNECTING",
+                    "Connecting with the supplied StringSession",
+                )
+                logger.info("📡 Telethon connecting...")
+
                 client = TelegramClient(
                     StringSession(TELETHON_SESSION),
                     api_id,
                     TELETHON_API_HASH,
-                    connection_retries=5,
+                    connection_retries=8,
                     retry_delay=5,
-                    request_retries=5,
+                    request_retries=8,
                     timeout=30,
                     auto_reconnect=True,
                     flood_sleep_threshold=60,
                 )
+
                 telethon_client = client
                 register_telethon_events(client)
+
                 await client.connect()
 
                 if not client.is_connected():
-                    raise ConnectionError("Telethon connect() completed without a connection")
+                    raise ConnectionError(
+                        "Telethon connect() completed without a connection"
+                    )
+
                 if not await client.is_user_authorized():
+                    telethon_ready.clear()
                     set_telethon_status(
                         "AUTH_ERROR",
                         "StringSession is unauthorized. Create a new authorized session.",
@@ -1979,24 +1591,57 @@ def telethon_worker() -> None:
                     or getattr(me, "first_name", None)
                     or "authorized account"
                 )
+
                 telethon_ready.set()
-                set_telethon_status("CONNECTED", f"Logged in as {account_name}; initial 8-channel scan started")
-                logger.info("TELETHON CONNECTED as %s", account_name)
+                set_telethon_status(
+                    "CONNECTED",
+                    f"Logged in as {account_name}; initial channel scan started",
+                )
+                logger.info("🟢 TELETHON CONNECTED as %s", account_name)
 
                 await scan_all_channels(
                     limit=None if INITIAL_SCAN_LIMIT == 0 else INITIAL_SCAN_LIMIT,
                     reason="initial",
                 )
-                set_telethon_status("CONNECTED", f"Watcher active; {sum(1 for m in MOODS if MOOD_CHANNELS.get(m))}/8 channels configured")
+
+                set_telethon_status(
+                    "CONNECTED",
+                    f"Watcher active; {sum(1 for m in MOODS if MOOD_CHANNELS.get(m))}/8 channels configured",
+                )
                 scanner_task = asyncio.create_task(periodic_scanner())
+
+                # Blocks until Telethon is actually disconnected.
                 await client.run_until_disconnected()
+
+                # run_until_disconnected() can return without raising when the
+                # connection closes. Mark it explicitly so the UI does not
+                # falsely show CONNECTED during the reconnect delay.
+                telethon_ready.clear()
+                set_telethon_status(
+                    "RECONNECTING",
+                    f"Connection closed; retrying in {TELETHON_RECONNECT_DELAY}s",
+                )
+                logger.warning(
+                    "🔴 Telethon connection closed; reconnecting in %s seconds",
+                    TELETHON_RECONNECT_DELAY,
+                )
+
             except asyncio.CancelledError:
+                telethon_ready.clear()
+                set_telethon_status("STOPPED", "Worker cancelled")
                 raise
+
             except Exception as exc:
-                set_telethon_status("DISCONNECTED", f"{type(exc).__name__}: {str(exc)[:240]}")
-                logger.exception("Telethon connection error")
+                telethon_ready.clear()
+                set_telethon_status(
+                    "RECONNECTING",
+                    f"{type(exc).__name__}: {str(exc)[:200]} | retrying in {TELETHON_RECONNECT_DELAY}s",
+                )
+                logger.exception("Telethon connection error; will reconnect")
+
             finally:
                 telethon_ready.clear()
+
                 if scanner_task is not None:
                     scanner_task.cancel()
                     try:
@@ -2005,28 +1650,37 @@ def telethon_worker() -> None:
                         pass
                     except Exception:
                         logger.exception("Periodic scanner cleanup error")
+
                 if client is not None:
                     try:
                         if client.is_connected():
                             await client.disconnect()
                     except Exception:
-                        logger.exception("Telethon disconnect error")
+                        logger.exception("Telethon disconnect cleanup error")
+
                 if telethon_client is client:
                     telethon_client = None
 
-            # AUTH_ERROR needs a newly generated session, not an endless retry.
+            # AUTH_ERROR is terminal: a new StringSession is required.
             with telethon_status_lock:
                 terminal_auth_error = telethon_status["state"] == "AUTH_ERROR"
             if terminal_auth_error:
                 return
-            logger.warning("Telethon disconnected; reconnecting in %s seconds", TELETHON_RECONNECT_DELAY)
+
+            set_telethon_status(
+                "RECONNECTING",
+                f"Waiting {TELETHON_RECONNECT_DELAY}s before reconnect",
+            )
             await asyncio.sleep(TELETHON_RECONNECT_DELAY)
 
     try:
         asyncio.run(runner())
     except Exception as exc:
         telethon_ready.clear()
-        set_telethon_status("WORKER_ERROR", f"{type(exc).__name__}: {str(exc)[:240]}")
+        set_telethon_status(
+            "WORKER_ERROR",
+            f"{type(exc).__name__}: {str(exc)[:240]}",
+        )
         logger.exception("Telethon worker stopped")
 
 
@@ -2374,300 +2028,106 @@ def reserve_track(
         )
         return None
 # ============================================================
-# AI PERSONAL RADIO
+# PERSONAL RADIO — LIKE + MOOD WEIGHTED
 # ============================================================
-def build_radio_candidate_text(
-    tracks: list[dict[str, Any]],
-) -> str:
-    lines = []
-    for track in tracks:
-        genres = track.get(
-            "ai_genres"
-        )
-        if isinstance(
-            genres,
-            str,
-        ):
-            try:
-                genres = json.loads(
-                    genres
-                )
-            except Exception:
-                genres = []
-        if not isinstance(
-            genres,
-            list,
-        ):
-            genres = []
-        lines.append(
-            (
-                f"ID={track['id']} | "
-                f"Artist={track.get('artist') or 'Unknown'} | "
-                f"Title={track.get('title') or 'Unknown'} | "
-                f"Mood={track.get('mood')} | "
-                f"AI Mood={track.get('ai_mood')} | "
-                f"Genres={','.join(map(str, genres))} | "
-                f"Energy={track.get('ai_energy')} | "
-                f"Valence={track.get('ai_valence')} | "
-                f"Profile={track.get('ai_profile') or ''}"
-            )
-        )
-    return "\n".join(lines)
-def ai_choose_radio_track(
-    likes: list[dict[str, Any]],
-    candidates: list[dict[str, Any]],
-) -> Optional[int]:
-    if not OPENAI_API_KEY:
-        return None
-    if not candidates:
-        return None
-    liked_text = build_radio_candidate_text(
-        likes
-    )
-    candidate_text = build_radio_candidate_text(
-        candidates
-    )
-    instructions = """
-You are the recommendation engine for
-NOT YOUR VIBE MUSIC.
-The user has liked some songs.
-Choose ONE candidate track that best matches
-the user's liked music.
-Use:
-- artist similarity
-- title/style clues
-- mood
-- genre
-- energy
-- valence
-- AI profile
-IMPORTANT:
-You may ONLY choose an ID from the candidate list.
-Never invent an ID.
-Return ONLY JSON:
-{
-  "track_id": 123,
-  "reason": "short reason"
-}
-"""
-    prompt = (
-        "LIKED TRACKS:\n"
-        + liked_text
-        + "\n\n"
-        + "CANDIDATES:\n"
-        + candidate_text
-    )
-    result = openai_request(
-        instructions,
-        prompt,
-    )
-    if not result:
-        return None
-    try:
-        result = re.sub(
-            r"^```(?:json)?",
-            "",
-            result.strip(),
-            flags=re.I,
-        )
-        result = re.sub(
-            r"```$",
-            "",
-            result,
-        ).strip()
-        data = json.loads(
-            result
-        )
-        track_id = int(
-            data["track_id"]
-        )
-        allowed = {
-            int(track["id"])
-            for track in candidates
-        }
-        if track_id in allowed:
-            return track_id
-    except Exception:
-        logger.warning(
-            "Invalid AI radio response: %s",
-            result[:500],
-        )
-    return None
 def reserve_radio_track(
     user_id: int,
 ) -> Optional[dict[str, Any]]:
+    """Pick a Radio track using only the user's Like/Unlike history.
+
+    Radio has no manual mood filter. Instead, each mood gets a weight from
+    how many liked tracks the user has in that mood. Higher-liked moods are
+    recommended more often, while every mood with likes still gets a chance.
+    Recent tracks and explicit unlikes are excluded. Liked tracks may return
+    again after their recent-history cooldown.
+    """
     try:
-        likes = get_user_likes(
-            user_id,
-            30,
-        )
-        recent_ids = get_recent_track_ids(
-            user_id,
-            RECENT_HISTORY_LIMIT,
-        )
-        unlikes = get_user_unlikes(
-            user_id
-        )
-        selected_mood = get_user_mood(
-            user_id
-        )
+        likes = get_user_likes(user_id, 200)
+        if not likes:
+            return None
+
+        recent_ids = get_recent_track_ids(user_id, RECENT_HISTORY_LIMIT)
+        unlikes = get_user_unlikes(user_id, 500)
+        liked_ids = {int(x["id"]) for x in likes}
+
+        # Mood preference comes ONLY from liked tracks.
+        mood_counts = {mood: 0 for mood in MOODS}
+        for track in likes:
+            mood = str(track.get("mood") or "").lower()
+            if mood in mood_counts:
+                mood_counts[mood] += 1
+
+        active_moods = [m for m in MOODS if mood_counts[m] > 0]
+        if not active_moods:
+            return None
+
+        # Weight = like count, with a small floor so less-liked moods remain
+        # discoverable. This naturally gives more tracks to the most-liked mood.
+        weights = {m: max(1, mood_counts[m]) for m in active_moods}
+
+        # Fetch a broad pool from only moods the user has liked.
+        placeholders = ",".join(["%s"] * len(active_moods))
+        params: list[Any] = list(active_moods)
+        params.extend([list(unlikes) or [-1], TRACK_CANDIDATE_LIMIT * 8])
+
         with db_connection() as connection:
             with db_cursor(connection) as cursor:
                 cursor.execute(
-                    """
-                    SELECT pg_advisory_xact_lock(%s)
+                    f"""
+                    SELECT *
+                    FROM tracks
+                    WHERE mood IN ({placeholders})
+                    AND id <> ALL(%s)
+                    ORDER BY RANDOM()
+                    LIMIT %s
                     """,
-                    (user_id,),
+                    tuple(params),
                 )
-                # ---------------------------------------------
-                # Candidate pool
-                # ---------------------------------------------
-                if selected_mood:
-                    cursor.execute(
-                        """
-                        SELECT *
-                        FROM tracks
-                        WHERE mood=%s
-                        AND id <> ALL(%s)
-                        ORDER BY RANDOM()
-                        LIMIT %s
-                        """,
-                        (
-                            selected_mood,
-                            list(unlikes)
-                            or [-1],
-                            TRACK_CANDIDATE_LIMIT,
-                        ),
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        SELECT *
-                        FROM tracks
-                        WHERE id <> ALL(%s)
-                        ORDER BY RANDOM()
-                        LIMIT %s
-                        """,
-                        (
-                            list(unlikes)
-                            or [-1],
-                            TRACK_CANDIDATE_LIMIT,
-                        ),
-                    )
-                candidates = [
-                    dict(row)
-                    for row in cursor.fetchall()
-                ]
-                candidates = [
-                    track
-                    for track in candidates
-                    if int(track["id"])
-                    not in recent_ids
-                ]
-                # ---------------------------------------------
-                # If no recent-safe candidates,
-                # relax recent-history only.
-                # ---------------------------------------------
-                if not candidates:
-                    if selected_mood:
-                        cursor.execute(
-                            """
-                            SELECT *
-                            FROM tracks
-                            WHERE mood=%s
-                            AND id <> ALL(%s)
-                            ORDER BY RANDOM()
-                            LIMIT %s
-                            """,
-                            (
-                                selected_mood,
-                                list(unlikes)
-                                or [-1],
-                                TRACK_CANDIDATE_LIMIT,
-                            ),
-                        )
-                    else:
-                        cursor.execute(
-                            """
-                            SELECT *
-                            FROM tracks
-                            WHERE id <> ALL(%s)
-                            ORDER BY RANDOM()
-                            LIMIT %s
-                            """,
-                            (
-                                list(unlikes)
-                                or [-1],
-                                TRACK_CANDIDATE_LIMIT,
-                            ),
-                        )
-                    candidates = [
-                        dict(row)
-                        for row in cursor.fetchall()
-                    ]
-                if not candidates:
-                    return None
-                # ---------------------------------------------
-                # AI recommendation
-                # ---------------------------------------------
-                chosen_id = None
-                if likes:
-                    chosen_id = (
-                        ai_choose_radio_track(
-                            likes,
-                            candidates,
-                        )
-                    )
-                # ---------------------------------------------
-                # Fallback
-                # ---------------------------------------------
-                if chosen_id is not None:
-                    chosen = next(
-                        (
-                            x
-                            for x in candidates
-                            if int(x["id"])
-                            == chosen_id
-                        ),
-                        None,
-                    )
-                else:
-                    # If there are likes but AI is
-                    # temporarily unavailable,
-                    # prefer same mood / artist.
-                    chosen = None
-                    if likes:
-                        liked_artists = {
-                            str(
-                                x.get("artist") or ""
-                            ).lower()
-                            for x in likes
-                        }
-                        artist_matches = [
-                            x
-                            for x in candidates
-                            if str(
-                                x.get("artist") or ""
-                            ).lower()
-                            in liked_artists
-                        ]
-                        if artist_matches:
-                            chosen = random.choice(
-                                artist_matches
-                            )
-                    if chosen is None:
-                        chosen = random.choice(
-                            candidates
-                        )
-                save_history(
-                    user_id,
-                    chosen,
-                )
-                return chosen
-    except Exception:
-        logger.exception(
-            "Could not reserve radio track"
+                pool = [dict(row) for row in cursor.fetchall()]
+
+        # Strongly prefer tracks that haven't been sent recently.
+        candidates = [
+            t for t in pool
+            if int(t["id"]) not in recent_ids
+            and int(t["id"]) not in unlikes
+        ]
+
+        if not candidates:
+            # If all available tracks are in recent history, keep unlikes
+            # excluded but allow older history as a final fallback.
+            candidates = [
+                t for t in pool
+                if int(t["id"]) not in unlikes
+            ]
+        if not candidates:
+            return None
+
+        # Score each candidate:
+        # - mood popularity is the main factor
+        # - liked tracks get a bonus so they can reappear after cooldown
+        # - unseen tracks remain available for discovery
+        scored: list[tuple[dict[str, Any], float]] = []
+        for track in candidates:
+            mood = str(track.get("mood") or "").lower()
+            base = float(weights.get(mood, 1))
+            if int(track["id"]) in liked_ids:
+                base *= 1.35
+            # Small random factor prevents the same highest-score track from
+            # dominating every Radio request.
+            score = base * random.uniform(0.85, 1.15)
+            scored.append((track, score))
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        top_n = min(
+            max(8, len(scored) // 4),
+            len(scored),
         )
+        chosen = random.choice(scored[:top_n])[0]
+
+        save_history(user_id, chosen)
+        return chosen
+    except Exception:
+        logger.exception("Could not reserve radio track")
         return None
 # ============================================================
 # TELEGRAM HTTP
@@ -2955,7 +2415,7 @@ def send_track(
             f"🎧 {artist}\n"
             f"🎵 {title}\n\n"
             f"{MOOD_NAMES.get(mood, mood)}\n\n"
-            "✨ AI selected for your taste."
+            "✨ Recommended from your Like history."
         )
     else:
         text = (
@@ -3174,6 +2634,35 @@ def ai_status_text() -> str:
         )
     )
 # ============================================================
+# ADMIN STATUS
+# ============================================================
+def admin_status_text() -> str:
+    with telethon_status_lock:
+        state = str(telethon_status.get("state") or "UNKNOWN")
+        detail = str(telethon_status.get("detail") or "-")
+        updated_at = int(telethon_status.get("updated_at") or 0)
+    label = {
+        "CONNECTED": "🟢 CONNECTED",
+        "CONNECTING": "🟡 CONNECTING",
+        "RECONNECTING": "🟡 RECONNECTING",
+        "AUTH_ERROR": "🔴 AUTH ERROR",
+        "CONFIG_ERROR": "🔴 CONFIG ERROR",
+        "WORKER_ERROR": "🔴 WORKER ERROR",
+        "STOPPED": "🔴 STOPPED",
+    }.get(state, f"⚪ {state}")
+    age = int(time.time()) - updated_at if updated_at else -1
+    return (
+        "👑  ADMIN BOT STATUS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📡 Telethon: {label}\n"
+        f"📝 Detail: {detail}\n"
+        f"🕒 Status age: {age}s\n\n"
+        "🤖 AI: DISABLED\n"
+        "📻 Radio: LIKE/MOOD WEIGHTED\n"
+        f"👥 Users: {get_users_count()}"
+    )
+
+# ============================================================
 # ADMIN STATS
 # ============================================================
 def send_stats(
@@ -3212,7 +2701,8 @@ def send_stats(
             "",
             "━━━━━━━━━━━━━━━━━━",
             "",
-            ai_status_text(),
+            "🤖 AI: DISABLED",
+            "📻 Radio: Like/Mood weighted recommendation",
             "",
             "━━━━━━━━━━━━━━━━━━",
             "",
@@ -3220,7 +2710,12 @@ def send_stats(
                 "🟢 Telethon: CONNECTED"
                 if telethon_ready.is_set()
                 else
-                "🔴 Telethon: DISCONNECTED"
+                (
+                    "🟡 Telethon: RECONNECTING"
+                    if telethon_status.get("state") in {"CONNECTING", "RECONNECTING"}
+                    else
+                    "🔴 Telethon: DISCONNECTED"
+                )
             ),
         ]
     )
@@ -3407,13 +2902,12 @@ def handle_callback(
             (
                 "📻  MY RADIO\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                "Your AI Personal Radio is ON. ✨\n\n"
-                "❤️ Liked tracks\n"
-                "🎧 Listening history\n"
-                "🎛 Mood preference\n"
-                "🤖 AI music similarity\n\n"
-                "အားလုံးကိုအသုံးပြုပြီး "
-                "နောက်ထပ် track ရွေးပေးပါမယ်။"
+                "Your Personal Radio is ON. ✨\n\n"
+                "❤️ Your Like history\n"
+                "📊 Like အများဆုံး Mood ကို ပိုဦးစားပေးမယ်\n"
+                "🚫 Recent tracks မပို့ဘူး\n\n"
+                "Like လုပ်ထားတဲ့ Mood တွေကို အချိုးကျရောပြီး\n"
+                "track ရွေးပေးပါမယ်။"
             ),
         )
         if not schedule_radio(
@@ -3664,12 +3158,11 @@ def handle_message(
             (
                 "📻  MY RADIO\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                "AI Personal Radio is ON. ✨\n\n"
+                "Personal Radio is ON. ✨\n\n"
                 "❤️ Your Likes\n"
-                "🎧 Your History\n"
-                "🎛 Your Mood\n"
-                "🤖 AI Similarity\n\n"
-                "အားလုံးကိုအသုံးပြုပြီး "
+                "📊 Like အများဆုံး Mood ကို ပိုဦးစားပေးမယ်\n"
+                "🚫 Recent tracks မပို့ဘူး\n\n"
+                "Like လုပ်ထားတဲ့ Mood တွေကို အချိုးကျရောပြီး\n"
                 "music ရွေးပေးပါမယ်။"
             ),
         )
@@ -3755,15 +3248,12 @@ def handle_message(
                 "❌ Admin only.",
             )
             return
-        send_message(
-            chat_id,
-            ai_status_text(),
-        )
+        send_stats(chat_id, user_id)
         return
     # ========================================================
     # TELETHON
     # ========================================================
-    if command == "/telegram":
+    if command in ("/telegram", "/status"):
         if not is_admin(
             user_id
         ):
@@ -3774,7 +3264,7 @@ def handle_message(
             return
         send_message(
             chat_id,
-            telethon_status_text(),
+            admin_status_text() + "\n\n" + telethon_status_text(),
         )
         return
     # ========================================================
@@ -3789,14 +3279,14 @@ def handle_message(
                 "/start → Start\n"
                 "/mood → Mood selector\n"
                 "/next → Next track\n"
-                "/radio → AI Personal Radio\n"
+                "/radio → Personal Radio\n"
                 "/stopradio → Stop Radio\n\n"
                 "❤️ Like → Save your taste\n"
                 "😴 Unlike → Avoid track\n\n"
                 "👑 ADMIN\n"
                 "/users → User count\n"
                 "/stats → Bot statistics\n"
-                "/scan → AI scan status\n"
+                "/scan → Admin system status\n"
                 "/telegram → Telethon status"
             ),
         )
@@ -3958,7 +3448,7 @@ def startup() -> bool:
         "========================================"
     )
     logger.info(
-        "💎 NOT YOUR VIBE MUSIC BOT v4"
+        "💎 NOT YOUR VIBE MUSIC BOT v5 - PERSONAL RADIO"
     )
     logger.info(
         "========================================"
@@ -3981,10 +3471,6 @@ def startup() -> bool:
     # --------------------------------------------------------
     try:
         init_db()
-        # Previous deployment marked tracks as failed because the OpenAI
-        # request included an unsupported `temperature` parameter.
-        # Put those tracks back into the AI queue after the fix.
-        reset_failed_ai_tracks()
     except Exception:
         logger.exception(
             "❌ PostgreSQL initialization failed"
@@ -3993,17 +3479,9 @@ def startup() -> bool:
     # --------------------------------------------------------
     # AI
     # --------------------------------------------------------
-    if OPENAI_API_KEY:
-        logger.info(
-            "🟢 OpenAI AI configured"
-        )
-    else:
-        logger.warning(
-            (
-                "🟡 OPENAI_API_KEY missing. "
-                "AI scanner/recommendation disabled."
-            )
-        )
+    logger.info(
+        "⚪ OpenAI disabled. Radio uses Like/Mood recommendation only."
+    )
     # --------------------------------------------------------
     # Webhook
     # --------------------------------------------------------
@@ -4012,10 +3490,6 @@ def startup() -> bool:
     # Telethon
     # --------------------------------------------------------
     start_telethon_worker()
-    # --------------------------------------------------------
-    # AI Scanner
-    # --------------------------------------------------------
-    start_ai_scanner()
     logger.info(
         "🟢 BOT SERVER READY"
     )
