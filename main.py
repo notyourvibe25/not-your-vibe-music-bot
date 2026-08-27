@@ -228,19 +228,14 @@ RECOMMENDATION_HISTORY_LIMIT = env_int(
 )
 
 # Like signal weight
-LIKE_WEIGHT = 10.0
 
 # Not-for-me signal
-DISLIKE_WEIGHT = -14.0
 
 # Next ကို neutral / slight negative
-NEXT_WEIGHT = -1.5
 
 # Same mood preference
-MOOD_PREFERENCE_WEIGHT = 3.0
 
 # Radio random variation
-RADIO_RANDOMNESS = 8.0
 
 
 # ============================================================
@@ -272,8 +267,7 @@ MOOD_INFO = {
     "love": {
         "name": "❤️ LOVE",
         "description": (
-            "For the moments that make your "
-            "heart beat a little faster."
+            "For the moments that make your heart beat a little faster."
         ),
     },
 
@@ -1724,61 +1718,86 @@ def choose_next_track(
 
 
 def get_mood_like_ratios(user_id: int) -> dict[str, float]:
-    """Like ratio = likes / (likes + not-for-me + next).
-
-    Moods with no feedback get 0.0, so actual user taste drives Radio.
-    """
+    """Like ratio considers all explicit signals for each mood."""
     prefs = get_user_preferences(user_id)
     ratios: dict[str, float] = {}
     for mood in MOODS:
-        p = prefs[mood]
-        total = p["like"] + p["not_for_me"] + p["next"]
-        ratios[mood] = (p["like"] / total) if total > 0 else 0.0
+        data = prefs[mood]
+        total = data["like"] + data["not_for_me"] + data["next"]
+        ratios[mood] = (data["like"] / total) if total > 0 else 0.0
     return ratios
 
 
-def choose_radio_mood(
-    user_id: int,
-    current_mood: str,
-) -> Optional[str]:
-    """
-    Radio is NOT controlled by the selected mood.
+def get_radio_mood_weights(user_id: int) -> dict[str, float]:
+    """Convert Like volume and Like ratio into transparent Radio weights.
 
-    First Radio track: always the mood with the user's highest like ratio.
-    Following tracks: weighted mix using each mood's like ratio, while
-    giving the highest-ratio mood the strongest weight.
+    A mood with more Likes always receives more priority. The ratio provides a
+    secondary quality signal, while every available mood later receives a
+    small exploration chance.
     """
-    available = [m for m, count in get_track_counts().items() if count > 0]
+    prefs = get_user_preferences(user_id)
+    ratios = get_mood_like_ratios(user_id)
+    weights: dict[str, float] = {}
+    for mood in MOODS:
+        data = prefs[mood]
+        likes = data["like"]
+        dislikes = data["not_for_me"]
+        skips = data["next"]
+        # Like count is primary; Like ratio is secondary. Unlike/Next reduce
+        # a mood's chance but cannot reduce it below the exploration floor.
+        weights[mood] = max(
+            0.25,
+            1.0 + (likes * 10.0) + (ratios[mood] * 5.0)
+            - (dislikes * 2.0) - (skips * 0.5),
+        )
+    return weights
+
+
+def choose_radio_mood(user_id: int) -> Optional[str]:
+    """Pick a cross-mood Radio source without using the selected mood.
+
+    The first Radio track after a new Radio session comes from the mood with
+    the greatest Like count. Later tracks use a weighted mix across all eight
+    moods, so lower-liked moods retain some variety.
+    """
+    counts = get_track_counts()
+    available = [mood for mood in MOODS if counts.get(mood, 0) > 0]
     if not available:
         return None
 
+    prefs = get_user_preferences(user_id)
     ratios = get_mood_like_ratios(user_id)
-    ordered = sorted(available, key=lambda m: ratios.get(m, 0.0), reverse=True)
+    weights = get_radio_mood_weights(user_id)
     radio_index = get_radio_index(user_id)
 
-    # First track after pressing RADIO: highest like-ratio mood.
     if radio_index == 0:
-        top_ratio = ratios.get(ordered[0], 0.0)
-        if top_ratio > 0:
+        # First: absolute Like volume, then Like ratio, then fewer dislikes.
+        ordered = sorted(
+            available,
+            key=lambda mood: (
+                prefs[mood]["like"],
+                ratios[mood],
+                -prefs[mood]["not_for_me"],
+            ),
+            reverse=True,
+        )
+        if prefs[ordered[0]]["like"] > 0:
             return ordered[0]
-        # No feedback yet: only then use the selected mood as a neutral fallback.
-        return current_mood if current_mood in available else ordered[0]
+        # No Likes yet: explore all available moods fairly.
+        return random.choice(available)
 
-    # Subsequent Radio tracks: explore other moods according to like ratio.
-    # Small exploration floor keeps Radio from becoming a single-mood loop.
-    weights = []
-    for mood in available:
-        ratio = ratios.get(mood, 0.0)
-        weights.append(max(0.08, ratio) ** 1.35)
-    return random.choices(available, weights=weights, k=1)[0]
+    # After the first Radio track, mix moods according to user preferences.
+    # The 0.25 floor preserves a small chance for every available mood.
+    return random.choices(
+        available,
+        weights=[weights[mood] for mood in available],
+        k=1,
+    )[0]
 
 
-def choose_radio_track(
-    user_id: int,
-    current_mood: str,
-) -> Optional[TrackChoice]:
-    """RADIO may change mood, favours liked tracks, and still avoids repetition."""
-    radio_mood = choose_radio_mood(user_id, current_mood)
+def choose_radio_track(user_id: int) -> Optional[TrackChoice]:
+    """RADIO prioritizes the most-liked mood and permits favourite replays."""
+    radio_mood = choose_radio_mood(user_id)
     if not radio_mood:
         return None
 
@@ -1799,19 +1818,20 @@ def choose_radio_track(
         track for track in allowed
         if (track[1], track[0]) not in recent
     ]
-    pool = fresh or allowed
     liked = [
-        track for track in pool
+        track for track in allowed
         if feedback.get((track[1], track[0])) == "like"
     ]
 
-    # Use a liked track more often, but preserve exploration and variety.
-    if liked and random.random() < 0.65:
+    # A favourite may replay even when fresh tracks exist. Otherwise, fresh
+    # tracks are always preferred; this gives both familiarity and discovery.
+    if liked and random.random() < 0.40:
         pool = liked
+    else:
+        pool = fresh or allowed
 
     message_id, channel_id = random.choice(pool)
     return radio_mood, message_id, channel_id
-
 
 def record_next_signal(
     user_id: int,
@@ -1851,14 +1871,12 @@ def reserve_next_track(
 
 def reserve_radio_track(
     user_id: int,
-    current_mood: str,
 ) -> Optional[TrackChoice]:
-    choice = choose_radio_track(user_id, current_mood)
+    choice = choose_radio_track(user_id)
     reserved = reserve_selected_track(user_id, choice)
     if reserved:
         increment_radio_index(user_id)
     return reserved
-
 
 def reserve_selected_track(
     user_id: int,
@@ -2063,6 +2081,27 @@ def copy_music(
         },
         timeout=30,
     )
+
+
+# ============================================================
+# HOME MENU
+# ============================================================
+def home_menu() -> dict[str, Any]:
+    """Primary navigation shown immediately after /start."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🆕 NEW TRACKS", "callback_data": "new_tracks"},
+                {"text": "📻 RADIO", "callback_data": "radio"},
+            ],
+            [
+                {"text": "👤 MY PROFILE", "callback_data": "profile"},
+            ],
+            [
+                {"text": "🎛 CHOOSE MOOD", "callback_data": "change_mood"},
+            ],
+        ]
+    }
 
 
 # ============================================================
@@ -2271,32 +2310,34 @@ def mood_description(
 def send_music(
     chat_id: int,
     user_id: int,
-    mood: str,
+    mood: Optional[str],
     radio: bool = False,
 ) -> None:
-    if mood not in MOODS:
-        send_message(chat_id, "⚠️ Please choose a valid mood.", mood_menu())
-        return
+    """Deliver one normal-mood track or one cross-mood Radio recommendation."""
+    if not radio:
+        if mood not in MOODS:
+            send_message(chat_id, "⚠️ Please choose a valid mood.", mood_menu())
+            return
+        if get_track_count(mood) <= 0:
+            send_message(
+                chat_id,
+                f"{MOOD_INFO[mood]['name']}\n\n⚠️ No tracks available for this mood yet.",
+                mood_menu(),
+            )
+            return
+        reserved = reserve_next_track(user_id, mood)
+    else:
+        # Radio deliberately ignores the selected mood and chooses from all
+        # moods using the user's Like/Unlike distribution.
+        reserved = reserve_radio_track(user_id)
 
-    if get_track_count(mood) <= 0:
-        send_message(
-            chat_id,
-            f"{MOOD_INFO[mood]['name']}\n\n⚠️ No tracks available for this mood yet.",
-            mood_menu(),
-        )
-        return
-
-    reserved = (
-        reserve_radio_track(user_id, mood)
-        if radio
-        else reserve_next_track(user_id, mood)
-    )
     if not reserved:
-        send_message(
-            chat_id,
-            "⚠️ I couldn't find a new track right now. Try NEXT again shortly.",
-            music_buttons(user_id, "", 0, mood),
+        message = (
+            "📻 No Radio tracks are available yet."
+            if radio
+            else "⚠️ I couldn't find a new track right now. Try NEXT again shortly."
         )
+        send_message(chat_id, message, home_menu())
         return
 
     selected_mood, message_id, channel_id = reserved
@@ -2305,8 +2346,8 @@ def send_music(
         remove_latest_history(user_id, channel_id, message_id)
         send_message(
             chat_id,
-            "⚠️ This track can't be delivered right now. Please try NEXT.",
-            music_buttons(user_id, "", 0, selected_mood),
+            "⚠️ This track can't be delivered right now. Please try again.",
+            home_menu(),
         )
         return
 
@@ -2316,7 +2357,11 @@ def send_music(
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"{MOOD_INFO[selected_mood]['name']}\n"
         f"{MOOD_INFO[selected_mood]['description']}\n\n"
-        "Enjoy the vibe. ✨"
+        + (
+            "❤️ Picked from your Like-based Radio mix."
+            if radio
+            else "Enjoy the vibe. ✨"
+        )
     )
     send_message(
         chat_id,
@@ -3163,15 +3208,43 @@ def parse_feedback_callback(
 
 
 # ============================================================
-# USER PROFILE / NEW TRACKS
+# USER PROFILE / RADIO STATUS / NEW TRACKS
 # ============================================================
+def user_status_text(user_id: int) -> str:
+    """Expose the exact no-AI Radio preference signals to the user."""
+    preferences = get_user_preferences(user_id)
+    ratios = get_mood_like_ratios(user_id)
+    weights = get_radio_mood_weights(user_id)
+    lines = [
+        "📻 YOUR RADIO STATUS",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "Radio ignores the currently selected mood.",
+        "More Likes = higher priority; every mood keeps a small chance.",
+        "",
+        "MOOD PREFERENCES",
+    ]
+    for mood in MOODS:
+        info = preferences[mood]
+        lines.append(
+            f"{MOOD_INFO[mood]['name']} → ❤️ {int(info['like'])} | "
+            f"😴 {int(info['not_for_me'])} | "
+            f"ratio {ratios[mood] * 100:.0f}% | "
+            f"weight {weights[mood]:.1f}"
+        )
+    return "\n".join(lines)
+
+
 
 def navigation_buttons() -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [
+                {"text": "🏠 HOME", "callback_data": "home"},
                 {"text": "🎛 CHANGE MOOD", "callback_data": "change_mood"},
-                {"text": "🆕 NEW TRACKS", "callback_data": "new_tracks"},
+            ],
+            [
+                {"text": "📻 RADIO STATUS", "callback_data": "radio_status"},
             ],
         ]
     }
@@ -3472,6 +3545,23 @@ def handle_callback(
         return
 
     # --------------------------------------------------------
+    # HOME / RADIO STATUS
+    # --------------------------------------------------------
+    if data == "home":
+        answer_callback(callback_id, "🏠 Home")
+        send_message(
+            chat_id,
+            "🎧 NOT YOUR VIBE\n━━━━━━━━━━━━━━━━━━\n\nChoose what you want to explore.",
+            home_menu(),
+        )
+        return
+
+    if data == "radio_status":
+        answer_callback(callback_id, "📊 Radio status")
+        send_message(chat_id, user_status_text(user_id), navigation_buttons())
+        return
+
+    # --------------------------------------------------------
     # PROFILE
     # --------------------------------------------------------
 
@@ -3571,25 +3661,6 @@ def handle_callback(
 
     if data == "radio":
 
-        mood = get_user_mood(
-            user_id
-        )
-
-        if not mood:
-
-            answer_callback(
-                callback_id,
-                "Choose a mood first",
-            )
-
-            send_message(
-                chat_id,
-                "🎧 Choose your mood 👇",
-                mood_menu(),
-            )
-
-            return
-
         set_radio_mode(
             user_id,
             True,
@@ -3598,7 +3669,7 @@ def handle_callback(
         if schedule_music_request(
             chat_id,
             user_id,
-            mood,
+            None,
             True,
         ):
 
@@ -3712,7 +3783,7 @@ def handle_message(
                 "find you. ✨"
             ),
 
-            mood_menu(),
+            home_menu(),
         )
 
         return
@@ -3792,25 +3863,7 @@ def handle_message(
 
     if command == "/radio":
 
-        mood = (
-            get_user_mood(
-                user_id
-            )
-            if isinstance(
-                user_id,
-                int,
-            )
-            else None
-        )
-
-        if not mood:
-
-            send_message(
-                chat_id,
-                "📻 Choose a mood first 👇",
-                mood_menu(),
-            )
-
+        if not isinstance(user_id, int):
             return
 
         set_radio_mode(
@@ -3821,7 +3874,7 @@ def handle_message(
         if not schedule_music_request(
             chat_id,
             user_id,
-            mood,
+            None,
             True,
         ):
 
@@ -3830,6 +3883,14 @@ def handle_message(
                 "⏳ Your Radio is preparing...",
             )
 
+        return
+
+    # --------------------------------------------------------
+    # PERSONAL RADIO STATUS
+    # --------------------------------------------------------
+    if command in {"/status", "/radiostatus"}:
+        if isinstance(user_id, int):
+            send_message(chat_id, user_status_text(user_id), navigation_buttons())
         return
 
     # --------------------------------------------------------
