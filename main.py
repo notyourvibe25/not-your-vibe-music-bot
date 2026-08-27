@@ -26,6 +26,9 @@ from telethon.sessions import StringSession
 
 app = Flask(__name__)
 
+# Change this marker with each deployed release; /version exposes it in Telegram.
+APP_BUILD = "NO_AI_RADIO_MAIN_20260827_1500"
+
 
 # ============================================================
 # LOGGING
@@ -3712,12 +3715,20 @@ def handle_message(
                 "Your mood.\n"
                 "Your radio.\n\n"
                 "Choose a mood and let the music "
-                "find you. ✨"
+                "find you. ✨\n\n"
+                f"Build: {APP_BUILD}"
             ),
 
             home_menu(),
         )
 
+        return
+
+    # --------------------------------------------------------
+    # VERSION
+    # --------------------------------------------------------
+    if command == "/version":
+        send_message(chat_id, f"✅ Running build: {APP_BUILD}")
         return
 
     # --------------------------------------------------------
