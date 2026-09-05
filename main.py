@@ -80,7 +80,7 @@ def cur(c):
 
 def init_db():
     schema='''CREATE TABLE IF NOT EXISTS users(user_id BIGINT PRIMARY KEY,username TEXT,first_name TEXT,last_name TEXT,first_seen BIGINT NOT NULL,last_seen BIGINT NOT NULL,total_requests BIGINT NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS tracks(id BIGSERIAL PRIMARY KEY,mood TEXT NOT NULL,channel_id TEXT NOT NULL,message_id BIGINT NOT NULL,created_at BIGINT NOT NULL,UNIQUE(channel_id,message_id));
+    CREATE TABLE IF NOT EXISTS tracks(id BIGSERIAL PRIMARY KEY,mood TEXT NOT NULL,channel_id TEXT NOT NULL,message_id BIGINT NOT NULL,created_at BIGINT NOT NULL,title TEXT,UNIQUE(channel_id,message_id));
     CREATE TABLE IF NOT EXISTS user_history(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,mood TEXT NOT NULL,channel_id TEXT NOT NULL,message_id BIGINT NOT NULL,action TEXT NOT NULL DEFAULT 'served',sent_at BIGINT NOT NULL);
     CREATE TABLE IF NOT EXISTS user_state(user_id BIGINT PRIMARY KEY,mood TEXT,radio_enabled BOOLEAN NOT NULL DEFAULT FALSE,updated_at BIGINT NOT NULL);
     CREATE TABLE IF NOT EXISTS track_feedback(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,channel_id TEXT NOT NULL,message_id BIGINT NOT NULL,mood TEXT NOT NULL,feedback TEXT NOT NULL,created_at BIGINT NOT NULL,UNIQUE(user_id,channel_id,message_id));
@@ -89,7 +89,13 @@ def init_db():
     CREATE TABLE IF NOT EXISTS broadcast_reactions(id BIGSERIAL PRIMARY KEY,broadcast_id BIGINT NOT NULL,user_id BIGINT NOT NULL,reaction TEXT NOT NULL,created_at BIGINT NOT NULL,UNIQUE(broadcast_id,user_id));
     CREATE TABLE IF NOT EXISTS broadcast_comments(id BIGSERIAL PRIMARY KEY,broadcast_id BIGINT NOT NULL,user_id BIGINT NOT NULL,comment TEXT NOT NULL,created_at BIGINT NOT NULL);
     CREATE TABLE IF NOT EXISTS pending_comments(user_id BIGINT PRIMARY KEY,broadcast_id BIGINT NOT NULL,created_at BIGINT NOT NULL);
-    CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood); CREATE INDEX IF NOT EXISTS idx_hist_user ON user_history(user_id,sent_at DESC); CREATE INDEX IF NOT EXISTS idx_fb_user ON track_feedback(user_id); CREATE INDEX IF NOT EXISTS idx_daily_day ON daily_activity(day); CREATE INDEX IF NOT EXISTS idx_bc_broadcast ON broadcast_comments(broadcast_id);'''
+    CREATE TABLE IF NOT EXISTS pending_broadcasts(user_id BIGINT PRIMARY KEY,chat_id BIGINT NOT NULL,created_at BIGINT NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood); CREATE INDEX IF NOT EXISTS idx_hist_user ON user_history(user_id,sent_at DESC); CREATE INDEX IF NOT EXISTS idx_fb_user ON track_feedback(user_id); CREATE INDEX IF NOT EXISTS idx_daily_day ON daily_activity(day); CREATE INDEX IF NOT EXISTS idx_bc_broadcast ON broadcast_comments(broadcast_id);
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS title TEXT;
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS content_type TEXT;
+    ALTER TABLE broadcasts ALTER COLUMN text DROP NOT NULL;'''
     with db() as c:
         with cur(c) as x:x.execute(schema)
 
@@ -118,11 +124,11 @@ def set_radio(uid,on=True):
     with db() as c:
         with cur(c) as x:x.execute('''INSERT INTO user_state(user_id,mood,radio_enabled,updated_at) VALUES(%s,NULL,%s,%s) ON CONFLICT(user_id) DO UPDATE SET radio_enabled=EXCLUDED.radio_enabled,updated_at=EXCLUDED.updated_at''',(uid,on,int(time.time())))
 
-def save_track(mood,ch,msg):
+def save_track(mood,ch,msg,title=None):
     if mood not in MOODS or not ch or not msg:return False
     with db() as c:
         with cur(c) as x:
-            x.execute('''INSERT INTO tracks(mood,channel_id,message_id,created_at) VALUES(%s,%s,%s,%s) ON CONFLICT(channel_id,message_id) DO UPDATE SET mood=EXCLUDED.mood RETURNING id''',(mood,str(ch),int(msg),int(time.time())))
+            x.execute('''INSERT INTO tracks(mood,channel_id,message_id,created_at,title) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(channel_id,message_id) DO UPDATE SET mood=EXCLUDED.mood,title=COALESCE(EXCLUDED.title,tracks.title) RETURNING id''',(mood,str(ch),int(msg),int(time.time()),title))
             return x.fetchone() is not None
 
 def counts():
@@ -247,17 +253,30 @@ def broadcast_buttons(bid):
             x.execute('SELECT reaction,COUNT(*) count FROM broadcast_reactions WHERE broadcast_id=%s GROUP BY reaction',(bid,));r={a['reaction']:int(a['count']) for a in x.fetchall()}
     return {'inline_keyboard':[[{'text':f"❤️ {r.get('love',0)}",'callback_data':f'br:{bid}:love'},{'text':f"🔥 {r.get('fire',0)}",'callback_data':f'br:{bid}:fire'},{'text':f"👍 {r.get('like',0)}",'callback_data':f'br:{bid}:like'}],[{'text':'💬 COMMENT','callback_data':f'bc:{bid}'}]]}
 
-def create_broadcast(admin_id,text):
+def set_pending_broadcast(uid,chat_id):
+    with db() as c:
+        with cur(c) as x:x.execute('INSERT INTO pending_broadcasts(user_id,chat_id,created_at) VALUES(%s,%s,%s) ON CONFLICT(user_id) DO UPDATE SET chat_id=EXCLUDED.chat_id,created_at=EXCLUDED.created_at',(uid,chat_id,int(time.time())))
+
+def get_pending_broadcast(uid):
     with db() as c:
         with cur(c) as x:
-            x.execute('INSERT INTO broadcasts(admin_id,text,created_at) VALUES(%s,%s,%s) RETURNING id',(admin_id,text,int(time.time())));return int(x.fetchone()['id'])
+            x.execute('SELECT chat_id FROM pending_broadcasts WHERE user_id=%s',(uid,));r=x.fetchone();return int(r['chat_id']) if r else None
 
-def broadcast_job(bid,text):
+def clear_pending_broadcast(uid):
+    with db() as c:
+        with cur(c) as x:x.execute('DELETE FROM pending_broadcasts WHERE user_id=%s',(uid,))
+
+def create_broadcast(admin_id,source_chat_id,source_message_id,content_type,text=None):
+    with db() as c:
+        with cur(c) as x:
+            x.execute('INSERT INTO broadcasts(admin_id,text,source_chat_id,source_message_id,content_type,created_at) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id',(admin_id,text,source_chat_id,source_message_id,content_type,int(time.time())));return int(x.fetchone()['id'])
+
+def broadcast_job(bid,source_chat_id,source_message_id):
     with db() as c:
         with cur(c) as x:x.execute('SELECT user_id FROM users ORDER BY user_id');users=[int(a['user_id']) for a in x.fetchall()]
     k=broadcast_buttons(bid);okn=0;bad=0
     for uid in users:
-        r=tg('sendMessage',{'chat_id':uid,'text':text,'disable_web_page_preview':True,'reply_markup':k},15)
+        r=tg('copyMessage',{'chat_id':uid,'from_chat_id':source_chat_id,'message_id':source_message_id,'reply_markup':k},30)
         if r.get('ok'):okn+=1
         else:bad+=1
         time.sleep(0.04)
@@ -265,8 +284,8 @@ def broadcast_job(bid,text):
         with cur(c) as x:x.execute('UPDATE broadcasts SET sent_count=%s,failed_count=%s WHERE id=%s',(okn,bad,bid))
     send(ADMIN_USER_ID,f'📣 BROADCAST #{bid} COMPLETE\n\n✅ Sent: {okn}\n❌ Failed: {bad}')
 
-def start_broadcast(admin_id,text):
-    bid=create_broadcast(admin_id,text);executor.submit(broadcast_job,bid,text);return bid
+def start_broadcast(admin_id,source_chat_id,source_message_id,content_type,text=None):
+    bid=create_broadcast(admin_id,source_chat_id,source_message_id,content_type,text);executor.submit(broadcast_job,bid,source_chat_id,source_message_id);return bid
 
 def set_pending_comment(uid,bid):
     with db() as c:
@@ -279,6 +298,26 @@ def get_pending_comment(uid):
 def save_comment(uid,bid,text):
     with db() as c:
         with cur(c) as x:x.execute('INSERT INTO broadcast_comments(broadcast_id,user_id,comment,created_at) VALUES(%s,%s,%s,%s)',(bid,uid,text,int(time.time())));x.execute('DELETE FROM pending_comments WHERE user_id=%s',(uid,))
+
+def top_liked_tracks(limit=10):
+    with db() as c:
+        with cur(c) as x:
+            x.execute('''SELECT t.mood,t.channel_id,t.message_id,COALESCE(NULLIF(t.title,''),''Track #''||t.message_id::text) AS title,COUNT(f.id) AS likes
+                         FROM tracks t JOIN track_feedback f ON f.channel_id=t.channel_id AND f.message_id=t.message_id AND f.feedback='like'
+                         GROUP BY t.id,t.mood,t.channel_id,t.message_id,t.title
+                         ORDER BY likes DESC,t.created_at DESC LIMIT %s''',(limit,));return x.fetchall()
+
+def top_liked_text():
+    rows=top_liked_tracks(10)
+    lines=['🏆 TOP 10 MOST LIKED TRACKS','━━━━━━━━━━━━━━━━━━','']
+    if not rows:
+        lines.append('No likes yet. Start liking tracks ❤️')
+        return '\n'.join(lines)
+    for i,a in enumerate(rows,1):
+        title=str(a['title']).replace('\n',' ')[:90]
+        lines.append(f'{i}. 🎵 {title}')
+        lines.append(f'   {INFO[a["mood"]][0]} • ❤️ {int(a["likes"])} likes')
+    return '\n'.join(lines)
 
 def daily_stats():
     today=datetime.now(ZoneInfo('Asia/Yangon')).date();days=[today-timedelta(days=i) for i in range(7)]
@@ -307,6 +346,7 @@ def admin_panel():
          {'text':'📈 STATS','callback_data':'admin:stats'}],
         [{'text':'💬 COMMENTS','callback_data':'admin:comments'},
          {'text':'📣 BROADCAST','callback_data':'admin:broadcast'}],
+        [{'text':'🏆 TOP 10 LIKED','callback_data':'admin:top'}],
         [{'text':'📡 TELETHON','callback_data':'admin:telegram'}]
     ]}
 
@@ -331,7 +371,7 @@ def admin_dashboard():
     )
 
 def mood_menu():
-    return {'inline_keyboard':[[{'text':INFO['sad'][0],'callback_data':'mood_sad'},{'text':INFO['love'][0],'callback_data':'mood_love'}],[{'text':INFO['chill'][0],'callback_data':'mood_chill'},{'text':INFO['hype'][0],'callback_data':'mood_hype'}],[{'text':INFO['dark'][0],'callback_data':'mood_dark'},{'text':INFO['energetic'][0],'callback_data':'mood_energetic'}],[{'text':INFO['night'][0],'callback_data':'mood_night'},{'text':INFO['melodic'][0],'callback_data':'mood_melodic'}]]}
+    return {'inline_keyboard':[[{'text':INFO['sad'][0],'callback_data':'mood_sad'},{'text':INFO['love'][0],'callback_data':'mood_love'}],[{'text':INFO['chill'][0],'callback_data':'mood_chill'},{'text':INFO['hype'][0],'callback_data':'mood_hype'}],[{'text':INFO['dark'][0],'callback_data':'mood_dark'},{'text':INFO['energetic'][0],'callback_data':'mood_energetic'}],[{'text':INFO['night'][0],'callback_data':'mood_night'},{'text':INFO['melodic'][0],'callback_data':'mood_melodic'}],[{'text':'🏆 TOP 10 LIKED','callback_data':'top_liked'}]]}
 
 def buttons(uid,ch,msg,mood):
     f=feedback(uid,ch,msg);return {'inline_keyboard':[[{'text':'❤️✓' if f=='like' else '❤️','callback_data':f'like:{mood}:{ch}:{msg}'},{'text':'😴✓' if f=='not_for_me' else '😴','callback_data':f'notme:{mood}:{ch}:{msg}'}],[{'text':'⏭ NEXT','callback_data':'next_music'},{'text':'📻 RADIO','callback_data':'radio'}],[{'text':'👤 PROFILE','callback_data':'profile'},{'text':'🆕 NEW TRACKS','callback_data':'new_tracks'}],[{'text':'🎛 CHANGE MOOD','callback_data':'change_mood'}]]}
@@ -403,7 +443,8 @@ def callback(c):
         if action=='stats':
             cc=counts();send(chat,'📈 BOT STATS\n━━━━━━━━━━━━━━━━━━\n\n'+'\n'.join(f'{INFO[m][0]} → {cc[m]}' for m in MOODS)+f'\n\n📡 Telethon: {"CONNECTED" if ready.is_set() else "DISCONNECTED"}',admin_panel());return
         if action=='comments':send(chat,comments_text(),admin_panel());return
-        if action=='broadcast':send(chat,'📣 BROADCAST\n━━━━━━━━━━━━━━━━━━\n\nUse:\n/broadcast Your message here\n\nThe message will include ❤️ 🔥 👍 reactions and 💬 comments.',admin_panel());return
+        if action=='top':send(chat,top_liked_text(),admin_panel());return
+        if action=='broadcast':set_pending_broadcast(uid,chat);send(chat,'📣 BROADCAST\n━━━━━━━━━━━━━━━━━━\n\nNow send the post you want to broadcast.\n\n✅ Text, photo, video, audio, document and other Telegram posts are supported.\n❌ Send /cancel to stop.',admin_panel());return
         if action=='telegram':send(chat,'📡 TELETHON\n━━━━━━━━━━━━━━━━━━\n\nStatus: '+('🟢 CONNECTED' if ready.is_set() else '🔴 DISCONNECTED'),admin_panel());return
         return
     if data.startswith('br:'):
@@ -438,6 +479,7 @@ def callback(c):
         m=get_mood(uid) or 'melodic';set_radio(uid,True);answer(c.get('id'),'📻 Personalized Radio...');schedule(chat,uid,m,True);return
     if data=='change_mood':answer(c.get('id'),'Choose your mood');send(chat,'🎛 MOOD SELECTOR\n━━━━━━━━━━━━━━━━━━\n\nWhat are you feeling right now?',mood_menu());return
     if data=='profile':answer(c.get('id'));send(chat,profile_text(uid),mood_menu());return
+    if data=='top_liked':answer(c.get('id'));send(chat,top_liked_text(),mood_menu());return
     if data=='new_tracks':answer(c.get('id'));new_tracks(chat);return
     f=parse_fb(data)
     if f:
@@ -451,6 +493,17 @@ def message(m):
     chat=m.get('chat',{}).get('id');u=m.get('from',{});uid=u.get('id');
     if not isinstance(chat,int):return
     register(u);cmd=command((m.get('text') or '').strip())
+    pending_b=get_pending_broadcast(uid) if str(uid)==ADMIN_USER_ID else None
+    if pending_b:
+        raw_text=(m.get('text') or m.get('caption') or '').strip()
+        if raw_text.startswith('/cancel'):
+            clear_pending_broadcast(uid);send(chat,'❌ Broadcast cancelled.',admin_panel());return
+        if m.get('message_id'):
+            clear_pending_broadcast(uid)
+            ctype='text' if m.get('text') else ('photo' if m.get('photo') else ('video' if m.get('video') else ('audio' if m.get('audio') else ('document' if m.get('document') else ('animation' if m.get('animation') else 'media')))))
+            bid=start_broadcast(uid,chat,int(m['message_id']),ctype,raw_text or None)
+            send(chat,f'📣 Broadcast #{bid} started.\n\n📦 Type: {ctype}\n❤️ 🔥 👍 reactions + 💬 comments are enabled.')
+            return
     pending=get_pending_comment(uid)
     if pending and (m.get('text') or '').strip() and not (m.get('text') or '').strip().startswith('/'):
         text=(m.get('text') or '').strip()[:2000];save_comment(uid,pending,text)
@@ -463,15 +516,15 @@ def message(m):
         md=get_mood(uid) or 'melodic';set_radio(uid,True);schedule(chat,uid,md,True);return
     if cmd=='/profile':send(chat,profile_text(uid),mood_menu());return
     if cmd=='/new':new_tracks(chat);return
-    if cmd=='/help':send(chat,'🎧 NOT YOUR VIBE\n\n/start /mood /next /radio /profile /new /stats /telegram /help\n\n❤️ Like = improve Radio\n😴 = avoid track/mood signal');return
+    if cmd=='/top':send(chat,top_liked_text(),mood_menu());return
+    if cmd=='/help':send(chat,'🎧 NOT YOUR VIBE\n\n/start /mood /next /radio /profile /new /top /stats /telegram /help\n\n❤️ Like = improve Radio\n😴 = avoid track/mood signal');return
     if cmd=='/admin':
         if str(uid)!=ADMIN_USER_ID:return send(chat,'❌ Admin only.')
         send(chat,admin_dashboard(),admin_panel());return
     if cmd=='/broadcast':
         if str(uid)!=ADMIN_USER_ID:return send(chat,'❌ Admin only.')
-        text=(m.get('text') or '').strip()[len('/broadcast'):].strip()
-        if not text:return send(chat,'📣 Usage:\n/broadcast Your message here')
-        bid=start_broadcast(uid,text);send(chat,f'📣 Broadcast #{bid} started.\n\nUsers will receive the message with ❤️ 🔥 👍 reactions and 💬 comments.');return
+        set_pending_broadcast(uid,chat)
+        send(chat,'📣 BROADCAST\n━━━━━━━━━━━━━━━━━━\n\nNow send the post you want to broadcast.\n\n✅ Text, photo, video, audio, document and other Telegram posts are supported.\n❌ Send /cancel to stop.',admin_panel());return
     if cmd=='/daily':
         if str(uid)!=ADMIN_USER_ID:return send(chat,'❌ Admin only.')
         total,today_n,week_n,rows=daily_stats();lines=[f'📊 DAILY USERS\n━━━━━━━━━━━━━━━━━━','Today: {0}'.format(today_n),f'Last 7 days unique: {week_n}',f'Total users: {total}','', 'Last 7 days:']
@@ -522,13 +575,22 @@ def is_music(msg):
     if mime.startswith(('audio/','video/')):return True
     name=(getattr(getattr(msg,'file',None),'name','') or '').lower();return name.endswith(AUDIO)
 
+def message_title(msg):
+    try:
+        f=getattr(msg,'file',None)
+        name=(getattr(f,'name','') or '').strip() if f else ''
+        if name:return name.rsplit('/',1)[-1][:200]
+    except:pass
+    text=(getattr(msg,'message','') or '').strip()
+    return text[:200] if text else None
+
 async def scan(mood,val):
     if not val:return 0
     try:
         ent=await client.get_entity(int(val) if val.lstrip('-').isdigit() else val);n=0
         async for msg in client.iter_messages(ent):
             if is_music(msg):
-                ch=normch(getattr(ent,'id',0));n+=save_track(mood,ch,msg.id)
+                ch=normch(getattr(ent,'id',0));n+=save_track(mood,ch,msg.id,message_title(msg))
         return n
     except Exception:log.exception('scan %s',mood);return 0
 async def scan_all():
@@ -548,7 +610,7 @@ def tele_worker():
     async def new(event):
         try:
             ch=normch(event.chat_id);m=channel_map.get(ch)
-            if m and is_music(event.message):save_track(m,ch,event.message.id)
+            if m and is_music(event.message):save_track(m,ch,event.message.id,message_title(event.message))
         except Exception:log.exception('watcher')
     async def run():
         while True:
