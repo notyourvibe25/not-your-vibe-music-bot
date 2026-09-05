@@ -45,7 +45,7 @@ CHANNELS={m:env(m.upper()+'_CHANNEL') for m in MOODS}
 CHANNELS['hype']=env('HYPE_CHANNEL','-1004427220481'); CHANNELS['melodic']=env('MELODIC_CHANNEL','-1004446996297')
 AUDIO=('.mp3','.m4a','.flac','.wav','.aac','.ogg','.opus','.mp4','.mkv','.webm')
 
-db_pool=None; db_lock=threading.Lock(); client=None; ready=threading.Event(); tele_thread=None; tele_lock=threading.Lock(); executor=ThreadPoolExecutor(max_workers=WORKERS,thread_name_prefix='music'); pending=set(); pending_lock=threading.Lock(); channel_map={}; last_scan=0
+db_pool=None; db_lock=threading.Lock(); client=None; tele_loop=None; ready=threading.Event(); tele_thread=None; tele_lock=threading.Lock(); executor=ThreadPoolExecutor(max_workers=WORKERS,thread_name_prefix='music'); pending=set(); pending_lock=threading.Lock(); channel_map={}; last_scan=0
 http_local=threading.local()
 
 @contextmanager
@@ -299,16 +299,66 @@ def save_comment(uid,bid,text):
     with db() as c:
         with cur(c) as x:x.execute('INSERT INTO broadcast_comments(broadcast_id,user_id,comment,created_at) VALUES(%s,%s,%s,%s)',(bid,uid,text,int(time.time())));x.execute('DELETE FROM pending_comments WHERE user_id=%s',(uid,))
 
+async def backfill_track_titles(rows):
+    for row in rows:
+        if row.get('title'):
+            continue
+        try:
+            entity = await telethon_client.get_entity(int(row['channel_id']))
+            msg = await telethon_client.get_messages(entity, ids=int(row['message_id']))
+            if not msg:
+                continue
+            title = message_title(msg)
+            if title:
+                with db() as c:
+                    with cur(c) as x:
+                        x.execute('UPDATE tracks SET title=%s WHERE channel_id=%s AND message_id=%s',(title,str(row['channel_id']),int(row['message_id'])))
+                row['title'] = title
+        except Exception:
+            continue
+
 def top_liked_tracks(limit=10):
     with db() as c:
         with cur(c) as x:
-            x.execute('''SELECT t.mood,t.channel_id,t.message_id,COALESCE(NULLIF(t.title,''),''Track #''||t.message_id::text) AS title,COUNT(f.id) AS likes
-                         FROM tracks t JOIN track_feedback f ON f.channel_id=t.channel_id AND f.message_id=t.message_id AND f.feedback='like'
+            x.execute("""SELECT t.mood,t.channel_id,t.message_id,
+                         COALESCE(NULLIF(t.title,''),'Track #'||t.message_id::text) AS title,
+                         COUNT(f.id) AS likes
+                         FROM tracks t JOIN track_feedback f
+                         ON f.channel_id=t.channel_id AND f.message_id=t.message_id AND f.feedback='like'
                          GROUP BY t.id,t.mood,t.channel_id,t.message_id,t.title
-                         ORDER BY likes DESC,t.created_at DESC LIMIT %s''',(limit,));return x.fetchall()
+                         ORDER BY likes DESC,t.created_at DESC LIMIT %s""",(limit,));return x.fetchall()
+
+async def backfill_track_titles_async(rows):
+    for row in rows:
+        if row.get('title'):
+            continue
+        try:
+            ent=await client.get_entity(int(row['channel_id']))
+            msg=await client.get_messages(ent,ids=int(row['message_id']))
+            if not msg:
+                continue
+            title=message_title(msg)
+            if not title:
+                continue
+            with db() as c:
+                with cur(c) as x:
+                    x.execute('UPDATE tracks SET title=%s WHERE channel_id=%s AND message_id=%s',(title,str(row['channel_id']),int(row['message_id'])))
+            row['title']=title
+        except Exception:
+            log.exception('backfill track title channel=%s message=%s',row.get('channel_id'),row.get('message_id'))
+
+def backfill_track_titles(rows):
+    if not rows or client is None or tele_loop is None or not ready.is_set():
+        return rows
+    try:
+        fut=asyncio.run_coroutine_threadsafe(backfill_track_titles_async(rows),tele_loop)
+        fut.result(timeout=45)
+    except Exception:
+        log.exception('top liked title backfill')
+    return rows
 
 def top_liked_text():
-    rows=top_liked_tracks(10)
+    rows=backfill_track_titles(top_liked_tracks(10))
     lines=['🏆 TOP 10 MOST LIKED TRACKS','━━━━━━━━━━━━━━━━━━','']
     if not rows:
         lines.append('No likes yet. Start liking tracks ❤️')
@@ -603,7 +653,7 @@ async def scan_all():
     last_scan=int(time.time());log.info('tracks=%s',counts())
 
 def tele_worker():
-    global client
+    global client,tele_loop
     if not (API_ID and API_HASH and SESSION):log.error('Missing Telethon API_ID/API_HASH/SESSION');return
     client=TelegramClient(StringSession(SESSION),int(API_ID),API_HASH,connection_retries=10,retry_delay=5,timeout=30,auto_reconnect=True)
     @client.on(events.NewMessage(incoming=True))
@@ -613,6 +663,8 @@ def tele_worker():
             if m and is_music(event.message):save_track(m,ch,event.message.id,message_title(event.message))
         except Exception:log.exception('watcher')
     async def run():
+        global tele_loop
+        tele_loop=asyncio.get_running_loop()
         while True:
             try:
                 await client.connect()
