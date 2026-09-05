@@ -271,28 +271,10 @@ def radio_track(uid):
             t=random.choice(unseen or allowed);return m,t[0],t[1]
     return None
 
-def mood_history(uid,mood):
-    r=set()
-    with db() as c:
-        with cur(c) as x:
-            x.execute("""SELECT channel_id,message_id FROM user_history
-                         WHERE user_id=%s AND action='served' AND source='mood' AND mood=%s""",(uid,mood))
-            for a in x.fetchall():
-                r.add((str(a['channel_id']),int(a['message_id'])))
-    return r
-
 def normal_track(uid,mood):
-    fm=feedback_map(uid)
-    seen=mood_history(uid,mood)
-    all_rows=candidates(mood,limit=600)
-    allowed=[t for t in all_rows if fm.get((t[1],t[0]))!='not_for_me']
-    unseen=[t for t in allowed if (t[1],t[0]) not in seen]
-    # Mood selection always prefers tracks never sent through the Mood menu.
-    # Only after that mood has been exhausted do we recycle older Mood tracks.
-    pool=unseen or allowed
-    if not pool:return None
-    t=random.choice(pool)
-    return mood,t[0],t[1]
+    fm=feedback_map(uid);h=history(uid);a=[t for t in candidates(mood) if fm.get((t[1],t[0]))!='not_for_me'];u=[t for t in a if (t[1],t[0]) not in h]
+    if not (u or a):return None
+    t=random.choice(u or a);return mood,t[0],t[1]
 
 def reserve(uid,ch,source='served'):
     if not ch:return None
