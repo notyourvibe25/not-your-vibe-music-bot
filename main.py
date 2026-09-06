@@ -703,6 +703,11 @@ def save_track(
     ):
         return False
 
+    # Never store a Telegram message/copy ID as a track title.
+    title = str(title or "").strip() or None
+    if title and title.isdigit():
+        title = None
+
     with db() as c:
 
         with cur(c) as x:
@@ -724,10 +729,13 @@ def save_track(
                 )
                 DO UPDATE SET
                     mood=EXCLUDED.mood,
-                    title=COALESCE(
-                        EXCLUDED.title,
-                        tracks.title
-                    )
+                    title=CASE
+                        WHEN EXCLUDED.title IS NOT NULL
+                         AND BTRIM(EXCLUDED.title) <> ''
+                         AND EXCLUDED.title !~ '^[0-9]+$'
+                        THEN EXCLUDED.title
+                        ELSE tracks.title
+                    END
                 RETURNING id
                 """,
                 (
@@ -2115,7 +2123,9 @@ async def backfill_track_titles_async(
 
     for row in rows:
 
-        if row.get("title"):
+        existing = str(row.get("title") or "").strip()
+        # Empty, numeric, or old copy-message placeholders must be refreshed.
+        if existing and not existing.isdigit() and not existing.lower().startswith("track #"):
             continue
 
         try:
@@ -2207,6 +2217,22 @@ def backfill_track_titles(
 
 
 # =========================================================
+# DISPLAY TITLE
+# =========================================================
+
+def display_title(row):
+    title = str(row.get("title") or "").strip()
+    mid = str(row.get("message_id") or "")
+
+    # Never show copy/message IDs as a track name.
+    if (not title or title.lower() == "none" or title.isdigit() or
+            title == mid or title.lower().startswith("track #")):
+        return "Unknown Track"
+
+    return title.replace("\n", " ")[:200]
+
+
+# =========================================================
 # LIST BUTTONS
 # =========================================================
 
@@ -2225,18 +2251,7 @@ def track_list_buttons(
             row["id"]
         )
 
-        title = (
-            row.get("title")
-            or
-            f"Track #{row['message_id']}"
-        )
-
-        title = str(
-            title
-        ).replace(
-            "\n",
-            " ",
-        )
+        title = display_title(row)
 
         if len(title) > 38:
             title = title[:35] + "..."
@@ -2308,12 +2323,7 @@ def top_liked_text(
         1,
     ):
 
-        title = str(
-            row["title"]
-        ).replace(
-            "\n",
-            " ",
-        )[:90]
+        title = display_title(row)[:90]
 
         lines.append(
             f"{i}. 🎵 {title}"
@@ -2368,12 +2378,7 @@ def trending_text(
         1,
     ):
 
-        title = str(
-            row["title"]
-        ).replace(
-            "\n",
-            " ",
-        )[:90]
+        title = display_title(row)[:90]
 
         lines.append(
             f"{i}. 🎵 {title}"
@@ -5476,49 +5481,37 @@ def is_music(msg):
 
 
 def message_title(msg):
-
+    """Return a human-readable audio title, never Telegram message/copy IDs."""
     try:
+        media = getattr(msg, "media", None)
+        document = getattr(media, "document", None)
+        attrs = getattr(document, "attributes", []) or []
 
-        f = getattr(
-            msg,
-            "file",
-            None,
-        )
+        for attr in attrs:
+            title = str(getattr(attr, "title", "") or "").strip()
+            performer = str(getattr(attr, "performer", "") or "").strip()
+            if title and performer:
+                return f"{performer} - {title}"[:200]
+            if title:
+                return title[:200]
 
-        name = (
-            getattr(
-                f,
-                "name",
-                "",
-            )
-            or ""
-        ).strip() if f else ""
-
+        f = getattr(msg, "file", None)
+        name = str(getattr(f, "name", "") or "").strip() if f else ""
         if name:
-
-            return name.rsplit(
-                "/",
-                1,
-            )[-1][:200]
-
+            name = name.rsplit("/", 1)[-1]
+            # Remove only the extension; keep the actual filename as title.
+            if "." in name:
+                name = name.rsplit(".", 1)[0]
+            if name and not name.isdigit():
+                return name[:200]
     except Exception:
-
         pass
 
-    text = (
-        getattr(
-            msg,
-            "message",
-            "",
-        )
-        or ""
-    ).strip()
+    text = str(getattr(msg, "message", "") or "").strip()
+    if text and not text.isdigit():
+        return text[:200]
 
-    return (
-        text[:200]
-        if text
-        else None
-    )
+    return None
 
 
 # =========================================================
@@ -5703,21 +5696,26 @@ def tele_worker():
                 )
             ):
 
+                # Extract and save the title immediately when a new
+                # channel track arrives.  This is independent of the
+                # periodic scan/backfill, so new tracks do not wait for it.
+                title = message_title(
+                    event.message
+                )
+
                 save_track(
                     mood,
                     ch,
                     event.message.id,
-                    message_title(
-                        event.message
-                    ),
+                    title,
                 )
 
                 log.info(
-                    "NEW TRACK mood=%s "
-                    "channel=%s message=%s",
+                    "NEW TRACK mood=%s channel=%s message=%s title=%r",
                     mood,
                     ch,
                     event.message.id,
+                    title,
                 )
 
         except Exception:
