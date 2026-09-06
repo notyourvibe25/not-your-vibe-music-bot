@@ -2298,8 +2298,11 @@ def top_liked_text(
     )
 
     lines = [
-        "🏆 TOP 10 MOST LIKED TRACKS",
-        "━━━━━━━━━━━━━━━━━━",
+        "╔════════════════════╗",
+        "     🏆 TOP 10 LIKED",
+        "╚════════════════════╝",
+        "",
+        "❤️ Most loved by Ravers",
         "",
     ]
 
@@ -2351,8 +2354,9 @@ def trending_text(
     )
 
     lines = [
-        "📈 TRENDING NOW",
-        "━━━━━━━━━━━━━━━━━━",
+        "╔════════════════════╗",
+        "      🔥 TRENDING NOW",
+        "╚════════════════════╝",
         "",
         f"🔥 Based on the last {TRENDING_DAYS} days",
         "",
@@ -2663,100 +2667,54 @@ def admin_dashboard():
 # =========================================================
 
 def mood_menu():
-
+    """UX-polished main menu. Callback values stay unchanged."""
     return {
         "inline_keyboard": [
             [
-                {
-                    "text": INFO["sad"][0],
-                    "callback_data":
-                        "mood_sad",
-                },
-                {
-                    "text": INFO["love"][0],
-                    "callback_data":
-                        "mood_love",
-                },
+                {"text": "📻 RADIO", "callback_data": "radio"},
+                {"text": "✨ FOR YOU", "callback_data": "for_you"},
             ],
             [
-                {
-                    "text": INFO["chill"][0],
-                    "callback_data":
-                        "mood_chill",
-                },
-                {
-                    "text": INFO["hype"][0],
-                    "callback_data":
-                        "mood_hype",
-                },
+                {"text": "🔥 DAILY VIBE", "callback_data": "daily_vibe"},
+                {"text": "🎵 TRACK OF THE DAY", "callback_data": "track_of_day"},
             ],
             [
-                {
-                    "text": INFO["dark"][0],
-                    "callback_data":
-                        "mood_dark",
-                },
-                {
-                    "text": INFO["energetic"][0],
-                    "callback_data":
-                        "mood_energetic",
-                },
+                {"text": "🎛 EXPLORE MOODS", "callback_data": "change_mood"},
             ],
             [
-                {
-                    "text": INFO["night"][0],
-                    "callback_data":
-                        "mood_night",
-                },
-                {
-                    "text": INFO["melodic"][0],
-                    "callback_data":
-                        "mood_melodic",
-                },
+                {"text": "📈 TRENDING", "callback_data": "trending"},
+                {"text": "🏆 TOP 10 LIKED", "callback_data": "top_liked"},
             ],
             [
-                {
-                    "text":
-                        "🔥 DAILY VIBE",
-                    "callback_data":
-                        "daily_vibe",
-                },
-                {
-                    "text":
-                        "🧠 FOR YOU",
-                    "callback_data":
-                        "for_you",
-                },
+                {"text": "🎲 SURPRISE ME", "callback_data": "surprise_me"},
+                {"text": "👤 PROFILE", "callback_data": "profile"},
+            ],
+        ]
+    }
+
+
+def mood_selector_menu():
+    """Second-level mood selector; no recommendation logic is changed."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": INFO["sad"][0], "callback_data": "mood_sad"},
+                {"text": INFO["love"][0], "callback_data": "mood_love"},
             ],
             [
-                {
-                    "text":
-                        "🎲 SURPRISE ME",
-                    "callback_data":
-                        "surprise_me",
-                },
-                {
-                    "text":
-                        "📈 TRENDING",
-                    "callback_data":
-                        "trending",
-                },
+                {"text": INFO["chill"][0], "callback_data": "mood_chill"},
+                {"text": INFO["hype"][0], "callback_data": "mood_hype"},
             ],
             [
-                {
-                    "text":
-                        "🎵 TRACK OF THE DAY",
-                    "callback_data":
-                        "track_of_day",
-                }
+                {"text": INFO["dark"][0], "callback_data": "mood_dark"},
+                {"text": INFO["energetic"][0], "callback_data": "mood_energetic"},
             ],
             [
-                {
-                    "text":
-                        "🏆 TOP 10 LIKED",
-                    "callback_data":
-                        "top_liked",
-                }
+                {"text": INFO["night"][0], "callback_data": "mood_night"},
+                {"text": INFO["melodic"][0], "callback_data": "mood_melodic"},
+            ],
+            [
+                {"text": "⬅️ BACK", "callback_data": "menu"},
             ],
         ]
     }
@@ -3204,11 +3162,12 @@ def play_selected_track(
 
     send(
         chat,
-        f"{header}\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"╭─ {header}\n"
+        "━━━━━━━━━━━━━━━━\n\n"
         f"🎵 {title}\n"
         f"{INFO[mood][0]}\n\n"
-        "Enjoy the vibe. ✨",
+        "━━━━━━━━━━━━━━━━\n"
+        "Press play. Let it speak. 🖤",
         buttons(
             uid,
             ch,
@@ -3280,7 +3239,8 @@ def send_special_music(
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"🎵 {label}\n"
         f"{INFO[mood][0]}\n\n"
-        "Enjoy the vibe. ✨",
+        "━━━━━━━━━━━━━━━━\n"
+        "Press play. Let it speak. 🖤",
         buttons(
             uid,
             ch,
@@ -3354,20 +3314,21 @@ def send_music(
 
     if radio:
 
-        title = "📻 YOUR RADIO"
+        title = "╭─ 📻 RADIO SIGNAL"
 
         desc = (
-            "Personalized from your "
-            "feedback across all moods."
+            "A signal shaped by your music taste.\n"
+            "Press play and see where it takes you."
         )
 
     else:
 
-        title = "🎧 NOW PLAYING"
+        title = "╭─ 🎧 NOW DISCOVERING"
 
-        desc = INFO[
-            selected_mood
-        ][1]
+        desc = (
+            INFO[selected_mood][1]
+            + "\n\n╰─ Feel the moment."
+        )
 
     send(
         chat,
@@ -3811,6 +3772,25 @@ def callback(c):
     callback_id = c.get(
         "id"
     )
+
+    # =====================================================
+    # MAIN MENU
+    # =====================================================
+
+    if data == "menu":
+        answer(callback_id)
+        send(
+            chat,
+            "╭────────────────────╮\n"
+            "│   🎧 NOT YOUR VIBE   │\n"
+            "╰────────────────────╯\n\n"
+            "Music doesn't need to be explained.\n"
+            "It just needs to feel right.\n\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            "Choose your next vibe. ✨",
+            mood_menu(),
+        )
+        return
 
     # =====================================================
     # PLAY SELECTED TRACK
@@ -4334,10 +4314,10 @@ def callback(c):
 
         send(
             chat,
-            "🎛 MOOD SELECTOR\n"
+            "🎛 CHOOSE YOUR VIBE\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "What are you feeling right now?",
-            mood_menu(),
+            mood_selector_menu(),
         )
 
         return
