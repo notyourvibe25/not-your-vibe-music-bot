@@ -1174,111 +1174,93 @@ def radio_weights(uid):
 # =========================================================
 
 def radio_track(uid):
+    """Radio recommendation engine.
 
+    Mood selection is weighted by the user's feedback counts.
+    Tracks the user has already liked are deliberately shown less often
+    than tracks they have not seen yet.
+
+    Example:
+      Love 18 likes, Chill 15 likes, Sad 10 likes
+    means Love has the highest mood weight, then Chill, then Sad.
+    It does NOT lock Radio to Love; all moods with available tracks remain
+    eligible.
+    """
+    r = ratios(uid)
     weights = radio_weights(uid)
-
-    available = [
-        m
-        for m, c in counts().items()
-        if c > 0
-    ]
-
+    available = [m for m, n in counts().items() if n > 0]
     if not available:
         return None
 
     fm = feedback_map(uid)
     hist = history(uid)
 
-    ranked = sorted(
-        available,
-        key=lambda m: weights[m],
-        reverse=True,
+    # Build two pools per mood:
+    #   fresh = never delivered to this user
+    #   liked = explicitly liked by this user (shown less frequently)
+    pools = {}
+    for mood in available:
+        rows = candidates(mood, limit=500)
+        fresh = []
+        liked = []
+
+        for msg, ch in rows:
+            key = (str(ch), int(msg))
+            if fm.get(key) == "not_for_me":
+                continue
+
+            if key not in hist:
+                # A never-seen liked track is still fresh; it belongs to
+                # the fresh pool until it has actually been delivered.
+                fresh.append((msg, ch))
+            elif fm.get(key) == "like":
+                liked.append((msg, ch))
+
+        if fresh or liked:
+            pools[mood] = {
+                "fresh": fresh,
+                "liked": liked,
+            }
+
+    if not pools:
+        return None
+
+    moods = list(pools)
+
+    # Mood priority comes from LIKE RATIO / feedback, not from a fixed mood.
+    # With no feedback, every available mood gets the same chance.
+    total_feedback = sum(
+        r[m]["like"] + r[m]["not"] for m in moods
     )
 
-    mood = ranked[0]
-
-    total_likes = sum(
-        ratios(uid)[m]["like"]
-        for m in MOODS
-    )
-
-    if total_likes == 0:
-
-        mood = random.choice(
-            available
-        )
-
-    cs = candidates(mood)
-
-    allowed = [
-        t
-        for t in cs
-        if fm.get(
-            (
-                t[1],
-                t[0],
-            )
-        ) != "not_for_me"
-    ]
-
-    unseen = [
-        t
-        for t in allowed
-        if (
-            t[1],
-            t[0],
-        ) not in hist
-    ]
-
-    if allowed:
-
-        t = random.choice(
-            unseen or allowed
-        )
-
-        return (
-            mood,
-            t[0],
-            t[1],
-        )
-
-    for m in ranked[1:]:
-
-        cs = candidates(m)
-
-        allowed = [
-            t
-            for t in cs
-            if fm.get(
-                (
-                    t[1],
-                    t[0],
-                )
-            ) != "not_for_me"
+    if total_feedback == 0:
+        mood = random.choice(moods)
+    else:
+        mood_weights = [
+            max(0.001, weights.get(m, 0.05))
+            for m in moods
         ]
+        mood = random.choices(
+            moods,
+            weights=mood_weights,
+            k=1,
+        )[0]
 
-        unseen = [
-            t
-            for t in allowed
-            if (
-                t[1],
-                t[0],
-            ) not in hist
-        ]
+    fresh = pools[mood]["fresh"]
+    liked = pools[mood]["liked"]
 
-        if allowed:
+    # Liked tracks are intentionally reduced.
+    # ~75% fresh / ~25% already-liked when both pools exist.
+    if fresh and liked:
+        use_liked = random.random() < 0.25
+        pool = liked if use_liked else fresh
+    elif fresh:
+        pool = fresh
+    else:
+        pool = liked
 
-            t = random.choice(
-                unseen or allowed
-            )
-
-            return (
-                m,
-                t[0],
-                t[1],
-            )
-
-    return None
+    msg, ch = random.choice(pool)
+    return (mood, msg, ch)
 
 
 # =========================================================
@@ -1334,7 +1316,6 @@ def normal_track(
 def reserve(
     uid,
     track,
-    action="served",
 ):
 
     if not track:
@@ -1362,7 +1343,8 @@ def reserve(
                     sent_at
                 )
                 VALUES(
-                    %s,%s,%s,%s,%s,%s
+                    %s,%s,%s,%s,
+                    'served',%s
                 )
                 """,
                 (
@@ -1370,7 +1352,6 @@ def reserve(
                     track[0],
                     str(track[2]),
                     int(track[1]),
-                    action,
                     int(time.time()),
                 ),
             )
@@ -2877,102 +2858,68 @@ def stable_pick(
 # SPECIAL TRACKS
 # =========================================================
 
-def liked_tracks(uid):
-    """Return only tracks explicitly liked by this user."""
-    with db() as c:
-        with cur(c) as x:
-            x.execute(
-                """
-                SELECT t.mood, t.message_id, t.channel_id, t.title
-                FROM tracks t
-                JOIN track_feedback f
-                  ON f.channel_id=t.channel_id
-                 AND f.message_id=t.message_id
-                WHERE f.user_id=%s
-                  AND f.feedback='like'
-                ORDER BY f.created_at DESC, t.id DESC
-                """,
-                (uid,),
-            )
-            return x.fetchall()
-
-
 def daily_vibe_track(uid):
-    """Today's Daily Vibe: only moods manually selected/listened today."""
-    tz = ZoneInfo("Asia/Yangon")
-    now = datetime.now(tz)
-    day_start = int(datetime(now.year, now.month, now.day, tzinfo=tz).timestamp())
-    day_end = day_start + 86400
 
-    with db() as c:
-        with cur(c) as x:
-            x.execute(
-                """
-                SELECT mood, COUNT(*) AS plays
-                FROM user_history
-                WHERE user_id=%s
-                  AND action='manual_mood'
-                  AND sent_at >= %s
-                  AND sent_at < %s
-                GROUP BY mood
-                ORDER BY plays DESC, mood ASC
-                LIMIT 1
-                """,
-                (uid, day_start, day_end),
-            )
-            row = x.fetchone()
+    rows = eligible_tracks(uid)
 
-    if not row:
-        return None
+    today = datetime.now(
+        ZoneInfo("Asia/Yangon")
+    ).date().isoformat()
 
-    mood = row['mood']
-    rows = eligible_tracks(uid, "mood=%s", (mood,))
-    today = now.date().isoformat()
-    return stable_pick(rows, f"daily-vibe:{uid}:{mood}:{today}")
-
-
-def track_of_day_tracks(uid, limit=10):
-    """A daily playlist made only from the user's liked tracks."""
-    rows = liked_tracks(uid)
-    if len(rows) < 10:
-        return []
-    today = datetime.now(ZoneInfo("Asia/Yangon")).date().isoformat()
-    ordered = sorted(
+    return stable_pick(
         rows,
-        key=lambda r: hashlib.md5(
-            f"track-of-day:{uid}:{today}:{r['channel_id']}:{r['message_id']}".encode()
-        ).hexdigest(),
+        f"daily:{uid}:{today}",
     )
-    return [
-        (r['mood'], int(r['message_id']), str(r['channel_id']), r.get('title'))
-        for r in ordered[:limit]
-    ]
 
 
 def track_of_day(uid):
-    tracks = track_of_day_tracks(uid, 10)
-    return tracks[0] if tracks else None
+
+    rows = eligible_tracks(uid)
+
+    today = datetime.now(
+        ZoneInfo("Asia/Yangon")
+    ).date().isoformat()
+
+    return stable_pick(
+        rows,
+        f"today:{uid}:{today}",
+    )
 
 
 def for_you_track(uid):
-    """For You never recommends unliked tracks."""
-    rows = liked_tracks(uid)
+
+    weights = radio_weights(uid)
+    rows = eligible_tracks(uid)
+
     if not rows:
         return None
 
-    hist = history(uid)
-    unseen = [
-        r for r in rows
-        if (str(r['channel_id']), int(r['message_id'])) not in hist
+    weighted = [
+        max(
+            0.05,
+            float(
+                weights.get(
+                    row["mood"],
+                    0.05,
+                )
+            ),
+        )
+        for row in rows
     ]
-    pool = unseen or rows
-    r = random.choice(pool)
+
+    r = random.choices(
+        rows,
+        weights=weighted,
+        k=1,
+    )[0]
+
     return (
-        r['mood'],
-        int(r['message_id']),
-        str(r['channel_id']),
-        r.get('title'),
+        r["mood"],
+        int(r["message_id"]),
+        str(r["channel_id"]),
+        r.get("title"),
     )
+
 
 def surprise_track(uid):
 
@@ -3339,42 +3286,6 @@ def send_special_music(
 
 
 # =========================================================
-# TRACK OF THE DAY PLAYLIST
-# =========================================================
-
-def send_track_of_day_playlist(chat, uid):
-    tracks = track_of_day_tracks(uid, 10)
-
-    if not tracks:
-        return send(
-            chat,
-            "🎵 TRACK OF THE DAY\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "Raver အနေနဲ့ Like 10 ခုပေးအောင်မလုပ်ရသေးသဖြင့် BOT မှမပို့ပေးနိုင်သေးကြောင်းပါ",
-            mood_menu(),
-        )
-
-    send(
-        chat,
-        "🎵 TRACK OF THE DAY\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "❤️ Your daily playlist: 10 tracks you already liked.\n"
-        "နေ့တိုင်း playlist selection/order ပြောင်းပါတယ်။",
-    )
-
-    for i, track in enumerate(tracks, 1):
-        mood, msg, ch, title = track
-        result = copy_music(chat, ch, msg)
-        if result.get("ok"):
-            reserve(uid, (mood, msg, ch), action="track_of_day")
-
-    return send(
-        chat,
-        "🎧 Playlist complete. Enjoy the vibe. ✨",
-        mood_menu(),
-    )
-
-# =========================================================
 # SEND NORMAL / RADIO
 # =========================================================
 
@@ -3433,12 +3344,7 @@ def send_music(
 
     reserve(
         uid,
-        (
-            selected_mood,
-            msg,
-            channel,
-        ),
-        action="radio" if radio else "manual_mood",
+        track,
     )
 
     if radio:
@@ -4560,9 +4466,11 @@ def callback(c):
             "🎵 Track of the Day",
         )
 
-        send_track_of_day_playlist(
+        send_special_music(
             chat,
             uid,
+            track_of_day(uid),
+            "🎵 TRACK OF THE DAY",
         )
 
         return
