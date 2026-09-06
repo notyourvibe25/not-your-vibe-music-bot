@@ -1334,6 +1334,7 @@ def normal_track(
 def reserve(
     uid,
     track,
+    action="served",
 ):
 
     if not track:
@@ -1361,8 +1362,7 @@ def reserve(
                     sent_at
                 )
                 VALUES(
-                    %s,%s,%s,%s,
-                    'served',%s
+                    %s,%s,%s,%s,%s,%s
                 )
                 """,
                 (
@@ -1370,6 +1370,7 @@ def reserve(
                     track[0],
                     str(track[2]),
                     int(track[1]),
+                    action,
                     int(time.time()),
                 ),
             )
@@ -2876,68 +2877,102 @@ def stable_pick(
 # SPECIAL TRACKS
 # =========================================================
 
+def liked_tracks(uid):
+    """Return only tracks explicitly liked by this user."""
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT t.mood, t.message_id, t.channel_id, t.title
+                FROM tracks t
+                JOIN track_feedback f
+                  ON f.channel_id=t.channel_id
+                 AND f.message_id=t.message_id
+                WHERE f.user_id=%s
+                  AND f.feedback='like'
+                ORDER BY f.created_at DESC, t.id DESC
+                """,
+                (uid,),
+            )
+            return x.fetchall()
+
+
 def daily_vibe_track(uid):
+    """Today's Daily Vibe: only moods manually selected/listened today."""
+    tz = ZoneInfo("Asia/Yangon")
+    now = datetime.now(tz)
+    day_start = int(datetime(now.year, now.month, now.day, tzinfo=tz).timestamp())
+    day_end = day_start + 86400
 
-    rows = eligible_tracks(uid)
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT mood, COUNT(*) AS plays
+                FROM user_history
+                WHERE user_id=%s
+                  AND action='manual_mood'
+                  AND sent_at >= %s
+                  AND sent_at < %s
+                GROUP BY mood
+                ORDER BY plays DESC, mood ASC
+                LIMIT 1
+                """,
+                (uid, day_start, day_end),
+            )
+            row = x.fetchone()
 
-    today = datetime.now(
-        ZoneInfo("Asia/Yangon")
-    ).date().isoformat()
+    if not row:
+        return None
 
-    return stable_pick(
+    mood = row['mood']
+    rows = eligible_tracks(uid, "mood=%s", (mood,))
+    today = now.date().isoformat()
+    return stable_pick(rows, f"daily-vibe:{uid}:{mood}:{today}")
+
+
+def track_of_day_tracks(uid, limit=10):
+    """A daily playlist made only from the user's liked tracks."""
+    rows = liked_tracks(uid)
+    if len(rows) < 10:
+        return []
+    today = datetime.now(ZoneInfo("Asia/Yangon")).date().isoformat()
+    ordered = sorted(
         rows,
-        f"daily:{uid}:{today}",
+        key=lambda r: hashlib.md5(
+            f"track-of-day:{uid}:{today}:{r['channel_id']}:{r['message_id']}".encode()
+        ).hexdigest(),
     )
+    return [
+        (r['mood'], int(r['message_id']), str(r['channel_id']), r.get('title'))
+        for r in ordered[:limit]
+    ]
 
 
 def track_of_day(uid):
-
-    rows = eligible_tracks(uid)
-
-    today = datetime.now(
-        ZoneInfo("Asia/Yangon")
-    ).date().isoformat()
-
-    return stable_pick(
-        rows,
-        f"today:{uid}:{today}",
-    )
+    tracks = track_of_day_tracks(uid, 10)
+    return tracks[0] if tracks else None
 
 
 def for_you_track(uid):
-
-    weights = radio_weights(uid)
-    rows = eligible_tracks(uid)
-
+    """For You never recommends unliked tracks."""
+    rows = liked_tracks(uid)
     if not rows:
         return None
 
-    weighted = [
-        max(
-            0.05,
-            float(
-                weights.get(
-                    row["mood"],
-                    0.05,
-                )
-            ),
-        )
-        for row in rows
+    hist = history(uid)
+    unseen = [
+        r for r in rows
+        if (str(r['channel_id']), int(r['message_id'])) not in hist
     ]
-
-    r = random.choices(
-        rows,
-        weights=weighted,
-        k=1,
-    )[0]
-
+    pool = unseen or rows
+    r = random.choice(pool)
     return (
-        r["mood"],
-        int(r["message_id"]),
-        str(r["channel_id"]),
-        r.get("title"),
+        r['mood'],
+        int(r['message_id']),
+        str(r['channel_id']),
+        r.get('title'),
     )
-
 
 def surprise_track(uid):
 
@@ -3304,6 +3339,42 @@ def send_special_music(
 
 
 # =========================================================
+# TRACK OF THE DAY PLAYLIST
+# =========================================================
+
+def send_track_of_day_playlist(chat, uid):
+    tracks = track_of_day_tracks(uid, 10)
+
+    if not tracks:
+        return send(
+            chat,
+            "🎵 TRACK OF THE DAY\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "Raver အနေနဲ့ Like 10 ခုပေးအောင်မလုပ်ရသေးသဖြင့် BOT မှမပို့ပေးနိုင်သေးကြောင်းပါ",
+            mood_menu(),
+        )
+
+    send(
+        chat,
+        "🎵 TRACK OF THE DAY\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "❤️ Your daily playlist: 10 tracks you already liked.\n"
+        "နေ့တိုင်း playlist selection/order ပြောင်းပါတယ်။",
+    )
+
+    for i, track in enumerate(tracks, 1):
+        mood, msg, ch, title = track
+        result = copy_music(chat, ch, msg)
+        if result.get("ok"):
+            reserve(uid, (mood, msg, ch), action="track_of_day")
+
+    return send(
+        chat,
+        "🎧 Playlist complete. Enjoy the vibe. ✨",
+        mood_menu(),
+    )
+
+# =========================================================
 # SEND NORMAL / RADIO
 # =========================================================
 
@@ -3362,7 +3433,12 @@ def send_music(
 
     reserve(
         uid,
-        track,
+        (
+            selected_mood,
+            msg,
+            channel,
+        ),
+        action="radio" if radio else "manual_mood",
     )
 
     if radio:
@@ -4484,11 +4560,9 @@ def callback(c):
             "🎵 Track of the Day",
         )
 
-        send_special_music(
+        send_track_of_day_playlist(
             chat,
             uid,
-            track_of_day(uid),
-            "🎵 TRACK OF THE DAY",
         )
 
         return
