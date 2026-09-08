@@ -652,7 +652,7 @@ def get_state(uid):
             r["radio_enabled"]
         ),
         "mode": r.get("current_mode") if r.get("current_mode") in {
-            "daily_vibe", "for_you", "surprise_me", "track_of_day"
+            "daily_vibe", "for_you", "surprise_me", "track_of_day", "new_tracks"
         } else None,
     }
 
@@ -664,6 +664,7 @@ def set_special_mode(uid, mode):
         "for_you",
         "surprise_me",
         "track_of_day",
+        "new_tracks",
     }:
         return False
 
@@ -3222,6 +3223,7 @@ def play_selected_track(
     uid,
     track_id,
     header="▶️ SELECTED TRACK",
+    mode=None,
 ):
 
     row = get_track(
@@ -3299,7 +3301,57 @@ def play_selected_track(
             ch,
             msg,
             mood,
+            mode,
         ),
+    )
+
+
+# =========================================================
+# NEW TRACK MODE PICKER
+# =========================================================
+
+def new_track_mode_track(uid):
+
+    rows = backfill_track_titles(latest_tracks(25))
+
+    if not rows:
+        return None
+
+    seen = recent(uid, 500)
+
+    candidates = [
+        r for r in rows
+        if (
+            str(r["channel_id"]),
+            int(r["message_id"]),
+        ) not in seen
+        and feedback(
+            uid,
+            str(r["channel_id"]),
+            int(r["message_id"]),
+        ) != "not_for_me"
+    ]
+
+    if not candidates:
+        candidates = [
+            r for r in rows
+            if feedback(
+                uid,
+                str(r["channel_id"]),
+                int(r["message_id"]),
+            ) != "not_for_me"
+        ]
+
+    if not candidates:
+        return None
+
+    r = candidates[0]
+
+    return (
+        r["mood"],
+        int(r["message_id"]),
+        str(r["channel_id"]),
+        r.get("title"),
     )
 
 
@@ -3327,6 +3379,11 @@ def send_next_special_mode(chat, uid, mode):
     if mode == "track_of_day":
         return send_special_music(
             chat, uid, track_of_day(uid), "🎵 TRACK OF THE DAY"
+        )
+
+    if mode == "new_tracks":
+        return send_special_music(
+            chat, uid, new_track_mode_track(uid), "🆕 NEW TRACK"
         )
 
     return send(
@@ -3758,7 +3815,10 @@ def latest_tracks(
     return rows
 
 
-def new_tracks(chat):
+def new_tracks(chat, uid=None):
+
+    if uid is not None:
+        set_special_mode(uid, "new_tracks")
 
     rows = latest_tracks(
         5
@@ -3819,7 +3879,7 @@ def new_tracks(chat):
                         "text":
                             f"▶️ {title[:38]}",
                         "callback_data":
-                            f"play:{int(row['id'])}",
+                            (f"play:new_tracks:{int(row['id'])}" if uid is not None else f"play:{int(row['id'])}"),
                     }
                 ]
             )
@@ -3941,12 +4001,21 @@ def callback(c):
 
         try:
 
-            track_id = int(
-                data.split(
-                    ":",
-                    1,
-                )[1]
-            )
+            parts = data.split(":")
+            mode = None
+
+            if len(parts) == 2:
+                track_id = int(parts[1])
+            elif len(parts) == 3:
+                mode = parts[1]
+                track_id = int(parts[2])
+
+                if mode not in {"new_tracks"}:
+                    raise ValueError("Invalid mode")
+
+                set_special_mode(uid, mode)
+            else:
+                raise ValueError("Invalid callback")
 
         except Exception:
 
@@ -3966,6 +4035,7 @@ def callback(c):
             chat,
             uid,
             track_id,
+            mode=mode,
         )
 
         return
@@ -4356,7 +4426,7 @@ def callback(c):
 
         mode = data.split(":", 1)[1]
 
-        if mode in {"daily_vibe", "for_you", "surprise_me", "track_of_day"}:
+        if mode in {"daily_vibe", "for_you", "surprise_me", "track_of_day", "new_tracks"}:
 
             # Keep the user inside the same feature mode.
             # Re-save it so the database state stays consistent.
@@ -4719,7 +4789,8 @@ def callback(c):
         )
 
         new_tracks(
-            chat
+            chat,
+            uid,
         )
 
         return
