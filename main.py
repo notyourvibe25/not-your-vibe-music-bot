@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import threading
 import time
 
@@ -2021,8 +2022,7 @@ def top_liked_tracks(
                     t.message_id,
                     COALESCE(
                         NULLIF(t.title,''),
-                        'Track #' ||
-                        t.message_id::text
+                        'Unknown Track'
                     ) AS title,
                     COUNT(f.id) AS likes
                 FROM tracks t
@@ -2109,8 +2109,7 @@ def trending_rows(
 
                     COALESCE(
                         NULLIF(t.title,''),
-                        'Track #' ||
-                        t.message_id::text
+                        'Unknown Track'
                     ) AS title,
 
                     COALESCE(
@@ -2315,11 +2314,7 @@ def track_list_buttons(
             row["id"]
         )
 
-        title = (
-            row.get("title")
-            or
-            f"Track #{row['message_id']}"
-        )
+        title = clean_track_title(row.get("title")) or "Unknown Track"
 
         title = str(
             title
@@ -3264,10 +3259,7 @@ def play_selected_track(
         row["message_id"]
     )
 
-    title = (
-        row.get("title")
-        or f"Track #{msg}"
-    )
+    title = clean_track_title(row.get("title")) or "Unknown Track"
 
     result = copy_music(
         chat,
@@ -3455,10 +3447,7 @@ def send_special_music(
         ),
     )
 
-    label = (
-        title
-        or f"Track #{msg}"
-    )
+    label = clean_track_title(title) or "Unknown Track"
 
     label = str(
         label
@@ -3482,6 +3471,77 @@ def send_special_music(
             get_state(uid).get("mode"),
         ),
     )
+
+
+def get_track_title(ch, msg):
+    """Return the saved title, or fetch/backfill it from Telegram."""
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute(
+                    """
+                    SELECT title
+                    FROM tracks
+                    WHERE channel_id=%s
+                      AND message_id=%s
+                    LIMIT 1
+                    """,
+                    (str(ch), int(msg)),
+                )
+                row = x.fetchone()
+
+        title = clean_track_title(row.get("title") if row else None)
+        if title:
+            return title
+    except Exception:
+        log.exception(
+            "track title DB lookup failed channel=%s message=%s",
+            ch,
+            msg,
+        )
+
+    if client is None or tele_loop is None or not ready.is_set():
+        return None
+
+    try:
+        fut = asyncio.run_coroutine_threadsafe(
+            fetch_track_title_async(ch, msg),
+            tele_loop,
+        )
+        return clean_track_title(fut.result(timeout=15))
+    except Exception:
+        log.warning(
+            "track title Telegram lookup failed channel=%s message=%s",
+            ch,
+            msg,
+        )
+        return None
+
+
+async def fetch_track_title_async(ch, msg):
+    ent = await client.get_entity(int(ch))
+    tg_msg = await client.get_messages(ent, ids=int(msg))
+
+    if not tg_msg:
+        return None
+
+    title = message_title(tg_msg)
+    if not title:
+        return None
+
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                UPDATE tracks
+                SET title=%s
+                WHERE channel_id=%s
+                  AND message_id=%s
+                """,
+                (title, str(ch), int(msg)),
+            )
+
+    return title
 
 
 # =========================================================
@@ -3517,6 +3577,9 @@ def send_music(
         )
 
     selected_mood, msg, channel = track
+
+    # Resolve title before sending the source message.
+    track_label = get_track_title(channel, msg) or "Unknown Track"
 
     result = copy_music(
         chat,
@@ -3565,8 +3628,9 @@ def send_music(
 
     send(
         chat,
-        f"{title}\n"
+        f"{header_title}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎵 {track_label}\n"
         f"{INFO[selected_mood][0]}\n\n"
         f"{desc}\n\n"
         "Enjoy the vibe. ✨",
@@ -3874,11 +3938,7 @@ def new_tracks(chat, uid=None):
 
         for row in mood_rows:
 
-            title = (
-                row.get("title")
-                or
-                f"Track #{row['message_id']}"
-            )
+            title = clean_track_title(row.get("title")) or "Unknown Track"
 
             title = str(
                 title
@@ -5766,50 +5826,87 @@ def is_music(msg):
     )
 
 
-def message_title(msg):
+def clean_track_title(value):
+    """Return a readable track title and reject bare message numbers."""
+    if value is None:
+        return None
 
-    try:
+    value = str(value).strip()
+    if not value:
+        return None
 
-        f = getattr(
-            msg,
-            "file",
-            None,
-        )
+    value = value.rsplit("/", 1)[-1].strip()
 
-        name = (
-            getattr(
-                f,
-                "name",
-                "",
-            )
-            or ""
-        ).strip() if f else ""
+    # Never use a bare Telegram message ID as the title.
+    if re.fullmatch(r"(?:#?\s*)\d+", value):
+        return None
 
-        if name:
-
-            return name.rsplit(
-                "/",
-                1,
-            )[-1][:200]
-
-    except Exception:
-
-        pass
-
-    text = (
-        getattr(
-            msg,
-            "message",
-            "",
-        )
-        or ""
+    # Remove common audio/video extensions.
+    value = re.sub(
+        r"\.(mp3|m4a|flac|wav|aac|ogg|opus|mp4|mkv|webm)$",
+        "",
+        value,
+        flags=re.IGNORECASE,
     ).strip()
 
-    return (
-        text[:200]
-        if text
-        else None
-    )
+    if not value or re.fullmatch(r"(?:#?\s*)\d+", value):
+        return None
+
+    return value[:200]
+
+
+def message_title(msg):
+    """Extract the best human-readable title from a Telethon message."""
+    # 1) Filename.
+    try:
+        f = getattr(msg, "file", None)
+        name = getattr(f, "name", None) if f else None
+        title = clean_track_title(name)
+        if title:
+            return title
+    except Exception:
+        pass
+
+    # 2) Telegram audio metadata: title + performer.
+    try:
+        media = getattr(msg, "media", None)
+        document = getattr(media, "document", None) if media else None
+        attrs = getattr(document, "attributes", None) or []
+
+        audio_title = None
+        performer = None
+
+        for attr in attrs:
+            if "documentattributeaudio" in attr.__class__.__name__.lower():
+                audio_title = getattr(attr, "title", None)
+                performer = getattr(attr, "performer", None)
+                break
+
+        audio_title = clean_track_title(audio_title)
+        performer = clean_track_title(performer)
+
+        if audio_title and performer:
+            return f"{performer} - {audio_title}"[:200]
+        if audio_title:
+            return audio_title
+    except Exception:
+        pass
+
+    # 3) Caption/text.
+    try:
+        caption = (
+            getattr(msg, "message", None)
+            or getattr(msg, "raw_text", None)
+            or ""
+        ).strip()
+
+        title = clean_track_title(caption)
+        if title:
+            return title
+    except Exception:
+        pass
+
+    return None
 
 
 # =========================================================
