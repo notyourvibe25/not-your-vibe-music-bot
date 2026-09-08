@@ -3136,6 +3136,7 @@ def buttons(
     ch,
     msg,
     mood,
+    mode=None,
 ):
 
     f = feedback(
@@ -3177,7 +3178,7 @@ def buttons(
                     "text":
                         "⏭ NEXT",
                     "callback_data":
-                        "next_music",
+                        (f"next_special:{mode}" if mode else "next_music"),
                 },
                 {
                     "text":
@@ -3403,6 +3404,7 @@ def send_special_music(
             ch,
             msg,
             mood,
+            get_state(uid).get("mode"),
         ),
     )
 
@@ -4344,6 +4346,36 @@ def callback(c):
                 False,
             )
 
+        return
+
+    # =====================================================
+    # NEXT SPECIAL MODE (MODE LOCKED IN CALLBACK)
+    # =====================================================
+
+    if data.startswith("next_special:"):
+
+        mode = data.split(":", 1)[1]
+
+        if mode in {"daily_vibe", "for_you", "surprise_me", "track_of_day"}:
+
+            # Keep the user inside the same feature mode.
+            # Re-save it so the database state stays consistent.
+            set_special_mode(uid, mode)
+
+            answer(
+                callback_id,
+                "⏭ Finding your next track...",
+            )
+
+            send_next_special_mode(
+                chat,
+                uid,
+                mode,
+            )
+
+            return
+
+        answer(callback_id, "Invalid mode")
         return
 
     # =====================================================
