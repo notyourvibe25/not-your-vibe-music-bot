@@ -390,7 +390,6 @@ def init_db():
         user_id BIGINT PRIMARY KEY,
         mood TEXT,
         radio_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-        current_mode TEXT,
         updated_at BIGINT NOT NULL
     );
 
@@ -482,9 +481,6 @@ def init_db():
     ALTER TABLE tracks
         ADD COLUMN IF NOT EXISTS title TEXT;
 
-    ALTER TABLE user_state
-        ADD COLUMN IF NOT EXISTS current_mode TEXT;
-
     ALTER TABLE broadcasts
         ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
 
@@ -573,6 +569,18 @@ def register(u):
 
 
 # =========================================================
+# SPECIAL MODE MEMORY
+# =========================================================
+
+SPECIAL_MODE = {}
+
+def set_special_mode(uid, mode):
+    SPECIAL_MODE[int(uid)] = mode
+
+def get_special_mode(uid):
+    return SPECIAL_MODE.get(int(uid))
+
+# =========================================================
 # USER STATE
 # =========================================================
 
@@ -591,16 +599,14 @@ def set_mood(uid, mood):
                     user_id,
                     mood,
                     radio_enabled,
-                    current_mode,
                     updated_at
                 )
-                VALUES(%s,%s,FALSE,NULL,%s)
+                VALUES(%s,%s,FALSE,%s)
 
                 ON CONFLICT(user_id)
                 DO UPDATE SET
                     mood=EXCLUDED.mood,
                     radio_enabled=FALSE,
-                    current_mode=NULL,
                     updated_at=EXCLUDED.updated_at
                 """,
                 (
@@ -623,8 +629,7 @@ def get_state(uid):
                 """
                 SELECT
                     mood,
-                    radio_enabled,
-                    current_mode
+                    radio_enabled
                 FROM user_state
                 WHERE user_id=%s
                 """,
@@ -638,7 +643,6 @@ def get_state(uid):
         return {
             "mood": None,
             "radio": False,
-            "mode": None,
         }
 
     mood = r["mood"]
@@ -651,69 +655,7 @@ def get_state(uid):
         "radio": bool(
             r["radio_enabled"]
         ),
-        "mode": r.get("current_mode") if r.get("current_mode") in {
-            "daily_vibe", "for_you", "surprise_me", "track_of_day", "new_tracks"
-        } else None,
     }
-
-
-def set_special_mode(uid, mode):
-
-    if mode not in {
-        "daily_vibe",
-        "for_you",
-        "surprise_me",
-        "track_of_day",
-        "new_tracks",
-    }:
-        return False
-
-    with db() as c:
-
-        with cur(c) as x:
-
-            x.execute(
-                """
-                INSERT INTO user_state(
-                    user_id,
-                    mood,
-                    radio_enabled,
-                    current_mode,
-                    updated_at
-                )
-                VALUES(%s,NULL,FALSE,%s,%s)
-
-                ON CONFLICT(user_id)
-                DO UPDATE SET
-                    radio_enabled=FALSE,
-                    current_mode=EXCLUDED.current_mode,
-                    updated_at=EXCLUDED.updated_at
-                """,
-                (
-                    uid,
-                    mode,
-                    int(time.time()),
-                ),
-            )
-
-    return True
-
-
-def clear_special_mode(uid):
-
-    with db() as c:
-
-        with cur(c) as x:
-
-            x.execute(
-                """
-                UPDATE user_state
-                SET current_mode=NULL,
-                    updated_at=%s
-                WHERE user_id=%s
-                """,
-                (int(time.time()), uid),
-            )
 
 
 def get_mood(uid):
@@ -738,15 +680,13 @@ def set_radio(uid, on=True):
                     user_id,
                     mood,
                     radio_enabled,
-                    current_mode,
                     updated_at
                 )
-                VALUES(%s,NULL,%s,NULL,%s)
+                VALUES(%s,NULL,%s,%s)
 
                 ON CONFLICT(user_id)
                 DO UPDATE SET
                     radio_enabled=EXCLUDED.radio_enabled,
-                    current_mode=NULL,
                     updated_at=EXCLUDED.updated_at
                 """,
                 (
@@ -755,33 +695,6 @@ def set_radio(uid, on=True):
                     int(time.time()),
                 ),
             )
-
-
-# =========================================================
-# TRACK TITLE NORMALIZATION
-# =========================================================
-
-def clean_track_title(title):
-    title = str(title or "").strip()
-    if not title:
-        return None
-
-    # Telegram copy/message IDs must never become titles.
-    if title.isdigit() or title.lower() in {"none", "null", "copymessage"}:
-        return None
-
-    # Remove path and only the final audio extension.
-    title = title.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].strip()
-    lower = title.lower()
-    for ext in AUDIO:
-        if lower.endswith(ext):
-            title = title[:-len(ext)].strip()
-            break
-
-    if not title or title.isdigit() or title.lower() in {"none", "null", "copymessage"}:
-        return None
-
-    return title[:200]
 
 
 # =========================================================
@@ -801,8 +714,6 @@ def save_track(
         or not msg
     ):
         return False
-
-    title = clean_track_title(title)
 
     with db() as c:
 
@@ -2226,9 +2137,7 @@ async def backfill_track_titles_async(
 
     for row in rows:
 
-        existing_title = clean_track_title(row.get("title"))
-        if existing_title:
-            row["title"] = existing_title
+        if row.get("title"):
             continue
 
         try:
@@ -2320,17 +2229,6 @@ def backfill_track_titles(
 
 
 # =========================================================
-# DISPLAY TITLE
-# =========================================================
-
-def display_title(row):
-    title = clean_track_title(row.get("title"))
-    if title:
-        return title.replace("\n", " ")[:200]
-    return "Unknown Track"
-
-
-# =========================================================
 # LIST BUTTONS
 # =========================================================
 
@@ -2349,7 +2247,18 @@ def track_list_buttons(
             row["id"]
         )
 
-        title = display_title(row)
+        title = (
+            row.get("title")
+            or
+            "Unknown Track"
+        )
+
+        title = str(
+            title
+        ).replace(
+            "\n",
+            " ",
+        )
 
         if len(title) > 38:
             title = title[:35] + "..."
@@ -2421,7 +2330,12 @@ def top_liked_text(
         1,
     ):
 
-        title = display_title(row)[:90]
+        title = str(
+            row["title"]
+        ).replace(
+            "\n",
+            " ",
+        )[:90]
 
         lines.append(
             f"{i}. 🎵 {title}"
@@ -2476,7 +2390,12 @@ def trending_text(
         1,
     ):
 
-        title = display_title(row)[:90]
+        title = str(
+            row["title"]
+        ).replace(
+            "\n",
+            " ",
+        )[:90]
 
         lines.append(
             f"{i}. 🎵 {title}"
@@ -2990,57 +2909,24 @@ def track_of_day(uid):
 
 
 def for_you_track(uid):
-
-    # FOR YOU = ONLY tracks this user has explicitly liked.
-    # Never use Radio weights or the general recommendation pool here.
+    # FOR YOU = ONLY tracks explicitly liked by this user.
     with db() as c:
-
         with cur(c) as x:
-
-            x.execute(
-                """
-                SELECT
-                    t.mood,
-                    t.message_id,
-                    t.channel_id,
-                    t.title
-                FROM track_feedback f
-                JOIN tracks t
-                  ON t.channel_id=f.channel_id
-                 AND t.message_id=f.message_id
-                WHERE f.user_id=%s
-                  AND f.feedback='like'
-                ORDER BY f.created_at DESC
-                """,
-                (uid,),
-            )
-
-            rows = x.fetchall()
-
-    if not rows:
-        return None
-
-    # Prefer liked tracks that have not been sent recently in history.
-    h = history(uid)
-
-    unseen = [
-        row
-        for row in rows
-        if (
-            str(row["channel_id"]),
-            int(row["message_id"]),
-        ) not in h
-    ]
-
-    row = random.choice(unseen or rows)
-
-    return (
-        row["mood"],
-        int(row["message_id"]),
-        str(row["channel_id"]),
-        row.get("title"),
-    )
-
+            x.execute("""
+                SELECT t.mood,t.message_id,t.channel_id,t.title
+                FROM tracks t
+                JOIN track_feedback f
+                  ON f.channel_id=t.channel_id
+                 AND f.message_id=t.message_id
+                WHERE f.user_id=%s AND f.feedback='like'
+                ORDER BY f.created_at DESC,t.id DESC
+            """, (uid,))
+            rows=x.fetchall()
+    if not rows: return None
+    h=history(uid)
+    unseen=[r for r in rows if (str(r['channel_id']),int(r['message_id'])) not in h]
+    r=random.choice(unseen or rows)
+    return (r['mood'],int(r['message_id']),str(r['channel_id']),r.get('title'))
 
 def surprise_track(uid):
 
@@ -3210,7 +3096,7 @@ def buttons(
                     "text":
                         "⏭ NEXT",
                     "callback_data":
-                        (f"next_special:{mode}" if mode else "next_music"),
+                        f"next_special:{mode}" if mode else "next_music",
                 },
                 {
                     "text":
@@ -3254,7 +3140,6 @@ def play_selected_track(
     uid,
     track_id,
     header="▶️ SELECTED TRACK",
-    mode=None,
 ):
 
     row = get_track(
@@ -3332,95 +3217,7 @@ def play_selected_track(
             ch,
             msg,
             mood,
-            mode,
         ),
-    )
-
-
-# =========================================================
-# NEW TRACK MODE PICKER
-# =========================================================
-
-def new_track_mode_track(uid):
-
-    rows = backfill_track_titles(latest_tracks(25))
-
-    if not rows:
-        return None
-
-    seen = recent(uid, 500)
-
-    candidates = [
-        r for r in rows
-        if (
-            str(r["channel_id"]),
-            int(r["message_id"]),
-        ) not in seen
-        and feedback(
-            uid,
-            str(r["channel_id"]),
-            int(r["message_id"]),
-        ) != "not_for_me"
-    ]
-
-    if not candidates:
-        candidates = [
-            r for r in rows
-            if feedback(
-                uid,
-                str(r["channel_id"]),
-                int(r["message_id"]),
-            ) != "not_for_me"
-        ]
-
-    if not candidates:
-        return None
-
-    r = candidates[0]
-
-    return (
-        r["mood"],
-        int(r["message_id"]),
-        str(r["channel_id"]),
-        r.get("title"),
-    )
-
-
-# =========================================================
-# SPECIAL MODE NEXT
-# =========================================================
-
-def send_next_special_mode(chat, uid, mode):
-
-    if mode == "daily_vibe":
-        return send_special_music(
-            chat, uid, daily_vibe_track(uid), "🔥 YOUR DAILY VIBE", mode="daily_vibe"
-        )
-
-    if mode == "for_you":
-        return send_special_music(
-            chat, uid, for_you_track(uid), "🧠 PICKED FOR YOU", mode="for_you"
-        )
-
-    if mode == "surprise_me":
-        return send_special_music(
-            chat, uid, surprise_track(uid), "🎲 SURPRISE ME", mode="surprise_me"
-        )
-
-    if mode == "track_of_day":
-        return send_special_music(
-            chat, uid, track_of_day(uid), "🎵 TRACK OF THE DAY", mode="track_of_day"
-        )
-
-    if mode == "new_tracks":
-        return send_special_music(
-            chat, uid, new_track_mode_track(uid), "🆕 NEW TRACK", mode="new_tracks"
-        )
-
-    return send(
-        chat,
-        "🎧 Choose your mood first 👇",
-        mood_menu(),
     )
 
 
@@ -3471,7 +3268,7 @@ def send_special_music(
 
     label = (
         title
-        or f"Track #{msg}"
+        or "Unknown Track"
     )
 
     label = str(
@@ -3493,7 +3290,7 @@ def send_special_music(
             ch,
             msg,
             mood,
-            mode or get_state(uid).get("mode"),
+            mode,
         ),
     )
 
@@ -3847,10 +3644,7 @@ def latest_tracks(
     return rows
 
 
-def new_tracks(chat, uid=None):
-
-    if uid is not None:
-        set_special_mode(uid, "new_tracks")
+def new_tracks(chat):
 
     rows = latest_tracks(
         5
@@ -3888,7 +3682,18 @@ def new_tracks(chat, uid=None):
 
         for row in mood_rows:
 
-            title = display_title(row)
+            title = (
+                row.get("title")
+                or
+                "Unknown Track"
+            )
+
+            title = str(
+                title
+            ).replace(
+                "\n",
+                " ",
+            )
 
             lines.append(
                 f"• {title[:80]}"
@@ -3900,7 +3705,7 @@ def new_tracks(chat, uid=None):
                         "text":
                             f"▶️ {title[:38]}",
                         "callback_data":
-                            (f"play:new_tracks:{int(row['id'])}" if uid is not None else f"play:{int(row['id'])}"),
+                            f"play:{int(row['id'])}",
                     }
                 ]
             )
@@ -4022,21 +3827,12 @@ def callback(c):
 
         try:
 
-            parts = data.split(":")
-            mode = None
-
-            if len(parts) == 2:
-                track_id = int(parts[1])
-            elif len(parts) == 3:
-                mode = parts[1]
-                track_id = int(parts[2])
-
-                if mode not in {"new_tracks"}:
-                    raise ValueError("Invalid mode")
-
-                set_special_mode(uid, mode)
-            else:
-                raise ValueError("Invalid callback")
+            track_id = int(
+                data.split(
+                    ":",
+                    1,
+                )[1]
+            )
 
         except Exception:
 
@@ -4056,7 +3852,6 @@ def callback(c):
             chat,
             uid,
             track_id,
-            mode=mode,
         )
 
         return
@@ -4440,34 +4235,22 @@ def callback(c):
         return
 
     # =====================================================
-    # NEXT SPECIAL MODE (MODE LOCKED IN CALLBACK)
+    # SPECIAL MODE NEXT (NEVER LEAVE CURRENT MODE)
     # =====================================================
-
     if data.startswith("next_special:"):
-
-        mode = data.split(":", 1)[1]
-
-        if mode in {"daily_vibe", "for_you", "surprise_me", "track_of_day", "new_tracks"}:
-
-            # Keep the user inside the same feature mode.
-            # Re-save it so the database state stays consistent.
-            set_special_mode(uid, mode)
-
-            answer(
-                callback_id,
-                "⏭ Finding your next track...",
-            )
-
-            send_next_special_mode(
-                chat,
-                uid,
-                mode,
-            )
-
+        mode=data.split(":",1)[1]
+        set_special_mode(uid, mode)
+        mapping={
+            "daily_vibe": (daily_vibe_track, "🔥 YOUR DAILY VIBE"),
+            "for_you": (for_you_track, "🧠 PICKED FOR YOU"),
+            "surprise_me": (surprise_track, "🎲 SURPRISE ME"),
+            "track_of_day": (track_of_day, "🎵 TRACK OF THE DAY"),
+        }
+        if mode in mapping:
+            fn,header=mapping[mode]
+            answer(callback_id,"⏭ Next track...")
+            send_special_music(chat,uid,fn(uid),header,mode=mode)
             return
-
-        answer(callback_id, "Invalid mode")
-        return
 
     # =====================================================
     # NEXT
@@ -4481,22 +4264,6 @@ def callback(c):
 
         mood = state["mood"]
         radio = state["radio"]
-        mode = state.get("mode")
-
-        if mode:
-
-            answer(
-                callback_id,
-                "⏭ Finding your next track...",
-            )
-
-            send_next_special_mode(
-                chat,
-                uid,
-                mode,
-            )
-
-            return
 
         if radio:
 
@@ -4655,54 +4422,57 @@ def callback(c):
 
     if data == "daily_vibe":
 
-        set_special_mode(uid, "daily_vibe")
-
         answer(
             callback_id,
             "🔥 Daily Vibe",
         )
+
+        set_special_mode(uid, "daily_vibe")
 
         send_special_music(
             chat,
             uid,
             daily_vibe_track(uid),
             "🔥 YOUR DAILY VIBE",
+            mode="daily_vibe",
         )
 
         return
 
     if data == "for_you":
 
-        set_special_mode(uid, "for_you")
-
         answer(
             callback_id,
             "🧠 Personal pick",
         )
+
+        set_special_mode(uid, "for_you")
 
         send_special_music(
             chat,
             uid,
             for_you_track(uid),
             "🧠 PICKED FOR YOU",
+            mode="for_you",
         )
 
         return
 
     if data == "surprise_me":
 
-        set_special_mode(uid, "surprise_me")
-
         answer(
             callback_id,
             "🎲 Surprise!",
         )
+
+        set_special_mode(uid, "surprise_me")
 
         send_special_music(
             chat,
             uid,
             surprise_track(uid),
             "🎲 SURPRISE ME",
+            mode="surprise_me",
         )
 
         return
@@ -4728,18 +4498,19 @@ def callback(c):
 
     if data == "track_of_day":
 
-        set_special_mode(uid, "track_of_day")
-
         answer(
             callback_id,
             "🎵 Track of the Day",
         )
+
+        set_special_mode(uid, "track_of_day")
 
         send_special_music(
             chat,
             uid,
             track_of_day(uid),
             "🎵 TRACK OF THE DAY",
+            mode="track_of_day",
         )
 
         return
@@ -4810,8 +4581,7 @@ def callback(c):
         )
 
         new_tracks(
-            chat,
-            uid,
+            chat
         )
 
         return
@@ -4880,7 +4650,6 @@ def callback(c):
                     "⚠️ Track not found",
                 )
 
-        current_mode = get_state(uid).get("mode")
         edit_k(
             chat,
             msg.get(
@@ -4891,7 +4660,6 @@ def callback(c):
                 ch,
                 mid,
                 mood,
-                current_mode,
             ),
         )
 
@@ -5122,22 +4890,6 @@ def message(m):
 
         mood = state["mood"]
         radio = state["radio"]
-        mode = state.get("mode")
-
-        if mode:
-
-            send(
-                chat,
-                "⏭ Finding your next track...",
-            )
-
-            send_next_special_mode(
-                chat,
-                uid,
-                mode,
-            )
-
-            return
 
         if radio:
 
@@ -5278,6 +5030,7 @@ def message(m):
             uid,
             daily_vibe_track(uid),
             "🔥 YOUR DAILY VIBE",
+            mode="daily_vibe",
         )
 
         return
@@ -5295,6 +5048,7 @@ def message(m):
             uid,
             for_you_track(uid),
             "🧠 PICKED FOR YOU",
+            mode="for_you",
         )
 
         return
@@ -5312,6 +5066,7 @@ def message(m):
             uid,
             surprise_track(uid),
             "🎲 SURPRISE ME",
+            mode="surprise_me",
         )
 
         return
@@ -5347,6 +5102,7 @@ def message(m):
             uid,
             track_of_day(uid),
             "🎵 TRACK OF THE DAY",
+            mode="track_of_day",
         )
 
         return
@@ -5772,28 +5528,26 @@ def is_music(msg):
 
 
 def message_title(msg):
-
-    # 1) Telegram audio filename is the best source.
+    # Real Telegram audio metadata first; never return copyMessage/message_id.
     try:
-        f = getattr(msg, "file", None)
-        name = str(getattr(f, "name", "") or "").strip() if f else ""
-        title = clean_track_title(name)
-        if title:
-            return title
-    except Exception:
-        pass
-
-    # 2) Caption/message is the fallback.
+        for obj in (getattr(msg,"audio",None), getattr(msg,"document",None)):
+            for attr in getattr(obj,"attributes",None) or []:
+                title=getattr(attr,"title",None); performer=getattr(attr,"performer",None)
+                if title and str(title).strip():
+                    return (f"{str(performer).strip()} - " if performer and str(performer).strip() else "") + str(title).strip()
+    except Exception: pass
     try:
-        text = str(getattr(msg, "message", "") or "").strip()
-        title = clean_track_title(text)
-        if title:
-            return title
-    except Exception:
-        pass
-
+        name=str(getattr(getattr(msg,"file",None),"name","") or "").strip()
+        if name:
+            for ext in AUDIO:
+                if name.lower().endswith(ext): name=name[:-len(ext)]; break
+            if name and not name.isdigit(): return name[:200]
+    except Exception: pass
+    try:
+        text=str(getattr(msg,"message","") or "").strip()
+        if text and not text.isdigit(): return text[:200]
+    except Exception: pass
     return None
-
 
 # =========================================================
 # TELETHON SCAN
