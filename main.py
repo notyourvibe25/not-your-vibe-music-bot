@@ -2978,36 +2978,54 @@ def track_of_day(uid):
 
 def for_you_track(uid):
 
-    weights = radio_weights(uid)
-    rows = eligible_tracks(uid)
+    # FOR YOU = ONLY tracks this user has explicitly liked.
+    # Never use Radio weights or the general recommendation pool here.
+    with db() as c:
+
+        with cur(c) as x:
+
+            x.execute(
+                """
+                SELECT
+                    t.mood,
+                    t.message_id,
+                    t.channel_id,
+                    t.title
+                FROM track_feedback f
+                JOIN tracks t
+                  ON t.channel_id=f.channel_id
+                 AND t.message_id=f.message_id
+                WHERE f.user_id=%s
+                  AND f.feedback='like'
+                ORDER BY f.created_at DESC
+                """,
+                (uid,),
+            )
+
+            rows = x.fetchall()
 
     if not rows:
         return None
 
-    weighted = [
-        max(
-            0.05,
-            float(
-                weights.get(
-                    row["mood"],
-                    0.05,
-                )
-            ),
-        )
+    # Prefer liked tracks that have not been sent recently in history.
+    h = history(uid)
+
+    unseen = [
+        row
         for row in rows
+        if (
+            str(row["channel_id"]),
+            int(row["message_id"]),
+        ) not in h
     ]
 
-    r = random.choices(
-        rows,
-        weights=weighted,
-        k=1,
-    )[0]
+    row = random.choice(unseen or rows)
 
     return (
-        r["mood"],
-        int(r["message_id"]),
-        str(r["channel_id"]),
-        r.get("title"),
+        row["mood"],
+        int(row["message_id"]),
+        str(row["channel_id"]),
+        row.get("title"),
     )
 
 
