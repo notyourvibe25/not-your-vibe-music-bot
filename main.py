@@ -160,23 +160,24 @@ def set_radio(uid,on=True):
         with cur(c) as x:x.execute('''INSERT INTO user_state(user_id,mood,radio_enabled,updated_at) VALUES(%s,NULL,%s,%s) ON CONFLICT(user_id) DO UPDATE SET radio_enabled=EXCLUDED.radio_enabled,updated_at=EXCLUDED.updated_at''',(uid,on,int(time.time())))
 
 def is_bad_title(title):
-    if not title:
+    if title is None:
         return True
     s=str(title).strip()
     if not s:
         return True
-    low=s.lower()
-    bad_prefixes=('copymessage','copy message','forwarded message','track #','message #')
-    if any(low.startswith(p) for p in bad_prefixes):
+    low=s.lower().strip()
+    bad_exact={'copymessage','copy message','copy_message','forwarded message',
+               'audio','document','file','music','unknown track','untitled track'}
+    if low in bad_exact:
         return True
-    if low in ('audio','document','file','music'):
-        return True
-    return False
+    bad_prefixes=('copymessage ','copy message ','copy_message ','forwarded message ',
+                  'track #','message #')
+    return any(low.startswith(p) for p in bad_prefixes)
 
 def clean_title(title):
     if is_bad_title(title):
         return None
-    s=str(title).replace('\\n',' ').strip()
+    s=' '.join(str(title).replace('\\n',' ').split())
     return s[:200] if s else None
 
 def save_track(mood,ch,msg,title=None):
@@ -408,7 +409,7 @@ def top_liked_tracks(limit=10):
     with db() as c:
         with cur(c) as x:
             x.execute("""SELECT t.mood,t.channel_id,t.message_id,
-                         COALESCE(NULLIF(t.title,''),'Track #'||t.message_id::text) AS title,
+                         NULLIF(t.title,'') AS title,
                          COUNT(f.id) AS likes
                          FROM tracks t JOIN track_feedback f
                          ON f.channel_id=t.channel_id AND f.message_id=t.message_id AND f.feedback='like'
@@ -455,7 +456,7 @@ def top_liked_text():
         lines.append('No likes yet. Start liking tracks ❤️')
         return '\n'.join(lines)
     for i,a in enumerate(rows,1):
-        title=str(a['title']).replace('\n',' ')[:90]
+        title=display_title(a).replace('\n',' ')[:90]
         lines.append(f'{i}. 🎵 {title}')
         lines.append(f'   {INFO[a["mood"]][0]} • ❤️ {int(a["likes"])} likes')
     return '\n'.join(lines)
@@ -586,7 +587,7 @@ def liked_tracks(uid):
     with db() as c:
         with cur(c) as x:
             x.execute('''SELECT t.id,t.mood,t.message_id,t.channel_id,
-                                COALESCE(NULLIF(t.title,''),'Track #'||t.message_id::text) AS title,
+                                NULLIF(t.title,'') AS title,
                                 f.created_at AS liked_at
                          FROM track_feedback f
                          JOIN tracks t ON t.channel_id=f.channel_id AND t.message_id=f.message_id
@@ -644,7 +645,7 @@ def trending_rows(limit=10):
     with db() as c:
         with cur(c) as x:
             x.execute("""SELECT t.id,t.mood,t.channel_id,t.message_id,
-                       COALESCE(NULLIF(t.title,''),'Track #'||t.message_id::text) AS title,
+                       NULLIF(t.title,'') AS title,
                        COUNT(f.id) AS likes FROM tracks t JOIN track_feedback f
                        ON f.channel_id=t.channel_id AND f.message_id=t.message_id AND f.feedback='like'
                        GROUP BY t.id,t.mood,t.channel_id,t.message_id,t.title
@@ -656,7 +657,7 @@ def trending_text(limit=10):
     if not rows:return '📈 TRENDING NOW\n━━━━━━━━━━━━━━━━━━\n\nNo liked tracks yet. Start liking tracks ❤️'
     lines=['📈 TRENDING NOW','━━━━━━━━━━━━━━━━━━','']
     for i,r in enumerate(rows,1):
-        title=str(r['title']).replace('\n',' ')[:90]
+        title=display_title(r).replace('\n',' ')[:90]
         lines.append(f"{i}. 🎵 {title}")
         lines.append(f"   {INFO[r['mood']][0]} • ❤️ {int(r['likes'])}")
     return '\n'.join(lines)
@@ -685,7 +686,7 @@ def send_special_music(chat,uid,track,header,source='special'):
     if not r.get('ok'):
         return send(chat,'⚠️ This track could not be delivered.',mood_menu())
     if not reserve(uid,(mood,msg,ch),source):log.warning('History record failed uid=%s channel=%s message=%s',uid,ch,msg)
-    label=(title or f'Track #{msg}').replace('\n',' ')[:120]
+    label=(clean_title(title) or 'Untitled Track').replace('\n',' ')[:120]
     send(chat,f'{header}\n━━━━━━━━━━━━━━━━━━\n\n🎵 {label}\n{INFO[mood][0]}\n\nEnjoy the vibe. ✨',special_buttons(uid,ch,msg,mood))
 
 def send_track_of_day_playlist(chat,uid):
@@ -705,7 +706,7 @@ def send_track_of_day_playlist(chat,uid):
         mood=str(r['mood']);ch=str(r['channel_id']);msg=int(r['message_id'])
         result=copy_music(chat,ch,msg)
         if result.get('ok'):
-            label=(r.get('title') or f'Track #{msg}').replace('\n',' ')[:120]
+            label=(clean_title(r.get('title')) or 'Untitled Track').replace('\n',' ')[:120]
             send(chat,f'#{i} 🎵 {label}\n{INFO[mood][0]}')
             # These tracks were already liked; keep them out of DAILY VIBE because
             # Track of the Day is a recommendation surface.
@@ -767,7 +768,7 @@ def new_tracks(chat):
         if not rows:lines.append('  — No tracks')
         else:
             for a in rows:
-                label=(a.get('title') or f'Track #{a["message_id"]}').replace('\n',' ')[:80]
+                label=(clean_title(a.get('title')) or 'Untitled Track').replace('\n',' ')[:80]
                 lines.append(f'  • {label}')
         lines.append('')
     send(chat,'\n'.join(lines),mood_menu())
@@ -973,43 +974,79 @@ def is_music(msg):
     name=(getattr(getattr(msg,'file',None),'name','') or '').lower();return name.endswith(AUDIO)
 
 def message_title(msg):
-    """Return the real music title, never Telegram's CopyMessage placeholder."""
-    # Telegram audio messages often contain ID3-like metadata in
-    # DocumentAttributeAudio. This is the most reliable source for title.
+    """Get the real music title from Telegram metadata, filename or caption."""
     try:
         doc=getattr(msg,'document',None)
         attrs=getattr(doc,'attributes',None) or []
-        audio_title=None
-        performer=None
-        filename=None
+        audio_title=None; performer=None; filename=None
         for a in attrs:
             t=getattr(a,'title',None)
             p=getattr(a,'performer',None)
             fn=getattr(a,'file_name',None)
-            if t: audio_title=t
-            if p: performer=p
-            if fn: filename=fn
+            if t and str(t).strip(): audio_title=str(t).strip()
+            if p and str(p).strip(): performer=str(p).strip()
+            if fn and str(fn).strip(): filename=str(fn).strip()
         if audio_title:
-            title=str(audio_title).strip()
-            if performer and str(performer).strip() and str(performer).strip().lower() not in title.lower():
-                title=f'{str(performer).strip()} - {title}'
-            if not is_bad_title(title):
-                return clean_title(title)
-
+            title=audio_title
+            if performer and performer.lower() not in title.lower():
+                title=f'{performer} - {title}'
+            title=clean_title(title)
+            if title:return title
         f=getattr(msg,'file',None)
         name=(getattr(f,'name','') or '').strip() if f else ''
         name=filename or name
         if name:
             name=name.rsplit('/',1)[-1]
-            # Remove common audio extension for a cleaner display name.
             import os as _os
             stem,ext=_os.path.splitext(name)
             name=stem if ext.lower() in AUDIO else name
-            if not is_bad_title(name):
-                return clean_title(name)
-    except:pass
-    text=(getattr(msg,'message','') or '').strip()
-    return clean_title(text)
+            name=clean_title(name)
+            if name:return name
+    except Exception:
+        log.exception('message title metadata extraction failed')
+    try:
+        return clean_title((getattr(msg,'message','') or '').strip())
+    except Exception:
+        return None
+
+async def backfill_track_titles_async(rows):
+    if not rows or client is None or not ready.is_set():
+        return rows
+    for row in rows:
+        current=clean_title(row.get('title'))
+        if current:
+            row['title']=current
+            continue
+        try:
+            ch=str(row['channel_id']); mid=int(row['message_id'])
+            ent=await client.get_entity(int(ch))
+            msg=await client.get_messages(ent,ids=mid)
+            if not msg: continue
+            title=message_title(msg)
+            if title:
+                with db() as c:
+                    with cur(c) as x:
+                        x.execute('UPDATE tracks SET title=%s WHERE channel_id=%s AND message_id=%s',(title,ch,mid))
+                row['title']=title
+        except Exception:
+            log.warning('Could not resolve title channel=%s message=%s',row.get('channel_id'),row.get('message_id'),exc_info=True)
+    return rows
+
+def backfill_track_titles(rows):
+    if not rows or client is None or tele_loop is None or not ready.is_set():
+        return rows
+    try:
+        fut=asyncio.run_coroutine_threadsafe(backfill_track_titles_async(rows),tele_loop)
+        fut.result(timeout=60)
+    except Exception:
+        log.warning('top/trending title backfill failed',exc_info=True)
+    return rows
+
+def ensure_row_titles(rows):
+    return backfill_track_titles(rows)
+
+def display_title(row, fallback='Untitled Track'):
+    return clean_title(row.get('title')) or fallback
 
 async def scan(mood,val):
     if not val:return 0
@@ -1024,7 +1061,7 @@ async def scan_all():
     global last_scan
     channel_map.clear()
     for m,v in CHANNELS.items():
-        if v:nv=normch(v)
+        nv=normch(v) if v else None
         if nv: channel_map[nv]=m
     for m,v in CHANNELS.items():
         if v:await scan(m,v);await asyncio.sleep(.3)
