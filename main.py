@@ -390,6 +390,7 @@ def init_db():
         user_id BIGINT PRIMARY KEY,
         mood TEXT,
         radio_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        current_mode TEXT,
         updated_at BIGINT NOT NULL
     );
 
@@ -480,6 +481,9 @@ def init_db():
 
     ALTER TABLE tracks
         ADD COLUMN IF NOT EXISTS title TEXT;
+
+    ALTER TABLE user_state
+        ADD COLUMN IF NOT EXISTS current_mode TEXT;
 
     ALTER TABLE broadcasts
         ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
@@ -587,14 +591,16 @@ def set_mood(uid, mood):
                     user_id,
                     mood,
                     radio_enabled,
+                    current_mode,
                     updated_at
                 )
-                VALUES(%s,%s,FALSE,%s)
+                VALUES(%s,%s,FALSE,NULL,%s)
 
                 ON CONFLICT(user_id)
                 DO UPDATE SET
                     mood=EXCLUDED.mood,
                     radio_enabled=FALSE,
+                    current_mode=NULL,
                     updated_at=EXCLUDED.updated_at
                 """,
                 (
@@ -617,7 +623,8 @@ def get_state(uid):
                 """
                 SELECT
                     mood,
-                    radio_enabled
+                    radio_enabled,
+                    current_mode
                 FROM user_state
                 WHERE user_id=%s
                 """,
@@ -631,6 +638,7 @@ def get_state(uid):
         return {
             "mood": None,
             "radio": False,
+            "mode": None,
         }
 
     mood = r["mood"]
@@ -643,7 +651,68 @@ def get_state(uid):
         "radio": bool(
             r["radio_enabled"]
         ),
+        "mode": r.get("current_mode") if r.get("current_mode") in {
+            "daily_vibe", "for_you", "surprise_me", "track_of_day"
+        } else None,
     }
+
+
+def set_special_mode(uid, mode):
+
+    if mode not in {
+        "daily_vibe",
+        "for_you",
+        "surprise_me",
+        "track_of_day",
+    }:
+        return False
+
+    with db() as c:
+
+        with cur(c) as x:
+
+            x.execute(
+                """
+                INSERT INTO user_state(
+                    user_id,
+                    mood,
+                    radio_enabled,
+                    current_mode,
+                    updated_at
+                )
+                VALUES(%s,NULL,FALSE,%s,%s)
+
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    radio_enabled=FALSE,
+                    current_mode=EXCLUDED.current_mode,
+                    updated_at=EXCLUDED.updated_at
+                """,
+                (
+                    uid,
+                    mode,
+                    int(time.time()),
+                ),
+            )
+
+    return True
+
+
+def clear_special_mode(uid):
+
+    with db() as c:
+
+        with cur(c) as x:
+
+            x.execute(
+                """
+                UPDATE user_state
+                SET current_mode=NULL,
+                    updated_at=%s
+                WHERE user_id=%s
+                """,
+                (int(time.time()), uid),
+            )
 
 
 def get_mood(uid):
@@ -668,13 +737,15 @@ def set_radio(uid, on=True):
                     user_id,
                     mood,
                     radio_enabled,
+                    current_mode,
                     updated_at
                 )
-                VALUES(%s,NULL,%s,%s)
+                VALUES(%s,NULL,%s,NULL,%s)
 
                 ON CONFLICT(user_id)
                 DO UPDATE SET
                     radio_enabled=EXCLUDED.radio_enabled,
+                    current_mode=NULL,
                     updated_at=EXCLUDED.updated_at
                 """,
                 (
@@ -703,11 +774,6 @@ def save_track(
     ):
         return False
 
-    # Never store a Telegram message/copy ID as a track title.
-    title = str(title or "").strip() or None
-    if title and title.isdigit():
-        title = None
-
     with db() as c:
 
         with cur(c) as x:
@@ -729,13 +795,10 @@ def save_track(
                 )
                 DO UPDATE SET
                     mood=EXCLUDED.mood,
-                    title=CASE
-                        WHEN EXCLUDED.title IS NOT NULL
-                         AND BTRIM(EXCLUDED.title) <> ''
-                         AND EXCLUDED.title !~ '^[0-9]+$'
-                        THEN EXCLUDED.title
-                        ELSE tracks.title
-                    END
+                    title=COALESCE(
+                        EXCLUDED.title,
+                        tracks.title
+                    )
                 RETURNING id
                 """,
                 (
@@ -1182,93 +1245,111 @@ def radio_weights(uid):
 # =========================================================
 
 def radio_track(uid):
-    """Radio recommendation engine.
 
-    Mood selection is weighted by the user's feedback counts.
-    Tracks the user has already liked are deliberately shown less often
-    than tracks they have not seen yet.
-
-    Example:
-      Love 18 likes, Chill 15 likes, Sad 10 likes
-    means Love has the highest mood weight, then Chill, then Sad.
-    It does NOT lock Radio to Love; all moods with available tracks remain
-    eligible.
-    """
-    r = ratios(uid)
     weights = radio_weights(uid)
-    available = [m for m, n in counts().items() if n > 0]
+
+    available = [
+        m
+        for m, c in counts().items()
+        if c > 0
+    ]
+
     if not available:
         return None
 
     fm = feedback_map(uid)
     hist = history(uid)
 
-    # Build two pools per mood:
-    #   fresh = never delivered to this user
-    #   liked = explicitly liked by this user (shown less frequently)
-    pools = {}
-    for mood in available:
-        rows = candidates(mood, limit=500)
-        fresh = []
-        liked = []
-
-        for msg, ch in rows:
-            key = (str(ch), int(msg))
-            if fm.get(key) == "not_for_me":
-                continue
-
-            if key not in hist:
-                # A never-seen liked track is still fresh; it belongs to
-                # the fresh pool until it has actually been delivered.
-                fresh.append((msg, ch))
-            elif fm.get(key) == "like":
-                liked.append((msg, ch))
-
-        if fresh or liked:
-            pools[mood] = {
-                "fresh": fresh,
-                "liked": liked,
-            }
-
-    if not pools:
-        return None
-
-    moods = list(pools)
-
-    # Mood priority comes from LIKE RATIO / feedback, not from a fixed mood.
-    # With no feedback, every available mood gets the same chance.
-    total_feedback = sum(
-        r[m]["like"] + r[m]["not"] for m in moods
+    ranked = sorted(
+        available,
+        key=lambda m: weights[m],
+        reverse=True,
     )
 
-    if total_feedback == 0:
-        mood = random.choice(moods)
-    else:
-        mood_weights = [
-            max(0.001, weights.get(m, 0.05))
-            for m in moods
+    mood = ranked[0]
+
+    total_likes = sum(
+        ratios(uid)[m]["like"]
+        for m in MOODS
+    )
+
+    if total_likes == 0:
+
+        mood = random.choice(
+            available
+        )
+
+    cs = candidates(mood)
+
+    allowed = [
+        t
+        for t in cs
+        if fm.get(
+            (
+                t[1],
+                t[0],
+            )
+        ) != "not_for_me"
+    ]
+
+    unseen = [
+        t
+        for t in allowed
+        if (
+            t[1],
+            t[0],
+        ) not in hist
+    ]
+
+    if allowed:
+
+        t = random.choice(
+            unseen or allowed
+        )
+
+        return (
+            mood,
+            t[0],
+            t[1],
+        )
+
+    for m in ranked[1:]:
+
+        cs = candidates(m)
+
+        allowed = [
+            t
+            for t in cs
+            if fm.get(
+                (
+                    t[1],
+                    t[0],
+                )
+            ) != "not_for_me"
         ]
-        mood = random.choices(
-            moods,
-            weights=mood_weights,
-            k=1,
-        )[0]
 
-    fresh = pools[mood]["fresh"]
-    liked = pools[mood]["liked"]
+        unseen = [
+            t
+            for t in allowed
+            if (
+                t[1],
+                t[0],
+            ) not in hist
+        ]
 
-    # Liked tracks are intentionally reduced.
-    # ~75% fresh / ~25% already-liked when both pools exist.
-    if fresh and liked:
-        use_liked = random.random() < 0.25
-        pool = liked if use_liked else fresh
-    elif fresh:
-        pool = fresh
-    else:
-        pool = liked
+        if allowed:
 
-    msg, ch = random.choice(pool)
-    return (mood, msg, ch)
+            t = random.choice(
+                unseen or allowed
+            )
+
+            return (
+                m,
+                t[0],
+                t[1],
+            )
+
+    return None
 
 
 # =========================================================
@@ -2123,9 +2204,7 @@ async def backfill_track_titles_async(
 
     for row in rows:
 
-        existing = str(row.get("title") or "").strip()
-        # Empty, numeric, or old copy-message placeholders must be refreshed.
-        if existing and not existing.isdigit() and not existing.lower().startswith("track #"):
+        if row.get("title"):
             continue
 
         try:
@@ -2217,22 +2296,6 @@ def backfill_track_titles(
 
 
 # =========================================================
-# DISPLAY TITLE
-# =========================================================
-
-def display_title(row):
-    title = str(row.get("title") or "").strip()
-    mid = str(row.get("message_id") or "")
-
-    # Never show copy/message IDs as a track name.
-    if (not title or title.lower() == "none" or title.isdigit() or
-            title == mid or title.lower().startswith("track #")):
-        return "Unknown Track"
-
-    return title.replace("\n", " ")[:200]
-
-
-# =========================================================
 # LIST BUTTONS
 # =========================================================
 
@@ -2251,7 +2314,18 @@ def track_list_buttons(
             row["id"]
         )
 
-        title = display_title(row)
+        title = (
+            row.get("title")
+            or
+            f"Track #{row['message_id']}"
+        )
+
+        title = str(
+            title
+        ).replace(
+            "\n",
+            " ",
+        )
 
         if len(title) > 38:
             title = title[:35] + "..."
@@ -2298,11 +2372,8 @@ def top_liked_text(
     )
 
     lines = [
-        "╔════════════════════╗",
-        "     🏆 TOP 10 LIKED",
-        "╚════════════════════╝",
-        "",
-        "❤️ Most loved by Ravers",
+        "🏆 TOP 10 MOST LIKED TRACKS",
+        "━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
@@ -2326,7 +2397,12 @@ def top_liked_text(
         1,
     ):
 
-        title = display_title(row)[:90]
+        title = str(
+            row["title"]
+        ).replace(
+            "\n",
+            " ",
+        )[:90]
 
         lines.append(
             f"{i}. 🎵 {title}"
@@ -2354,9 +2430,8 @@ def trending_text(
     )
 
     lines = [
-        "╔════════════════════╗",
-        "      🔥 TRENDING NOW",
-        "╚════════════════════╝",
+        "📈 TRENDING NOW",
+        "━━━━━━━━━━━━━━━━━━",
         "",
         f"🔥 Based on the last {TRENDING_DAYS} days",
         "",
@@ -2382,7 +2457,12 @@ def trending_text(
         1,
     ):
 
-        title = display_title(row)[:90]
+        title = str(
+            row["title"]
+        ).replace(
+            "\n",
+            " ",
+        )[:90]
 
         lines.append(
             f"{i}. 🎵 {title}"
@@ -2667,54 +2747,100 @@ def admin_dashboard():
 # =========================================================
 
 def mood_menu():
-    """UX-polished main menu. Callback values stay unchanged."""
+
     return {
         "inline_keyboard": [
             [
-                {"text": "📻 RADIO", "callback_data": "radio"},
-                {"text": "✨ FOR YOU", "callback_data": "for_you"},
+                {
+                    "text": INFO["sad"][0],
+                    "callback_data":
+                        "mood_sad",
+                },
+                {
+                    "text": INFO["love"][0],
+                    "callback_data":
+                        "mood_love",
+                },
             ],
             [
-                {"text": "🔥 DAILY VIBE", "callback_data": "daily_vibe"},
-                {"text": "🎵 TRACK OF THE DAY", "callback_data": "track_of_day"},
+                {
+                    "text": INFO["chill"][0],
+                    "callback_data":
+                        "mood_chill",
+                },
+                {
+                    "text": INFO["hype"][0],
+                    "callback_data":
+                        "mood_hype",
+                },
             ],
             [
-                {"text": "🎛 EXPLORE MOODS", "callback_data": "change_mood"},
+                {
+                    "text": INFO["dark"][0],
+                    "callback_data":
+                        "mood_dark",
+                },
+                {
+                    "text": INFO["energetic"][0],
+                    "callback_data":
+                        "mood_energetic",
+                },
             ],
             [
-                {"text": "📈 TRENDING", "callback_data": "trending"},
-                {"text": "🏆 TOP 10 LIKED", "callback_data": "top_liked"},
+                {
+                    "text": INFO["night"][0],
+                    "callback_data":
+                        "mood_night",
+                },
+                {
+                    "text": INFO["melodic"][0],
+                    "callback_data":
+                        "mood_melodic",
+                },
             ],
             [
-                {"text": "🎲 SURPRISE ME", "callback_data": "surprise_me"},
-                {"text": "👤 PROFILE", "callback_data": "profile"},
-            ],
-        ]
-    }
-
-
-def mood_selector_menu():
-    """Second-level mood selector; no recommendation logic is changed."""
-    return {
-        "inline_keyboard": [
-            [
-                {"text": INFO["sad"][0], "callback_data": "mood_sad"},
-                {"text": INFO["love"][0], "callback_data": "mood_love"},
+                {
+                    "text":
+                        "🔥 DAILY VIBE",
+                    "callback_data":
+                        "daily_vibe",
+                },
+                {
+                    "text":
+                        "🧠 FOR YOU",
+                    "callback_data":
+                        "for_you",
+                },
             ],
             [
-                {"text": INFO["chill"][0], "callback_data": "mood_chill"},
-                {"text": INFO["hype"][0], "callback_data": "mood_hype"},
+                {
+                    "text":
+                        "🎲 SURPRISE ME",
+                    "callback_data":
+                        "surprise_me",
+                },
+                {
+                    "text":
+                        "📈 TRENDING",
+                    "callback_data":
+                        "trending",
+                },
             ],
             [
-                {"text": INFO["dark"][0], "callback_data": "mood_dark"},
-                {"text": INFO["energetic"][0], "callback_data": "mood_energetic"},
+                {
+                    "text":
+                        "🎵 TRACK OF THE DAY",
+                    "callback_data":
+                        "track_of_day",
+                }
             ],
             [
-                {"text": INFO["night"][0], "callback_data": "mood_night"},
-                {"text": INFO["melodic"][0], "callback_data": "mood_melodic"},
-            ],
-            [
-                {"text": "⬅️ BACK", "callback_data": "menu"},
+                {
+                    "text":
+                        "🏆 TOP 10 LIKED",
+                    "callback_data":
+                        "top_liked",
+                }
             ],
         ]
     }
@@ -3162,18 +3288,50 @@ def play_selected_track(
 
     send(
         chat,
-        f"╭─ {header}\n"
-        "━━━━━━━━━━━━━━━━\n\n"
+        f"{header}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
         f"🎵 {title}\n"
         f"{INFO[mood][0]}\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "Press play. Let it speak. 🖤",
+        "Enjoy the vibe. ✨",
         buttons(
             uid,
             ch,
             msg,
             mood,
         ),
+    )
+
+
+# =========================================================
+# SPECIAL MODE NEXT
+# =========================================================
+
+def send_next_special_mode(chat, uid, mode):
+
+    if mode == "daily_vibe":
+        return send_special_music(
+            chat, uid, daily_vibe_track(uid), "🔥 YOUR DAILY VIBE"
+        )
+
+    if mode == "for_you":
+        return send_special_music(
+            chat, uid, for_you_track(uid), "🧠 PICKED FOR YOU"
+        )
+
+    if mode == "surprise_me":
+        return send_special_music(
+            chat, uid, surprise_track(uid), "🎲 SURPRISE ME"
+        )
+
+    if mode == "track_of_day":
+        return send_special_music(
+            chat, uid, track_of_day(uid), "🎵 TRACK OF THE DAY"
+        )
+
+    return send(
+        chat,
+        "🎧 Choose your mood first 👇",
+        mood_menu(),
     )
 
 
@@ -3239,8 +3397,7 @@ def send_special_music(
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"🎵 {label}\n"
         f"{INFO[mood][0]}\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "Press play. Let it speak. 🖤",
+        "Enjoy the vibe. ✨",
         buttons(
             uid,
             ch,
@@ -3314,21 +3471,20 @@ def send_music(
 
     if radio:
 
-        title = "╭─ 📻 RADIO SIGNAL"
+        title = "📻 YOUR RADIO"
 
         desc = (
-            "A signal shaped by your music taste.\n"
-            "Press play and see where it takes you."
+            "Personalized from your "
+            "feedback across all moods."
         )
 
     else:
 
-        title = "╭─ 🎧 NOW DISCOVERING"
+        title = "🎧 NOW PLAYING"
 
-        desc = (
-            INFO[selected_mood][1]
-            + "\n\n╰─ Feel the moment."
-        )
+        desc = INFO[
+            selected_mood
+        ][1]
 
     send(
         chat,
@@ -3774,25 +3930,6 @@ def callback(c):
     )
 
     # =====================================================
-    # MAIN MENU
-    # =====================================================
-
-    if data == "menu":
-        answer(callback_id)
-        send(
-            chat,
-            "╭────────────────────╮\n"
-            "│   🎧 NOT YOUR VIBE   │\n"
-            "╰────────────────────╯\n\n"
-            "Music doesn't need to be explained.\n"
-            "It just needs to feel right.\n\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            "Choose your next vibe. ✨",
-            mood_menu(),
-        )
-        return
-
-    # =====================================================
     # PLAY SELECTED TRACK
     # =====================================================
 
@@ -4221,6 +4358,22 @@ def callback(c):
 
         mood = state["mood"]
         radio = state["radio"]
+        mode = state.get("mode")
+
+        if mode:
+
+            answer(
+                callback_id,
+                "⏭ Finding your next track...",
+            )
+
+            send_next_special_mode(
+                chat,
+                uid,
+                mode,
+            )
+
+            return
 
         if radio:
 
@@ -4314,10 +4467,10 @@ def callback(c):
 
         send(
             chat,
-            "🎛 CHOOSE YOUR VIBE\n"
+            "🎛 MOOD SELECTOR\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "What are you feeling right now?",
-            mood_selector_menu(),
+            mood_menu(),
         )
 
         return
@@ -4379,6 +4532,8 @@ def callback(c):
 
     if data == "daily_vibe":
 
+        set_special_mode(uid, "daily_vibe")
+
         answer(
             callback_id,
             "🔥 Daily Vibe",
@@ -4395,6 +4550,8 @@ def callback(c):
 
     if data == "for_you":
 
+        set_special_mode(uid, "for_you")
+
         answer(
             callback_id,
             "🧠 Personal pick",
@@ -4410,6 +4567,8 @@ def callback(c):
         return
 
     if data == "surprise_me":
+
+        set_special_mode(uid, "surprise_me")
 
         answer(
             callback_id,
@@ -4445,6 +4604,8 @@ def callback(c):
         return
 
     if data == "track_of_day":
+
+        set_special_mode(uid, "track_of_day")
 
         answer(
             callback_id,
@@ -4835,6 +4996,22 @@ def message(m):
 
         mood = state["mood"]
         radio = state["radio"]
+        mode = state.get("mode")
+
+        if mode:
+
+            send(
+                chat,
+                "⏭ Finding your next track...",
+            )
+
+            send_next_special_mode(
+                chat,
+                uid,
+                mode,
+            )
+
+            return
 
         if radio:
 
@@ -4968,6 +5145,8 @@ def message(m):
 
     if cmd == "/dailyvibe":
 
+        set_special_mode(uid, "daily_vibe")
+
         send_special_music(
             chat,
             uid,
@@ -4983,6 +5162,8 @@ def message(m):
 
     if cmd == "/foryou":
 
+        set_special_mode(uid, "for_you")
+
         send_special_music(
             chat,
             uid,
@@ -4997,6 +5178,8 @@ def message(m):
     # =====================================================
 
     if cmd == "/surprise":
+
+        set_special_mode(uid, "surprise_me")
 
         send_special_music(
             chat,
@@ -5030,6 +5213,8 @@ def message(m):
     # =====================================================
 
     if cmd == "/today":
+
+        set_special_mode(uid, "track_of_day")
 
         send_special_music(
             chat,
@@ -5461,37 +5646,49 @@ def is_music(msg):
 
 
 def message_title(msg):
-    """Return a human-readable audio title, never Telegram message/copy IDs."""
+
     try:
-        media = getattr(msg, "media", None)
-        document = getattr(media, "document", None)
-        attrs = getattr(document, "attributes", []) or []
 
-        for attr in attrs:
-            title = str(getattr(attr, "title", "") or "").strip()
-            performer = str(getattr(attr, "performer", "") or "").strip()
-            if title and performer:
-                return f"{performer} - {title}"[:200]
-            if title:
-                return title[:200]
+        f = getattr(
+            msg,
+            "file",
+            None,
+        )
 
-        f = getattr(msg, "file", None)
-        name = str(getattr(f, "name", "") or "").strip() if f else ""
+        name = (
+            getattr(
+                f,
+                "name",
+                "",
+            )
+            or ""
+        ).strip() if f else ""
+
         if name:
-            name = name.rsplit("/", 1)[-1]
-            # Remove only the extension; keep the actual filename as title.
-            if "." in name:
-                name = name.rsplit(".", 1)[0]
-            if name and not name.isdigit():
-                return name[:200]
+
+            return name.rsplit(
+                "/",
+                1,
+            )[-1][:200]
+
     except Exception:
+
         pass
 
-    text = str(getattr(msg, "message", "") or "").strip()
-    if text and not text.isdigit():
-        return text[:200]
+    text = (
+        getattr(
+            msg,
+            "message",
+            "",
+        )
+        or ""
+    ).strip()
 
-    return None
+    return (
+        text[:200]
+        if text
+        else None
+    )
 
 
 # =========================================================
@@ -5676,26 +5873,21 @@ def tele_worker():
                 )
             ):
 
-                # Extract and save the title immediately when a new
-                # channel track arrives.  This is independent of the
-                # periodic scan/backfill, so new tracks do not wait for it.
-                title = message_title(
-                    event.message
-                )
-
                 save_track(
                     mood,
                     ch,
                     event.message.id,
-                    title,
+                    message_title(
+                        event.message
+                    ),
                 )
 
                 log.info(
-                    "NEW TRACK mood=%s channel=%s message=%s title=%r",
+                    "NEW TRACK mood=%s "
+                    "channel=%s message=%s",
                     mood,
                     ch,
                     event.message.id,
-                    title,
                 )
 
         except Exception:
