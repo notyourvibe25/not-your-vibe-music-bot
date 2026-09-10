@@ -1635,6 +1635,51 @@ def copy_music(
     )
 
 
+def track_details(ch, msg):
+
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute(
+                    """
+                    SELECT bpm, musical_key, energy, danceability,
+                           loudness, genre, subgenre, analyzer_mood
+                    FROM tracks
+                    WHERE channel_id=%s AND message_id=%s
+                    LIMIT 1
+                    """,
+                    (str(ch), int(msg)),
+                )
+                row = x.fetchone()
+        if not row:
+            return ""
+
+        def num(value):
+            try:
+                value = float(value)
+                return value if math.isfinite(value) else None
+            except (TypeError, ValueError):
+                return None
+
+        lines = []
+        v = num(row.get("bpm"))
+        if v is not None: lines.append(f"🥁 BPM: {v:.1f}")
+        if row.get("musical_key"): lines.append(f"🎼 Key: {str(row['musical_key'])[:40]}")
+        v = num(row.get("energy"))
+        if v is not None: lines.append(f"⚡ Energy: {v:.1f}")
+        v = num(row.get("danceability"))
+        if v is not None: lines.append(f"💃 Danceability: {v:.1f}")
+        v = num(row.get("loudness"))
+        if v is not None: lines.append(f"🔊 Loudness: {v:.1f} dB")
+        if row.get("analyzer_mood"): lines.append(f"🌙 Analyzer Mood: {str(row['analyzer_mood'])[:40]}")
+        if row.get("genre"): lines.append(f"🎚 Genre: {str(row['genre'])[:40]}")
+        if row.get("subgenre"): lines.append(f"🎛 Subgenre: {str(row['subgenre'])[:40]}")
+        return "📊 TRACK DETAILS\n" + "\n".join(lines) if lines else ""
+    except Exception:
+        log.exception("track details lookup failed channel=%s message=%s", ch, msg)
+        return ""
+
+
 # =========================================================
 # BROADCAST
 # =========================================================
@@ -3298,13 +3343,19 @@ def play_selected_track(
         " ",
     )[:120]
 
-    send(
-        chat,
+    details = track_details(ch, msg)
+    body = (
         f"{header}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"🎵 {title}\n"
         f"{INFO[mood][0]}\n\n"
-        "Enjoy the vibe. ✨",
+        + (details + "\n\n" if details else "")
+        + "Enjoy the vibe. ✨"
+    )
+
+    send(
+        chat,
+        body,
         buttons(
             uid,
             ch,
@@ -3371,13 +3422,19 @@ def send_special_music(
         " ",
     )[:120]
 
-    send(
-        chat,
+    details = track_details(ch, msg)
+    body = (
         f"{header}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"🎵 {label}\n"
         f"{INFO[mood][0]}\n\n"
-        "Enjoy the vibe. ✨",
+        + (details + "\n\n" if details else "")
+        + "Enjoy the vibe. ✨"
+    )
+
+    send(
+        chat,
+        body,
         buttons(
             uid,
             ch,
@@ -3431,13 +3488,19 @@ def send_music(
         title = "🎧 NOW PLAYING"
         desc = INFO[selected_mood][1]
 
-    send(
-        chat,
+    details = track_details(channel, msg)
+    body = (
         f"{title}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"{INFO[selected_mood][0]}\n\n"
         f"{desc}\n\n"
-        "Enjoy the vibe. ✨",
+        + (details + "\n\n" if details else "")
+        + "Enjoy the vibe. ✨"
+    )
+
+    send(
+        chat,
+        body,
         buttons(uid, channel, msg, selected_mood),
     )
 
@@ -6007,19 +6070,3 @@ def startup():
 # =========================================================
 
 if __name__ == "__main__":
-
-    if not startup():
-
-        raise SystemExit(1)
-
-    app.run(
-        host="0.0.0.0",
-        port=geti(
-            "PORT",
-            10000,
-            1,
-            65535,
-        ),
-        threaded=True,
-        use_reloader=False,
-    )
