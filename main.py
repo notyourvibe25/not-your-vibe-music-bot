@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import threading
+import math
 import time
 
 from datetime import datetime, timedelta
@@ -249,8 +250,13 @@ executor = ThreadPoolExecutor(
     thread_name_prefix="music",
 )
 
-pending = set()
+# Per-user music scheduling state.
+# Generation tokens invalidate stale queued jobs when mode changes.
+pending = {}
 pending_lock = threading.Lock()
+user_music_locks = {}
+user_music_locks_guard = threading.Lock()
+music_generation = {}
 
 channel_map = {}
 last_scan = 0
@@ -448,56 +454,45 @@ def init_db():
         created_at BIGINT NOT NULL
     );
 
-    CREATE INDEX IF NOT EXISTS idx_tracks_mood
-        ON tracks(mood);
+    CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood);
+    CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_hist_user ON user_history(user_id,sent_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_hist_track ON user_history(user_id,channel_id,message_id,sent_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_hist_recent ON user_history(sent_at DESC,channel_id,message_id);
+    CREATE INDEX IF NOT EXISTS idx_fb_user ON track_feedback(user_id);
+    CREATE INDEX IF NOT EXISTS idx_fb_track_feedback ON track_feedback(channel_id,message_id,feedback);
+    CREATE INDEX IF NOT EXISTS idx_fb_recent ON track_feedback(created_at DESC,feedback);
+    CREATE INDEX IF NOT EXISTS idx_daily_day ON daily_activity(day);
+    CREATE INDEX IF NOT EXISTS idx_bc_broadcast ON broadcast_comments(broadcast_id);
 
-    CREATE INDEX IF NOT EXISTS idx_tracks_created
-        ON tracks(created_at DESC);
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS title TEXT;
 
-    CREATE INDEX IF NOT EXISTS idx_hist_user
-        ON user_history(user_id,sent_at DESC);
+    -- Additive Audio Analyzer schema migration. Existing tracks/data are preserved.
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzed BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS ai_error TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bpm DOUBLE PRECISION;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS musical_key TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS energy DOUBLE PRECISION;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS danceability DOUBLE PRECISION;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS loudness DOUBLE PRECISION;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS subgenre TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_mood TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ;
 
-    CREATE INDEX IF NOT EXISTS idx_hist_track
-        ON user_history(user_id,channel_id,message_id,sent_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_tracks_analyzed ON tracks(analyzed);
+    CREATE INDEX IF NOT EXISTS idx_tracks_analyzer_mood ON tracks(analyzer_mood);
 
-    CREATE INDEX IF NOT EXISTS idx_hist_recent
-        ON user_history(sent_at DESC,channel_id,message_id);
-
-    CREATE INDEX IF NOT EXISTS idx_fb_user
-        ON track_feedback(user_id);
-
-    CREATE INDEX IF NOT EXISTS idx_fb_track_feedback
-        ON track_feedback(channel_id,message_id,feedback);
-
-    CREATE INDEX IF NOT EXISTS idx_fb_recent
-        ON track_feedback(created_at DESC,feedback);
-
-    CREATE INDEX IF NOT EXISTS idx_daily_day
-        ON daily_activity(day);
-
-    CREATE INDEX IF NOT EXISTS idx_bc_broadcast
-        ON broadcast_comments(broadcast_id);
-
-    ALTER TABLE tracks
-        ADD COLUMN IF NOT EXISTS title TEXT;
-
-    ALTER TABLE broadcasts
-        ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
-
-    ALTER TABLE broadcasts
-        ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
-
-    ALTER TABLE broadcasts
-        ADD COLUMN IF NOT EXISTS content_type TEXT;
-
-    ALTER TABLE broadcasts
-        ALTER COLUMN text DROP NOT NULL;
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS content_type TEXT;
+    ALTER TABLE broadcasts ALTER COLUMN text DROP NOT NULL;
     """
 
     with db() as c:
-
         with cur(c) as x:
             x.execute(schema)
+
 
 
 # =========================================================
@@ -569,6 +564,30 @@ def register(u):
 
 
 # =========================================================
+# PER-USER MUSIC MODE / GENERATION
+# =========================================================
+
+def _music_lock(uid):
+    uid = int(uid)
+    with user_music_locks_guard:
+        lock = user_music_locks.get(uid)
+        if lock is None:
+            lock = threading.RLock()
+            user_music_locks[uid] = lock
+        return lock
+
+
+def _music_generation(uid):
+    return int(music_generation.get(int(uid), 0))
+
+
+def _bump_music_generation(uid):
+    uid = int(uid)
+    music_generation[uid] = _music_generation(uid) + 1
+    return music_generation[uid]
+
+
+# =========================================================
 # SPECIAL MODE MEMORY
 # =========================================================
 
@@ -589,34 +608,24 @@ def set_mood(uid, mood):
     if mood not in MOODS:
         return False
 
-    with db() as c:
-
-        with cur(c) as x:
-
-            x.execute(
-                """
-                INSERT INTO user_state(
-                    user_id,
-                    mood,
-                    radio_enabled,
-                    updated_at
+    with _music_lock(uid):
+        with db() as c:
+            with cur(c) as x:
+                x.execute(
+                    """
+                    INSERT INTO user_state(user_id,mood,radio_enabled,updated_at)
+                    VALUES(%s,%s,FALSE,%s)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        mood=EXCLUDED.mood,
+                        radio_enabled=FALSE,
+                        updated_at=EXCLUDED.updated_at
+                    """,
+                    (uid, mood, int(time.time())),
                 )
-                VALUES(%s,%s,FALSE,%s)
-
-                ON CONFLICT(user_id)
-                DO UPDATE SET
-                    mood=EXCLUDED.mood,
-                    radio_enabled=FALSE,
-                    updated_at=EXCLUDED.updated_at
-                """,
-                (
-                    uid,
-                    mood,
-                    int(time.time()),
-                ),
-            )
+        _bump_music_generation(uid)
 
     return True
+
 
 
 def get_state(uid):
@@ -670,31 +679,21 @@ def is_radio(uid):
 
 def set_radio(uid, on=True):
 
-    with db() as c:
-
-        with cur(c) as x:
-
-            x.execute(
-                """
-                INSERT INTO user_state(
-                    user_id,
-                    mood,
-                    radio_enabled,
-                    updated_at
+    with _music_lock(uid):
+        with db() as c:
+            with cur(c) as x:
+                x.execute(
+                    """
+                    INSERT INTO user_state(user_id,mood,radio_enabled,updated_at)
+                    VALUES(%s,NULL,%s,%s)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        radio_enabled=EXCLUDED.radio_enabled,
+                        updated_at=EXCLUDED.updated_at
+                    """,
+                    (uid, bool(on), int(time.time())),
                 )
-                VALUES(%s,NULL,%s,%s)
+        _bump_music_generation(uid)
 
-                ON CONFLICT(user_id)
-                DO UPDATE SET
-                    radio_enabled=EXCLUDED.radio_enabled,
-                    updated_at=EXCLUDED.updated_at
-                """,
-                (
-                    uid,
-                    bool(on),
-                    int(time.time()),
-                ),
-            )
 
 
 # =========================================================
@@ -1140,157 +1139,251 @@ def ratios(uid):
     return out
 
 
-def radio_weights(uid):
+def radio_weights(uid, baseline_mood=None):
 
     r = ratios(uid)
     w = {}
 
     for m in MOODS:
-
         likes = r[m]["like"]
         nots = r[m]["not"]
+        net = (likes - nots) / (likes + nots + 1.0)
+        volume = math.log1p(likes)
+        confidence = (likes + 1.0) / (likes + nots + 2.0)
 
-        total = likes + nots
-
-        ratio = (
-            (likes + 1)
-            / (total + 2)
+        score = (
+            1.0
+            + 2.8 * volume
+            + 2.5 * net
+            + 1.5 * confidence
         )
 
-        volume = (
-            1
-            + min(likes, 20)
-            * 0.35
-        )
+        if baseline_mood == m:
+            score += 3.0
 
-        penalty = (
-            1
-            / (
-                1
-                + nots * 0.20
-            )
-        )
-
-        w[m] = max(
-            0.05,
-            ratio
-            * volume
-            * penalty,
-        )
+        w[m] = max(0.05, score)
 
     return w
+
 
 
 # =========================================================
 # RADIO TRACK
 # =========================================================
 
-def radio_track(uid):
+def _radio_key_parts(value):
+    if not value:
+        return None, None
+    parts = str(value).strip().lower().split()
+    if not parts:
+        return None, None
+    root = parts[0].replace("♯", "#").replace("♭", "b")
+    mode = parts[1] if len(parts) > 1 else None
+    return root, mode
 
-    weights = radio_weights(uid)
 
-    available = [
-        m
-        for m, c in counts().items()
-        if c > 0
-    ]
+def _numeric_similarity(value, target, scale):
+    if value is None or target is None:
+        return None
+    try:
+        value = float(value)
+        target = float(target)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or not math.isfinite(target):
+        return None
+    return max(0.0, 1.0 - abs(value - target) / scale)
 
-    if not available:
+
+def _radio_profile(uid):
+    profile = {
+        "bpm": None, "energy": None, "danceability": None, "loudness": None,
+        "keys": {}, "analyzer_moods": {}, "genres": {}, "subgenres": {},
+    }
+
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT t.bpm,t.energy,t.danceability,t.loudness,
+                       t.musical_key,t.analyzer_mood,t.genre,t.subgenre
+                FROM track_feedback f
+                JOIN tracks t ON t.channel_id=f.channel_id AND t.message_id=f.message_id
+                WHERE f.user_id=%s AND f.feedback='like'
+                ORDER BY f.created_at DESC
+                LIMIT 100
+                """,
+                (uid,),
+            )
+            rows = x.fetchall()
+
+    for field in ("bpm", "energy", "danceability", "loudness"):
+        values = []
+        for row in rows:
+            try:
+                value = float(row.get(field))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        if values:
+            profile[field] = sum(values) / len(values)
+
+    for row in rows:
+        root, mode = _radio_key_parts(row.get("musical_key"))
+        if root:
+            key = (root, mode)
+            profile["keys"][key] = profile["keys"].get(key, 0) + 1
+
+        for field, target in (("analyzer_mood", "analyzer_moods"), ("genre", "genres"), ("subgenre", "subgenres")):
+            value = row.get(field)
+            if value and str(value).strip():
+                value = str(value).strip().lower()
+                profile[target][value] = profile[target].get(value, 0) + 1
+
+    return profile
+
+
+def _radio_history(uid):
+    recent = {}
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT channel_id,message_id,sent_at
+                FROM user_history
+                WHERE user_id=%s AND action='served'
+                ORDER BY sent_at DESC,id DESC
+                LIMIT %s
+                """,
+                (uid, HISTORY_LIMIT),
+            )
+            for index, row in enumerate(x.fetchall()):
+                recent[(str(row["channel_id"]), int(row["message_id"]))] = index
+    return recent
+
+
+def _radio_candidates(uid):
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT t.id,t.mood,t.message_id,t.channel_id,t.title,
+                       t.bpm,t.musical_key,t.energy,t.danceability,t.loudness,
+                       t.genre,t.subgenre,t.analyzer_mood
+                FROM tracks t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM track_feedback f
+                    WHERE f.user_id=%s
+                      AND f.channel_id=t.channel_id
+                      AND f.message_id=t.message_id
+                      AND f.feedback='not_for_me'
+                )
+                ORDER BY t.id ASC
+                """,
+                (uid,),
+            )
+            return x.fetchall()
+
+
+def radio_track(uid, baseline_mood=None):
+    """Select a rule-based Radio track across all moods."""
+    rows = _radio_candidates(uid)
+    if not rows:
         return None
 
-    fm = feedback_map(uid)
-    hist = history(uid)
+    feedback = feedback_map(uid)
+    history_map = _radio_history(uid)
+    profile = _radio_profile(uid)
+    mood_weights = radio_weights(uid, baseline_mood)
+    liked_exact = {key for key, value in feedback.items() if value == "like"}
+    has_likes = bool(liked_exact)
 
-    ranked = sorted(
-        available,
-        key=lambda m: weights[m],
-        reverse=True,
+    scored = []
+    for row in rows:
+        mood = row.get("mood")
+        if mood not in MOODS:
+            continue
+
+        key = (str(row["channel_id"]), int(row["message_id"]))
+        fb = feedback.get(key)
+        if fb == "not_for_me":
+            continue
+
+        score = mood_weights[mood] * 2.2
+
+        # Selected mood is context, never a hard filter.
+        if mood == baseline_mood:
+            score += 2.5
+
+        # Liked tracks can return, but not at the expense of exploration.
+        if fb == "like":
+            score += 7.5
+
+        # Strongly prefer unserved tracks. Old served tracks remain eligible.
+        if key not in history_map:
+            score += 15.0
+        else:
+            rank = history_map[key]
+            score -= max(0.0, 12.0 - rank * 0.35)
+
+        sims = []
+        for field, scale in (("bpm",35.0),("energy",35.0),("danceability",35.0),("loudness",12.0)):
+            sim = _numeric_similarity(row.get(field), profile.get(field), scale)
+            if sim is not None:
+                sims.append(sim)
+        if sims:
+            score += 12.0 * (sum(sims) / len(sims))
+
+        analyzer_mood = row.get("analyzer_mood")
+        if analyzer_mood:
+            count = profile["analyzer_moods"].get(str(analyzer_mood).strip().lower(), 0)
+            if count:
+                score += min(7.0, 2.0 + count * 0.9)
+
+        genre = row.get("genre")
+        if genre:
+            count = profile["genres"].get(str(genre).strip().lower(), 0)
+            if count:
+                score += min(4.0, 1.0 + count * 0.5)
+
+        subgenre = row.get("subgenre")
+        if subgenre:
+            count = profile["subgenres"].get(str(subgenre).strip().lower(), 0)
+            if count:
+                score += min(5.0, 1.5 + count * 0.6)
+
+        root, key_mode = _radio_key_parts(row.get("musical_key"))
+        if root:
+            exact = profile["keys"].get((root, key_mode), 0)
+            root_matches = sum(count for (liked_root, _), count in profile["keys"].items() if liked_root == root)
+            if exact:
+                score += min(3.5, 1.5 + exact * 0.4)
+            elif root_matches:
+                score += min(1.5, 0.5 + root_matches * 0.15)
+
+        # Controlled exploration; recommendation score remains dominant.
+        score += random.uniform(0.0, 2.5)
+        if not has_likes:
+            score += random.uniform(0.0, 2.0)
+
+        scored.append((score, row))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    pool = scored[:min(8, len(scored))]
+    choice_weights = [max(0.05, item[0] - pool[-1][0] + 1.0) for item in pool]
+    row = random.choices(pool, weights=choice_weights, k=1)[0][1]
+
+    return (
+        row["mood"],
+        int(row["message_id"]),
+        str(row["channel_id"]),
+        row.get("title"),
     )
 
-    mood = ranked[0]
-
-    total_likes = sum(
-        ratios(uid)[m]["like"]
-        for m in MOODS
-    )
-
-    if total_likes == 0:
-
-        mood = random.choice(
-            available
-        )
-
-    cs = candidates(mood)
-
-    allowed = [
-        t
-        for t in cs
-        if fm.get(
-            (
-                t[1],
-                t[0],
-            )
-        ) != "not_for_me"
-    ]
-
-    unseen = [
-        t
-        for t in allowed
-        if (
-            t[1],
-            t[0],
-        ) not in hist
-    ]
-
-    if allowed:
-
-        t = random.choice(
-            unseen or allowed
-        )
-
-        return (
-            mood,
-            t[0],
-            t[1],
-        )
-
-    for m in ranked[1:]:
-
-        cs = candidates(m)
-
-        allowed = [
-            t
-            for t in cs
-            if fm.get(
-                (
-                    t[1],
-                    t[0],
-                )
-            ) != "not_for_me"
-        ]
-
-        unseen = [
-            t
-            for t in allowed
-            if (
-                t[1],
-                t[0],
-            ) not in hist
-        ]
-
-        if allowed:
-
-            t = random.choice(
-                unseen or allowed
-            )
-
-            return (
-                m,
-                t[0],
-                t[1],
-            )
-
-    return None
 
 
 # =========================================================
@@ -3307,72 +3400,36 @@ def send_music(
 ):
 
     if radio:
-
-        track = radio_track(
-            uid
-        )
-
+        track = radio_track(uid, baseline_mood=mood)
     else:
-
-        track = normal_track(
-            uid,
-            mood,
-        )
+        track = normal_track(uid, mood)
 
     if not track:
+        return send(chat, "⚠️ No suitable track found.", mood_menu())
 
-        return send(
-            chat,
-            "⚠️ No suitable track found.",
-            mood_menu(),
-        )
+    if len(track) == 4:
+        selected_mood, msg, channel, track_title = track
+    else:
+        selected_mood, msg, channel = track
+        track_title = None
 
-    selected_mood, msg, channel = track
-
-    result = copy_music(
-        chat,
-        channel,
-        msg,
-    )
+    result = copy_music(chat, channel, msg)
 
     if not result.get("ok"):
-
         log.warning(
-            "copy music failed "
-            "uid=%s channel=%s msg=%s result=%s",
-            uid,
-            channel,
-            msg,
-            result,
+            "copy music failed uid=%s channel=%s msg=%s result=%s",
+            uid, channel, msg, result,
         )
+        return send(chat, "⚠️ This track could not be delivered.", mood_menu())
 
-        return send(
-            chat,
-            "⚠️ This track could not be delivered.",
-            mood_menu(),
-        )
-
-    reserve(
-        uid,
-        track,
-    )
+    reserve(uid, (selected_mood, msg, channel))
 
     if radio:
-
         title = "📻 YOUR RADIO"
-
-        desc = (
-            "Personalized from your "
-            "feedback across all moods."
-        )
-
+        desc = "Personalized from your feedback across all moods."
     else:
-
         title = "🎧 NOW PLAYING"
-
-        desc = INFO[
-            selected_mood
-        ][1]
+        desc = INFO[selected_mood][1]
 
     send(
         chat,
@@ -3381,13 +3438,9 @@ def send_music(
         f"{INFO[selected_mood][0]}\n\n"
         f"{desc}\n\n"
         "Enjoy the vibe. ✨",
-        buttons(
-            uid,
-            channel,
-            msg,
-            selected_mood,
-        ),
+        buttons(uid, channel, msg, selected_mood),
     )
+
 
 
 # =========================================================
@@ -3401,40 +3454,55 @@ def schedule(
     radio=False,
 ):
 
-    with pending_lock:
+    uid = int(uid)
+    lock = _music_lock(uid)
 
-        if uid in pending:
-            return False
+    with lock:
+        state = get_state(uid)
+        generation = _music_generation(uid)
 
-        pending.add(uid)
+        if radio:
+            if not state["radio"]:
+                return False
+        else:
+            if state["radio"] or state["mood"] != mood:
+                return False
+
+        with pending_lock:
+            if pending.get(uid) == generation:
+                return False
+            pending[uid] = generation
 
     def work():
-
         try:
+            with lock:
+                with pending_lock:
+                    if pending.get(uid) != generation:
+                        return
 
-            send_music(
-                chat,
-                uid,
-                mood,
-                radio,
-            )
+                state_now = get_state(uid)
+                if _music_generation(uid) != generation:
+                    return
+
+                if radio:
+                    if not state_now["radio"]:
+                        return
+                else:
+                    if state_now["radio"] or state_now["mood"] != mood:
+                        return
+
+                send_music(chat, uid, mood, radio)
 
         except Exception:
-
-            log.exception(
-                "music worker"
-            )
-
+            log.exception("music worker")
         finally:
-
             with pending_lock:
-                pending.discard(uid)
+                if pending.get(uid) == generation:
+                    pending.pop(uid, None)
 
-    executor.submit(
-        work
-    )
-
+    executor.submit(work)
     return True
+
 
 
 def schedule_next(
