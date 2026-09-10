@@ -6070,3 +6070,19 @@ def startup():
 # =========================================================
 
 if __name__ == "__main__":
+
+    if not startup():
+
+        raise SystemExit(1)
+
+    app.run(
+        host="0.0.0.0",
+        port=geti(
+            "PORT",
+            10000,
+            1,
+            65535,
+        ),
+        threaded=True,
+        use_reloader=False,
+    )
