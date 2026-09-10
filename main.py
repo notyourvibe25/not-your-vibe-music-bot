@@ -1635,6 +1635,50 @@ def copy_music(
     )
 
 
+
+def analyzer_stats():
+    """Return analyzer progress counts for the admin panel."""
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(analyzed, FALSE) = TRUE
+                    ) AS analyzed,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(analyzed, FALSE) = FALSE
+                    ) AS pending,
+                    COUNT(*) FILTER (
+                        WHERE ai_error IS NOT NULL
+                          AND TRIM(ai_error) <> ''
+                    ) AS errors
+                FROM tracks
+                """
+            )
+            row = x.fetchone() or {}
+
+    total = int(row.get("total") or 0)
+    analyzed = int(row.get("analyzed") or 0)
+    pending = int(row.get("pending") or 0)
+    errors = int(row.get("errors") or 0)
+    percent = (analyzed / total * 100.0) if total else 0.0
+    return total, analyzed, pending, errors, percent
+
+
+def analyzer_stats_text():
+    total, analyzed, pending, errors, percent = analyzer_stats()
+    return (
+        "🎚 AUDIO ANALYZER STATUS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎵 Total tracks: {total}\n"
+        f"✅ Analyzed: {analyzed}\n"
+        f"⏳ Remaining: {pending}\n"
+        f"❌ Errors: {errors}\n"
+        f"📊 Progress: {percent:.1f}%"
+    )
+
 def track_details(ch, msg):
 
     try:
@@ -5982,107 +6026,4 @@ def start_telethon():
 
 # =========================================================
 # WEBHOOK SETUP
-# =========================================================
-
-def webhook_setup():
-
-    if (
-        not BOT_TOKEN
-        or not RENDER_EXTERNAL_URL
-    ):
-        return
-
-    p = {
-        "url":
-            RENDER_EXTERNAL_URL.rstrip("/")
-            + "/webhook",
-
-        "allowed_updates": [
-            "message",
-            "callback_query",
-        ],
-
-        "max_connections":
-            40,
-    }
-
-    if WEBHOOK_SECRET:
-
-        p["secret_token"] = (
-            WEBHOOK_SECRET
-        )
-
-    result = tg(
-        "setWebhook",
-        p,
-    )
-
-    log.info(
-        "webhook=%s description=%s",
-        result.get("ok"),
-        result.get("description"),
-    )
-
-
-# =========================================================
-# STARTUP
-# =========================================================
-
-def startup():
-
-    if (
-        not BOT_TOKEN
-        or not DATABASE_URL
-    ):
-
-        log.error(
-            "BOT_TOKEN and DATABASE_URL "
-            "are required"
-        )
-
-        return False
-
-    try:
-
-        init_db()
-
-    except Exception:
-
-        log.exception(
-            "Database initialization failed"
-        )
-
-        return False
-
-    webhook_setup()
-
-    start_telethon()
-
-    log.info(
-        "🟢 BOT READY"
-    )
-
-    return True
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-if __name__ == "__main__":
-
-    if not startup():
-
-        raise SystemExit(1)
-
-    app.run(
-        host="0.0.0.0",
-        port=geti(
-            "PORT",
-            10000,
-            1,
-            65535,
-        ),
-        threaded=True,
-        use_reloader=False,
-    )
+# ==
