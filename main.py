@@ -1644,16 +1644,9 @@ def analyzer_stats():
                 """
                 SELECT
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(analyzed, FALSE) = TRUE
-                    ) AS analyzed,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(analyzed, FALSE) = FALSE
-                    ) AS pending,
-                    COUNT(*) FILTER (
-                        WHERE ai_error IS NOT NULL
-                          AND TRIM(ai_error) <> ''
-                    ) AS errors
+                    COUNT(*) FILTER (WHERE COALESCE(analyzed, FALSE) = TRUE) AS analyzed,
+                    COUNT(*) FILTER (WHERE COALESCE(analyzed, FALSE) = FALSE) AS pending,
+                    COUNT(*) FILTER (WHERE ai_error IS NOT NULL AND TRIM(ai_error) <> '') AS errors
                 FROM tracks
                 """
             )
@@ -1678,6 +1671,8 @@ def analyzer_stats_text():
         f"❌ Errors: {errors}\n"
         f"📊 Progress: {percent:.1f}%"
     )
+
+
 
 def track_details(ch, msg):
 
@@ -1715,7 +1710,6 @@ def track_details(ch, msg):
         if v is not None: lines.append(f"💃 Danceability: {v:.1f}")
         v = num(row.get("loudness"))
         if v is not None: lines.append(f"🔊 Loudness: {v:.1f} dB")
-        if row.get("analyzer_mood"): lines.append(f"🌙 Analyzer Mood: {str(row['analyzer_mood'])[:40]}")
         if row.get("genre"): lines.append(f"🎚 Genre: {str(row['genre'])[:40]}")
         if row.get("subgenre"): lines.append(f"🎛 Subgenre: {str(row['subgenre'])[:40]}")
         return "📊 TRACK DETAILS\n" + "\n".join(lines) if lines else ""
