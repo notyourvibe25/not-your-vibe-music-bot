@@ -90,6 +90,7 @@ TELEGRAM_TIMEOUT = int(
     os.getenv("TELEGRAM_TIMEOUT", "60")
 )
 
+# These are kept for compatibility with existing ENV settings.
 TELEGRAM_RECONNECT_RETRIES = int(
     os.getenv("TELEGRAM_RECONNECT_RETRIES", "5")
 )
@@ -159,23 +160,12 @@ log = logging.getLogger(
 # ============================================================
 
 class PermanentTelegramMessageError(Exception):
-    """
-    The Telegram message is permanently unavailable.
-
-    Examples:
-    - message deleted
-    - invalid message ID
-    - inaccessible channel
-    """
-
+    """Telegram message is permanently unavailable."""
     pass
 
 
 class TemporaryTelegramError(Exception):
-    """
-    Telegram/network error that should be retried.
-    """
-
+    """Telegram/network error that should be retried."""
     pass
 
 
@@ -198,10 +188,6 @@ def retry_delay(
     base: float,
     maximum: float,
 ) -> float:
-    """
-    Exponential backoff + small jitter.
-    """
-
     value = min(
         maximum,
         base * (2 ** max(0, attempt - 1)),
@@ -220,13 +206,13 @@ async def sleep_backoff(
     base: float,
     maximum: float,
 ):
-    delay = retry_delay(
-        attempt,
-        base,
-        maximum,
+    await asyncio.sleep(
+        retry_delay(
+            attempt,
+            base,
+            maximum,
+        )
     )
-
-    await asyncio.sleep(delay)
 
 
 def is_retryable_db_error(exc: Exception) -> bool:
@@ -245,11 +231,17 @@ def is_retryable_db_error(exc: Exception) -> bool:
         "timeout",
         "timed out",
         "connection",
+        "network",
+        "dns",
+        "resolve",
         "server closed",
         "connection reset",
         "broken pipe",
         "could not connect",
         "temporarily unavailable",
+        "no address associated with hostname",
+        "network is unreachable",
+        "name or service not known",
     )
 
     return any(
@@ -285,6 +277,10 @@ def is_retryable_telegram_error(
         "file reference",
         "server error",
         "temporarily unavailable",
+        "network is unreachable",
+        "connection reset",
+        "connection refused",
+        "cannot connect",
     )
 
     return any(
@@ -318,19 +314,17 @@ def _db_connect():
 @contextmanager
 def db():
     """
-    PostgreSQL connection with automatic reconnect.
+    PostgreSQL connection with INDEFINITE retry.
 
-    A connection failure does not kill the analyzer.
+    If Wi-Fi/mobile data/DNS/Render DB temporarily disappears,
+    the analyzer waits and keeps trying instead of exiting.
     """
 
-    last_error = None
+    attempt = 0
 
-    for attempt in range(
-        1,
-        DB_CONNECT_RETRIES + 1,
-    ):
-
+    while True:
         conn = None
+        attempt += 1
 
         try:
             conn = _db_connect()
@@ -342,16 +336,11 @@ def db():
 
         except Exception as exc:
 
-            last_error = exc
-
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.rollback()
 
             if not is_retryable_db_error(exc):
-                raise
-
-            if attempt >= DB_CONNECT_RETRIES:
                 raise
 
             delay = retry_delay(
@@ -361,10 +350,8 @@ def db():
             )
 
             log.warning(
-                "PostgreSQL error. "
-                "Retry %s/%s in %.1fs: %s",
-                attempt,
-                DB_CONNECT_RETRIES,
+                "PostgreSQL unavailable. "
+                "Retrying in %.1fs: %s",
                 delay,
                 exc,
             )
@@ -377,25 +364,21 @@ def db():
                 with contextlib.suppress(Exception):
                     conn.close()
 
-    if last_error:
-        raise last_error
-
 
 def get_pending_tracks(
     limit: int,
 ):
     """
-    IMPORTANT:
+    Get pending tracks.
 
-    Temporary failures:
-        analyzed = false
-        ai_error = normal error
+    Temporary DB/network failure:
+        WAIT + RETRY FOREVER
 
-    Permanent failures:
-        analyzed = false
-        ai_error starts with PERMANENT:
+    Permanent Telegram failures:
+        excluded.
 
-    Permanent failures are excluded so they don't retry forever.
+    analyzed=TRUE:
+        excluded.
     """
 
     query = """
@@ -418,14 +401,37 @@ def get_pending_tracks(
         LIMIT %s
     """
 
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                query,
-                (limit,),
+    while True:
+
+        try:
+
+            with db() as conn:
+                with conn.cursor() as cur:
+
+                    cur.execute(
+                        query,
+                        (limit,),
+                    )
+
+                    return cur.fetchall()
+
+        except Exception as exc:
+
+            if not is_retryable_db_error(exc):
+                raise
+
+            log.warning(
+                "Could not read pending tracks. "
+                "Waiting for PostgreSQL..."
             )
 
-            return cur.fetchall()
+            time.sleep(
+                retry_delay(
+                    1,
+                    DB_RETRY_DELAY,
+                    DB_MAX_RETRY_DELAY,
+                )
+            )
 
 
 def mark_error(
@@ -433,17 +439,6 @@ def mark_error(
     error: Exception | str,
     permanent: bool = False,
 ):
-    """
-    Temporary:
-        analyzed = false
-        retry on next run
-
-    Permanent:
-        analyzed = false
-        ai_error = PERMANENT:...
-        excluded from future runs
-    """
-
     message = str(error).strip()
 
     if permanent:
@@ -474,6 +469,13 @@ def save_analysis(
     track_id: int,
     result: dict,
 ):
+    """
+    Save analysis.
+
+    If PostgreSQL temporarily disappears after audio analysis,
+    this waits until DB comes back instead of losing the result.
+    """
+
     with db() as conn:
         with conn.cursor() as cur:
 
@@ -545,15 +547,9 @@ def build_telegram_client():
         ),
         api_id,
         TELETHON_API_HASH,
-
-        # Telethon internal connection retry
         connection_retries=10,
         retry_delay=5,
-
-        # Network timeout
         timeout=TELEGRAM_TIMEOUT,
-
-        # Let Telethon reconnect itself
         auto_reconnect=True,
     )
 
@@ -562,26 +558,33 @@ async def ensure_telegram_connected(
     client: TelegramClient,
 ):
     """
-    Make absolutely sure Telethon is connected.
+    IMPORTANT:
+
+    Telegram connection retry is now INFINITE.
+
+    Network down:
+        wait
+
+    Network returns:
+        reconnect automatically
+
+    Analyzer does not exit because of temporary network loss.
     """
 
     if client.is_connected():
         return
 
-    last_error = None
+    attempt = 0
 
-    for attempt in range(
-        1,
-        TELEGRAM_RECONNECT_RETRIES + 1,
-    ):
+    while True:
+
+        attempt += 1
 
         try:
 
             log.warning(
-                "Telegram reconnect "
-                "attempt %s/%s...",
+                "Telegram reconnect attempt #%s...",
                 attempt,
-                TELEGRAM_RECONNECT_RETRIES,
             )
 
             await client.connect()
@@ -599,37 +602,33 @@ async def ensure_telegram_connected(
 
         except Exception as exc:
 
-            last_error = exc
-
             log.warning(
-                "Telegram reconnect failed: %s",
+                "Telegram connection unavailable: %s",
                 exc,
             )
 
             with contextlib.suppress(Exception):
                 await client.disconnect()
 
-            if attempt < TELEGRAM_RECONNECT_RETRIES:
-                await sleep_backoff(
-                    attempt,
-                    TELEGRAM_RECONNECT_DELAY,
-                    TELEGRAM_RECONNECT_DELAY * 4,
-                )
+            delay = retry_delay(
+                attempt,
+                TELEGRAM_RECONNECT_DELAY,
+                60.0,
+            )
 
-    raise RuntimeError(
-        "Telegram reconnect failed"
-    ) from last_error
+            log.warning(
+                "Waiting %.1fs before Telegram reconnect...",
+                delay,
+            )
+
+            await asyncio.sleep(
+                delay
+            )
 
 
 async def reconnect_telegram(
     client: TelegramClient,
 ):
-    """
-    Force a fresh Telegram connection.
-
-    Used after GetFileRequest timeout.
-    """
-
     log.warning(
         "Refreshing Telegram connection..."
     )
@@ -649,14 +648,9 @@ async def get_telegram_message(
     channel_id: str,
     message_id: int,
 ):
-    """
-    Get one Telegram message.
-
-    If the message does not exist, classify it as
-    PERMANENT instead of endlessly retrying.
-    """
 
     try:
+
         entity = await client.get_entity(
             int(channel_id)
             if str(channel_id).lstrip("-").isdigit()
@@ -689,9 +683,7 @@ async def get_telegram_message(
             ids=int(message_id),
         )
 
-    except (
-        MessageIdInvalidError,
-    ) as exc:
+    except MessageIdInvalidError as exc:
 
         raise PermanentTelegramMessageError(
             f"Telegram message not found: "
@@ -724,22 +716,20 @@ async def download_track(
     output_path: str,
 ):
     """
-    Robust Telegram downloader.
+    Download one track.
 
-    Handles:
-      - GetFileRequest TimeoutError
-      - connection errors
-      - expired file references
-      - FloodWait
-      - Telegram reconnect
+    Temporary network failure:
+        keep retrying
+
+    Permanent missing message:
+        stop retrying that track
     """
 
-    last_error = None
+    attempt = 0
 
-    for attempt in range(
-        1,
-        TELEGRAM_MAX_RETRIES + 1,
-    ):
+    while True:
+
+        attempt += 1
 
         try:
 
@@ -753,7 +743,6 @@ async def download_track(
                 message_id,
             )
 
-            # A message exists but contains no downloadable media.
             if not getattr(
                 message,
                 "media",
@@ -764,10 +753,8 @@ async def download_track(
                 )
 
             log.info(
-                "Telegram download attempt "
-                "%s/%s: %s/%s",
+                "Telegram download attempt #%s: %s/%s",
                 attempt,
-                TELEGRAM_MAX_RETRIES,
                 channel_id,
                 message_id,
             )
@@ -816,8 +803,6 @@ async def download_track(
 
         except FloodWaitError as exc:
 
-            last_error = exc
-
             wait_seconds = int(
                 getattr(
                     exc,
@@ -826,11 +811,8 @@ async def download_track(
                 )
             )
 
-            # IMPORTANT:
-            # Do NOT cap Telegram's actual FloodWait time.
             log.warning(
-                "Telegram FloodWait: "
-                "sleeping %ss",
+                "Telegram FloodWait: sleeping %ss",
                 wait_seconds,
             )
 
@@ -846,33 +828,25 @@ async def download_track(
             FileReferenceExpiredError,
         ) as exc:
 
-            last_error = exc
-
             log.warning(
-                "Telegram download temporary "
-                "error %s/%s: %s",
+                "Telegram temporary error "
+                "attempt #%s: %s",
                 attempt,
-                TELEGRAM_MAX_RETRIES,
                 exc,
             )
 
-            # Fresh connection after GetFileRequest timeout
-            if attempt < TELEGRAM_MAX_RETRIES:
-
-                with contextlib.suppress(Exception):
-                    await reconnect_telegram(
-                        client
-                    )
-
-                await sleep_backoff(
-                    attempt,
-                    TELEGRAM_RETRY_DELAY,
-                    TELEGRAM_MAX_RETRY_DELAY,
+            with contextlib.suppress(Exception):
+                await reconnect_telegram(
+                    client
                 )
 
-        except RPCError as exc:
+            await sleep_backoff(
+                attempt,
+                TELEGRAM_RETRY_DELAY,
+                60.0,
+            )
 
-            last_error = exc
+        except RPCError as exc:
 
             if not is_retryable_telegram_error(
                 exc
@@ -881,28 +855,23 @@ async def download_track(
 
             log.warning(
                 "Telegram RPC temporary error "
-                "%s/%s: %s",
+                "attempt #%s: %s",
                 attempt,
-                TELEGRAM_MAX_RETRIES,
                 exc,
             )
 
-            if attempt < TELEGRAM_MAX_RETRIES:
-
-                with contextlib.suppress(Exception):
-                    await reconnect_telegram(
-                        client
-                    )
-
-                await sleep_backoff(
-                    attempt,
-                    TELEGRAM_RETRY_DELAY,
-                    TELEGRAM_MAX_RETRY_DELAY,
+            with contextlib.suppress(Exception):
+                await reconnect_telegram(
+                    client
                 )
 
-        except Exception as exc:
+            await sleep_backoff(
+                attempt,
+                TELEGRAM_RETRY_DELAY,
+                60.0,
+            )
 
-            last_error = exc
+        except Exception as exc:
 
             if not is_retryable_telegram_error(
                 exc
@@ -910,31 +879,22 @@ async def download_track(
                 raise
 
             log.warning(
-                "Telegram unexpected temporary "
-                "error %s/%s: %s",
+                "Telegram unexpected temporary error "
+                "attempt #%s: %s",
                 attempt,
-                TELEGRAM_MAX_RETRIES,
                 exc,
             )
 
-            if attempt < TELEGRAM_MAX_RETRIES:
-
-                with contextlib.suppress(Exception):
-                    await reconnect_telegram(
-                        client
-                    )
-
-                await sleep_backoff(
-                    attempt,
-                    TELEGRAM_RETRY_DELAY,
-                    TELEGRAM_MAX_RETRY_DELAY,
+            with contextlib.suppress(Exception):
+                await reconnect_telegram(
+                    client
                 )
 
-    raise TemporaryTelegramError(
-        "Telegram download failed after "
-        f"{TELEGRAM_MAX_RETRIES} attempts: "
-        f"{last_error}"
-    )
+            await sleep_backoff(
+                attempt,
+                TELEGRAM_RETRY_DELAY,
+                60.0,
+            )
 
 
 # ============================================================
@@ -945,6 +905,7 @@ async def convert_to_wav(
     input_path: str,
     output_path: str,
 ):
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -963,6 +924,8 @@ async def convert_to_wav(
         output_path,
     ]
 
+    process = None
+
     try:
 
         process = await asyncio.create_subprocess_exec(
@@ -978,8 +941,9 @@ async def convert_to_wav(
 
     except asyncio.TimeoutError as exc:
 
-        with contextlib.suppress(Exception):
-            process.kill()
+        if process is not None:
+            with contextlib.suppress(Exception):
+                process.kill()
 
         raise RuntimeError(
             "FFmpeg conversion timed out"
@@ -1012,6 +976,7 @@ async def convert_to_wav(
 def read_wav(
     path: str,
 ):
+
     with wave.open(
         path,
         "rb",
@@ -1027,6 +992,7 @@ def read_wav(
         )
 
     if sample_width == 1:
+
         audio = (
             np.frombuffer(
                 raw,
@@ -1038,6 +1004,7 @@ def read_wav(
         ) / 128.0
 
     elif sample_width == 2:
+
         audio = (
             np.frombuffer(
                 raw,
@@ -1049,6 +1016,7 @@ def read_wav(
         )
 
     elif sample_width == 4:
+
         audio = (
             np.frombuffer(
                 raw,
@@ -1060,6 +1028,7 @@ def read_wav(
         )
 
     else:
+
         raise RuntimeError(
             f"Unsupported WAV sample width: "
             f"{sample_width}"
@@ -1099,7 +1068,6 @@ def rms_energy(
         )
     )
 
-    # Convert roughly to 0-100.
     value = (
         20.0
         * math.log10(
@@ -1149,7 +1117,9 @@ def spectral_features(
     audio: np.ndarray,
     sr: int,
 ):
+
     if len(audio) < 2:
+
         return {
             "centroid": 0.0,
             "bandwidth": 0.0,
@@ -1184,6 +1154,7 @@ def spectral_features(
     )
 
     if total <= 1e-12:
+
         return {
             "centroid": 0.0,
             "bandwidth": 0.0,
@@ -1240,15 +1211,16 @@ def spectral_features(
         )
     )
 
-    arithmetic = (
-        np.mean(
-            spectrum + 1e-12
-        )
+    arithmetic = np.mean(
+        spectrum + 1e-12
     )
 
     flatness = float(
         geometric
-        / max(arithmetic, 1e-12)
+        / max(
+            arithmetic,
+            1e-12,
+        )
     )
 
     return {
@@ -1267,20 +1239,15 @@ def estimate_bpm(
     if len(audio) < sr * 2:
         return None
 
-    # Keep the original style of lightweight
-    # onset/autocorrelation BPM estimation.
-
     audio = audio.astype(
         np.float32
     )
 
-    # Limit analysis size.
     max_samples = sr * 60
 
     if len(audio) > max_samples:
         audio = audio[:max_samples]
 
-    # Envelope
     diff = np.abs(
         np.diff(audio)
     )
@@ -1323,9 +1290,7 @@ def estimate_bpm(
 
     envelope /= std
 
-    envelope_rate = (
-        sr / hop
-    )
+    envelope_rate = sr / hop
 
     min_bpm = 60.0
     max_bpm = 200.0
@@ -1390,7 +1355,6 @@ def estimate_bpm(
         / best_lag
     )
 
-    # Normalize common half/double-time errors.
     while bpm < 80:
         bpm *= 2
 
@@ -1411,13 +1375,12 @@ def estimate_key(
     if len(audio) < sr * 2:
         return None
 
-    # Lightweight chroma/key estimation.
-    # Returns None when confidence is too low.
-
-    signal = audio[: min(
-        len(audio),
-        sr * 60,
-    )]
+    signal = audio[
+        :min(
+            len(audio),
+            sr * 60,
+        )
+    ]
 
     n_fft = 8192
 
@@ -1428,7 +1391,6 @@ def estimate_key(
         n_fft
     )
 
-    # Sample windows.
     positions = np.linspace(
         0,
         len(signal) - n_fft,
@@ -1436,9 +1398,8 @@ def estimate_key(
             30,
             max(
                 1,
-                len(signal) // (
-                    sr * 2
-                ),
+                len(signal)
+                // (sr * 2),
             ),
         ),
         dtype=int,
@@ -1465,6 +1426,18 @@ def estimate_key(
     if len(freqs) == 0:
         return None
 
+    notes = (
+        12.0
+        * np.log2(
+            freqs / 440.0
+        )
+        + 69.0
+    )
+
+    midi = np.round(
+        notes
+    ).astype(int)
+
     for pos in positions:
 
         frame = signal[
@@ -1479,18 +1452,6 @@ def estimate_key(
                 frame * window
             )
         )[valid]
-
-        notes = (
-            12.0
-            * np.log2(
-                freqs / 440.0
-            )
-            + 69.0
-        )
-
-        midi = np.round(
-            notes
-        ).astype(int)
 
         for magnitude, note in zip(
             spectrum,
@@ -1526,7 +1487,6 @@ def estimate_key(
         "B",
     ]
 
-    # Major/minor templates.
     major = np.array([
         6.35,
         2.23,
@@ -1595,19 +1555,19 @@ def estimate_key(
             )
         )
 
-        if best is None or (
-            major_score > best[0]
+        if (
+            best is None
+            or major_score > best[0]
         ):
+
             best = (
                 major_score,
                 names[root],
                 "Major",
             )
 
-        if (
-            minor_score
-            > best[0]
-        ):
+        if minor_score > best[0]:
+
             best = (
                 minor_score,
                 names[root],
@@ -1619,7 +1579,6 @@ def estimate_key(
 
     confidence = best[0]
 
-    # Avoid returning unreliable keys.
     if confidence < 0.45:
         return None
 
@@ -1740,7 +1699,6 @@ def estimate_mood(
     if bpm is None:
         bpm = 120.0
 
-    # Mood classification.
     if energy >= 85 and bpm >= 128:
         return "energetic"
 
@@ -1837,6 +1795,7 @@ def safe_filename(
     title: Optional[str],
     track_id: int,
 ):
+
     title = (
         title
         or f"track_{track_id}"
@@ -1849,7 +1808,6 @@ def safe_filename(
     if not title:
         title = f"track_{track_id}"
 
-    # Remove path separators.
     title = (
         title
         .replace("/", "_")
@@ -1901,8 +1859,6 @@ async def process_track(
         ),
     )
 
-    # We don't trust extension because Telegram may return
-    # mp3/m4a/ogg/etc.
     temp_audio += (
         f"_{track_id}_{message_id}.media"
     )
@@ -1994,7 +1950,6 @@ async def process_track(
             f"{exc}"
         )
 
-        # Do NOT retry this track on the next run.
         mark_error(
             track_id,
             exc,
@@ -2010,11 +1965,7 @@ async def process_track(
             f"❌ FAILED: {exc}"
         )
 
-        # IMPORTANT:
-        # analyzed remains FALSE.
-        #
-        # Therefore this track will be selected
-        # again on the next analyzer run.
+        # Temporary failure stays pending.
         mark_error(
             track_id,
             exc,
@@ -2026,6 +1977,7 @@ async def process_track(
     finally:
 
         with contextlib.suppress(Exception):
+
             if os.path.exists(
                 temp_audio
             ):
@@ -2034,6 +1986,7 @@ async def process_track(
                 )
 
         with contextlib.suppress(Exception):
+
             if os.path.exists(
                 temp_wav
             ):
@@ -2056,30 +2009,17 @@ async def run_analyzer(
     )
     print("=" * 60)
 
-    tracks = get_pending_tracks(
-        limit
-    )
-
-    print(
-        f"Tracks selected: {len(tracks)}"
-    )
-
-    if not tracks:
-        print()
-        print(
-            "No pending tracks."
-        )
-        print(
-            "All retryable tracks are already analyzed."
-        )
-        return 0
-
     client = build_telegram_client()
 
-    success = 0
-    failed = 0
+    total_success = 0
+    total_failed = 0
+    batch_number = 0
 
     try:
+
+        # ----------------------------------------------------
+        # Keep the Telegram connection alive for the whole run.
+        # ----------------------------------------------------
 
         await ensure_telegram_connected(
             client
@@ -2090,79 +2030,143 @@ async def run_analyzer(
             "Telethon: CONNECTED"
         )
 
-        for index, track in enumerate(
-            tracks,
-            start=1,
-        ):
+        while True:
 
-            try:
+            batch_number += 1
 
-                result = await process_track(
-                    client,
-                    track,
-                )
-
-                if result:
-                    success += 1
-                else:
-                    failed += 1
-
-            except Exception as exc:
-
-                # Extra safety:
-                # one track can NEVER kill the whole run.
-                failed += 1
-
-                log.exception(
-                    "Unhandled track error "
-                    "track_id=%s",
-                    track.get("id"),
-                )
-
-                with contextlib.suppress(Exception):
-                    mark_error(
-                        int(track["id"]),
-                        exc,
-                        permanent=False,
-                    )
-
-            # Small delay between tracks.
-            if index < len(tracks):
-
-                await asyncio.sleep(
-                    TRACK_DELAY
-                )
-
-        print()
-        print("=" * 60)
-        print(
-            "ANALYZER FINISHED"
-        )
-        print(
-            f"Success: {success}"
-        )
-        print(
-            f"Failed:  {failed}"
-        )
-
-        if failed:
             print()
             print(
-                "ℹ️ Temporary failed tracks "
-                "remain pending and will be retried "
-                "on the next run."
+                "=" * 60
+            )
+            print(
+                f"SCAN BATCH #{batch_number}"
+            )
+            print(
+                "=" * 60
+            )
+
+            # DB/network failure here waits automatically.
+            tracks = get_pending_tracks(
+                limit
             )
 
             print(
-                "ℹ️ Permanent Telegram-missing tracks "
-                "are excluded from future retries."
+                f"Tracks selected: {len(tracks)}"
             )
 
-        return failed
+            # ------------------------------------------------
+            # Nothing left to analyze.
+            # ------------------------------------------------
+
+            if not tracks:
+
+                print()
+                print(
+                    "✅ NO PENDING TRACKS"
+                )
+                print(
+                    f"Total Success: {total_success}"
+                )
+                print(
+                    f"Total Failed:  {total_failed}"
+                )
+
+                return 0
+
+            batch_success = 0
+            batch_failed = 0
+
+            for index, track in enumerate(
+                tracks,
+                start=1,
+            ):
+
+                try:
+
+                    # If connection disappeared between tracks,
+                    # this waits and reconnects automatically.
+                    await ensure_telegram_connected(
+                        client
+                    )
+
+                    result = await process_track(
+                        client,
+                        track,
+                    )
+
+                    if result:
+
+                        batch_success += 1
+                        total_success += 1
+
+                    else:
+
+                        batch_failed += 1
+                        total_failed += 1
+
+                except Exception as exc:
+
+                    batch_failed += 1
+                    total_failed += 1
+
+                    log.exception(
+                        "Unhandled track error "
+                        "track_id=%s",
+                        track.get("id"),
+                    )
+
+                    # Do not allow one track to kill analyzer.
+                    with contextlib.suppress(Exception):
+
+                        mark_error(
+                            int(track["id"]),
+                            exc,
+                            permanent=False,
+                        )
+
+                if index < len(tracks):
+
+                    await asyncio.sleep(
+                        TRACK_DELAY
+                    )
+
+            print()
+            print(
+                "=" * 60
+            )
+            print(
+                f"BATCH #{batch_number} DONE"
+            )
+            print(
+                f"Success={batch_success} | "
+                f"Failed={batch_failed}"
+            )
+            print(
+                f"TOTAL Success={total_success} | "
+                f"Failed={total_failed}"
+            )
+            print(
+                "=" * 60
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # Do NOT exit after a batch.
+            #
+            # Query PostgreSQL again for pending tracks.
+            # This automatically resumes after temporary
+            # failures and continues until everything is done.
+            # ------------------------------------------------
+
+            await asyncio.sleep(
+                1
+            )
 
     finally:
 
         with contextlib.suppress(Exception):
+
             if client.is_connected():
                 await client.disconnect()
 
@@ -2190,7 +2194,7 @@ def parse_args():
         default=ANALYZER_LIMIT,
         help=(
             "Number of pending tracks "
-            "to process"
+            "to process per batch"
         ),
     )
 
@@ -2202,6 +2206,7 @@ def main():
     args = parse_args()
 
     if args.limit <= 0:
+
         raise SystemExit(
             "--limit must be greater than 0"
         )
@@ -2214,8 +2219,6 @@ def main():
             )
         )
 
-        # 0 = everything selected succeeded
-        # 2 = some tracks failed but analyzer itself completed
         return (
             2
             if failed
