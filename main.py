@@ -1313,6 +1313,33 @@ def _radio_history(uid):
     return recent
 
 
+def _radio_today_served(uid):
+    """Return every track already served to this user today.
+
+    Radio treats this as a hard daily freshness boundary: a track served once
+    today must not be sent again by Radio until the date changes.
+    """
+    served = set()
+
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT channel_id,message_id
+                FROM user_history
+                WHERE user_id=%s
+                  AND action='served'
+                  AND to_timestamp(sent_at)::date = CURRENT_DATE
+                """,
+                (uid,),
+            )
+
+            for row in x.fetchall():
+                served.add((str(row["channel_id"]), int(row["message_id"])))
+
+    return served
+
+
 def _radio_last_seed(uid):
     """
     Return the latest served track with analyzer metadata.
@@ -1421,10 +1448,10 @@ def _radio_feature_similarity(a, b):
     parts = []
 
     for field, scale, weight in (
-        ("bpm", 28.0, 0.20),
-        ("energy", 0.30, 0.18),
-        ("danceability", 0.30, 0.12),
-        ("loudness", 10.0, 0.08),
+        ("bpm", 35.0, 0.08),
+        ("energy", 0.30, 0.22),
+        ("danceability", 0.30, 0.14),
+        ("loudness", 10.0, 0.10),
     ):
         sim = _numeric_similarity(a.get(field), b.get(field), scale)
         if sim is not None:
@@ -1494,6 +1521,49 @@ def _radio_seed_similarity(row, seeds):
 
     # Best seed match dominates; the weighted average keeps the profile stable.
     return (best * 0.62) + (weighted_avg * 0.38)
+
+
+def _radio_bpm_smooth_transition_score(candidate_bpm, last_bpm):
+    """
+    Prefer gradual BPM movement between consecutive Radio tracks.
+
+    BPM is NOT treated as an exact target and is NOT forced to stay around
+    the user's Like centroid.  Instead, the previous Radio track is used as
+    the transition anchor:
+      * 0-1 BPM change: slight penalty (avoid getting stuck)
+      * 2-4 BPM change: strongest preference
+      * 5-7 BPM change: good preference
+      * 8-10 BPM change: mild preference
+      * >10 BPM change: progressively penalized
+
+    This makes sequences such as 134 -> 137 -> 141 -> 145 -> 148 possible,
+    while discouraging abrupt jumps such as 134 -> 150 or 134 -> 82.
+    """
+    if last_bpm is None:
+        return 0.0
+
+    try:
+        bpm = float(candidate_bpm)
+        previous = float(last_bpm)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not (math.isfinite(bpm) and math.isfinite(previous)):
+        return 0.0
+
+    delta = abs(bpm - previous)
+
+    if delta < 1.0:
+        return -3.0
+    if delta <= 4.0:
+        return 9.0
+    if delta <= 7.0:
+        return 6.0
+    if delta <= 10.0:
+        return 2.0
+    if delta <= 14.0:
+        return -5.0 - ((delta - 10.0) * 1.0)
+    return -9.0 - min(10.0, (delta - 14.0) * 0.7)
 
 
 def _radio_negative_similarity(row, dislikes):
@@ -1578,9 +1648,15 @@ def radio_track(uid, baseline_mood=None):
 
     feedback = feedback_map(uid)
     history_map = _radio_history(uid)
+    today_served = _radio_today_served(uid)
     profile = _radio_profile(uid)
     last_seed = _radio_last_seed(uid)
     mood_weights = radio_weights(uid, baseline_mood)
+
+    # BPM is a smooth transition signal between consecutive Radio tracks.
+    # The Like profile remains a taste signal, but is NOT used as a hard BPM
+    # target, so Radio does not get stuck around one value.
+    last_bpm = last_seed.get("bpm") if last_seed else None
 
     liked_seeds = profile["likes"]
     disliked_seeds = profile["dislikes"]
@@ -1598,6 +1674,12 @@ def radio_track(uid, baseline_mood=None):
             int(row["message_id"]),
         )
 
+        # HARD RULE: anything already sent today cannot be sent again by Radio
+        # until the calendar date changes. This is intentionally independent
+        # of the normal recent-history penalty.
+        if key in today_served:
+            continue
+
         fb = feedback.get(key)
         if fb == "not_for_me":
             continue
@@ -1611,6 +1693,15 @@ def radio_track(uid, baseline_mood=None):
         seed_sim = _radio_seed_similarity(row, liked_seeds)
         if seed_sim is not None:
             score += 48.0 * seed_sim
+
+        # -------------------------------------------------------------
+        # 1b. Smooth BPM transition. Avoid both exact-BPM lock and large
+        #     jumps between consecutive Radio tracks.
+        # -------------------------------------------------------------
+        score += _radio_bpm_smooth_transition_score(
+            row.get("bpm"),
+            last_bpm,
+        )
 
         # -------------------------------------------------------------
         # 2. Last-played continuity — keeps consecutive Radio tracks
@@ -1642,10 +1733,10 @@ def radio_track(uid, baseline_mood=None):
         centroid_sims = []
 
         for field, scale, weight in (
-            ("bpm", 30.0, 0.18),
-            ("energy", 0.32, 0.20),
-            ("danceability", 0.32, 0.12),
-            ("loudness", 10.0, 0.08),
+            ("bpm", 40.0, 0.06),
+            ("energy", 0.32, 0.22),
+            ("danceability", 0.32, 0.14),
+            ("loudness", 10.0, 0.10),
         ):
             sim = _numeric_similarity(
                 row.get(field),
