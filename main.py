@@ -1296,7 +1296,7 @@ def _radio_candidates(uid):
 
 
 def radio_track(uid, baseline_mood=None):
-    """Select a rule-based Radio track across all moods."""
+    """Rule-based Radio: likes guide mood, but NEW tracks are protected."""
     rows = _radio_candidates(uid)
     if not rows:
         return None
@@ -1305,10 +1305,13 @@ def radio_track(uid, baseline_mood=None):
     history_map = _radio_history(uid)
     profile = _radio_profile(uid)
     mood_weights = radio_weights(uid, baseline_mood)
-    liked_exact = {key for key, value in feedback.items() if value == "like"}
-    has_likes = bool(liked_exact)
 
-    scored = []
+    # Split the pool first.  This prevents liked tracks from winning forever
+    # just because they match the user's profile.
+    unserved = []
+    liked = []
+    served = []
+
     for row in rows:
         mood = row.get("mood")
         if mood not in MOODS:
@@ -1316,77 +1319,92 @@ def radio_track(uid, baseline_mood=None):
 
         key = (str(row["channel_id"]), int(row["message_id"]))
         fb = feedback.get(key)
+
         if fb == "not_for_me":
             continue
 
-        score = mood_weights[mood] * 2.2
-
-        # Radio is not locked to the currently selected mood.
-        # Mood preference comes from the user's feedback profile.
-
-        # Liked tracks can return, but not at the expense of exploration.
-        if fb == "like":
-            score += 7.5
-
-        # Strongly prefer unserved tracks. Old served tracks remain eligible.
         if key not in history_map:
-            score += 15.0
+            unserved.append(row)
+        elif fb == "like":
+            liked.append(row)
         else:
-            rank = history_map[key]
-            score -= max(0.0, 12.0 - rank * 0.35)
+            served.append(row)
 
+    # Radio should keep discovering the collection.
+    # 70% NEW, 25% LIKED, 5% previously-served fallback.
+    roll = random.random()
+    if unserved and roll < 0.70:
+        pool = unserved
+        pool_type = "NEW"
+    elif liked and roll < 0.95:
+        pool = liked
+        pool_type = "LIKED"
+    elif unserved:
+        pool = unserved
+        pool_type = "NEW"
+    elif liked:
+        pool = liked
+        pool_type = "LIKED"
+    elif served:
+        pool = served
+        pool_type = "SERVED"
+    else:
+        return None
+
+    scored = []
+    for row in pool:
+        mood = row.get("mood")
+        score = mood_weights.get(mood, 0.05) * 2.0
+
+        # Likes guide the choice, but do not lock Radio to old liked tracks.
+        if feedback.get((str(row["channel_id"]), int(row["message_id"]))) == "like":
+            score += 8.0
+
+        # Similarity is a soft preference only.
         sims = []
-        for field, scale in (("bpm",35.0),("energy",35.0),("danceability",35.0),("loudness",12.0)):
+        for field, scale in (("bpm", 35.0), ("energy", 35.0), ("danceability", 35.0), ("loudness", 12.0)):
             sim = _numeric_similarity(row.get(field), profile.get(field), scale)
             if sim is not None:
                 sims.append(sim)
         if sims:
-            # Analyzer audio-feature similarity:
-            # BPM, Energy, Danceability, Loudness.
-            score += 12.0 * (sum(sims) / len(sims))
+            score += 7.0 * (sum(sims) / len(sims))
 
-        # Analyzer Mood learned from the user's liked tracks.
         analyzer_mood = row.get("analyzer_mood")
         if analyzer_mood:
             count = profile["analyzer_moods"].get(str(analyzer_mood).strip().lower(), 0)
             if count:
-                score += min(7.0, 2.0 + count * 0.9)
+                score += min(4.0, 1.0 + count * 0.5)
 
         genre = row.get("genre")
         if genre:
             count = profile["genres"].get(str(genre).strip().lower(), 0)
             if count:
-                score += min(4.0, 1.0 + count * 0.5)
+                score += min(3.0, 0.8 + count * 0.35)
 
         subgenre = row.get("subgenre")
         if subgenre:
             count = profile["subgenres"].get(str(subgenre).strip().lower(), 0)
             if count:
-                score += min(5.0, 1.5 + count * 0.6)
+                score += min(3.0, 0.8 + count * 0.35)
 
         root, key_mode = _radio_key_parts(row.get("musical_key"))
         if root:
             exact = profile["keys"].get((root, key_mode), 0)
             root_matches = sum(count for (liked_root, _), count in profile["keys"].items() if liked_root == root)
             if exact:
-                score += min(3.5, 1.5 + exact * 0.4)
+                score += min(2.5, 1.0 + exact * 0.3)
             elif root_matches:
-                score += min(1.5, 0.5 + root_matches * 0.15)
+                score += min(1.0, 0.3 + root_matches * 0.1)
 
-        # Controlled exploration; recommendation score remains dominant.
-        score += random.uniform(0.0, 2.5)
-        if not has_likes:
-            score += random.uniform(0.0, 2.0)
-
+        score += random.uniform(0.0, 1.5)
         scored.append((score, row))
 
-    if not scored:
-        return None
-
     scored.sort(key=lambda item: item[0], reverse=True)
-    pool = scored[:min(8, len(scored))]
-    choice_weights = [max(0.05, item[0] - pool[-1][0] + 1.0) for item in pool]
-    row = random.choices(pool, weights=choice_weights, k=1)[0][1]
+    top = scored[:min(10, len(scored))]
+    weights = [max(0.1, item[0] - top[-1][0] + 1.0) for item in top]
+    row = random.choices(top, weights=weights, k=1)[0][1]
+
+    log.info("RADIO PICK uid=%s pool=%s mood=%s title=%s", uid, pool_type, row.get("mood"), row.get("title"))
 
     return (
         row["mood"],
@@ -1394,7 +1412,6 @@ def radio_track(uid, baseline_mood=None):
         str(row["channel_id"]),
         row.get("title"),
     )
-
 
 
 # =========================================================
@@ -1682,6 +1699,7 @@ def track_details(ch, msg):
         if v is not None: lines.append(f"💃 Danceability: {v:.1f}")
         v = num(row.get("loudness"))
         if v is not None: lines.append(f"🔊 Loudness: {v:.1f} dB")
+        if row.get("analyzer_mood"): lines.append(f"🌙 Analyzer Mood: {str(row['analyzer_mood'])[:40]}")
         if row.get("genre"): lines.append(f"🎧 Genre: {str(row['genre'])[:40]}")
         if row.get("subgenre"): lines.append(f"🎵 Subgenre: {str(row['subgenre'])[:40]}")
         return "🎚 AUDIO ANALYSIS\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) if lines else ""
@@ -2794,17 +2812,6 @@ def admin_dashboard():
 
             x.execute(
                 """
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE analyzed=TRUE) AS analyzed
-                FROM tracks
-                """
-            )
-
-            analyzer_row = x.fetchone() or {}
-
-            x.execute(
-                """
                 SELECT COUNT(*) n
                 FROM broadcasts
                 WHERE created_at >= %s
@@ -2826,7 +2833,6 @@ def admin_dashboard():
         f"🟢 Today Active: {today_n}\n"
         f"📅 7-Day Active: {week_n}\n"
         f"🎵 Tracks: {track_total}\n"
-        f"🎚 Analyzer: {int(analyzer_row.get('analyzed') or 0)} / {int(analyzer_row.get('total') or 0)} scanned\n"
         f"📣 Broadcasts (24h): {recent_24h}\n\n"
         f"📡 Telethon: "
         f"{'CONNECTED' if ready.is_set() else 'DISCONNECTED'}\n"
