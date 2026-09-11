@@ -1148,44 +1148,14 @@ def ratios(uid):
     return out
 
 
-def radio_weights(uid, baseline_mood=None):
-
-    r = ratios(uid)
-    w = {}
-
-    for m in MOODS:
-        likes = r[m]["like"]
-        nots = r[m]["not"]
-        net = (likes - nots) / (likes + nots + 1.0)
-        volume = math.log1p(likes)
-        confidence = (likes + 1.0) / (likes + nots + 2.0)
-
-        score = (
-            1.0
-            + 2.8 * volume
-            + 2.5 * net
-            + 1.5 * confidence
-        )
-
-        # Radio is global across moods. The currently selected mood
-        # must not force Radio to keep serving that mood.
-        # User feedback remains the main mood preference signal.
-        w[m] = max(0.05, score)
-
-    return w
-
-
-
-# =========================================================
-# RADIO TRACK
-# =========================================================
-
 def _radio_key_parts(value):
     if not value:
         return None, None
+
     parts = str(value).strip().lower().split()
     if not parts:
         return None, None
+
     root = parts[0].replace("♯", "#").replace("♭", "b")
     mode = parts[1] if len(parts) > 1 else None
     return root, mode
@@ -1194,82 +1164,190 @@ def _radio_key_parts(value):
 def _numeric_similarity(value, target, scale):
     if value is None or target is None:
         return None
+
     try:
         value = float(value)
         target = float(target)
     except (TypeError, ValueError):
         return None
+
     if not math.isfinite(value) or not math.isfinite(target):
         return None
+
     return max(0.0, 1.0 - abs(value - target) / scale)
 
 
 def _radio_profile(uid):
+    """
+    Build a rule-based taste profile from the user's recent positive and
+    negative feedback.
+
+    This deliberately uses no AI/ML model.  It is a weighted nearest-neighbor
+    style profile: recent Likes matter more than old Likes, and Not For Me
+    tracks create a negative taste boundary.
+    """
     profile = {
-        "bpm": None, "energy": None, "danceability": None, "loudness": None,
-        "keys": {}, "analyzer_moods": {}, "genres": {}, "subgenres": {},
+        "likes": [],
+        "dislikes": [],
+        "bpm": None,
+        "energy": None,
+        "danceability": None,
+        "loudness": None,
+        "keys": {},
+        "analyzer_moods": {},
+        "genres": {},
+        "subgenres": {},
     }
 
     with db() as c:
         with cur(c) as x:
             x.execute(
                 """
-                SELECT t.bpm,t.energy,t.danceability,t.loudness,
-                       t.musical_key,t.analyzer_mood,t.genre,t.subgenre
+                SELECT
+                    f.feedback,
+                    f.created_at,
+                    t.bpm,
+                    t.musical_key,
+                    t.energy,
+                    t.danceability,
+                    t.loudness,
+                    t.genre,
+                    t.subgenre,
+                    t.analyzer_mood,
+                    t.mood,
+                    t.channel_id,
+                    t.message_id
                 FROM track_feedback f
-                JOIN tracks t ON t.channel_id=f.channel_id AND t.message_id=f.message_id
-                WHERE f.user_id=%s AND f.feedback='like'
+                JOIN tracks t
+                  ON t.channel_id=f.channel_id
+                 AND t.message_id=f.message_id
+                WHERE f.user_id=%s
                 ORDER BY f.created_at DESC
-                LIMIT 100
+                LIMIT 160
                 """,
                 (uid,),
             )
             rows = x.fetchall()
 
+    likes = [r for r in rows if r.get("feedback") == "like"]
+    dislikes = [r for r in rows if r.get("feedback") == "not_for_me"]
+
+    # Keep the most recent Likes as individual "seeds".  Spotify-like radio
+    # behaviour is much closer to seed similarity than a single global average.
+    profile["likes"] = likes[:40]
+    profile["dislikes"] = dislikes[:40]
+
+    # Weighted centroid: recent feedback gets more influence.
     for field in ("bpm", "energy", "danceability", "loudness"):
-        values = []
-        for row in rows:
+        weighted_sum = 0.0
+        weight_sum = 0.0
+
+        for index, row in enumerate(likes[:40]):
             try:
                 value = float(row.get(field))
             except (TypeError, ValueError):
                 continue
-            if math.isfinite(value):
-                values.append(value)
-        if values:
-            profile[field] = sum(values) / len(values)
 
-    for row in rows:
+            if not math.isfinite(value):
+                continue
+
+            # Smooth recency decay.  The newest Like has weight 1.0.
+            weight = math.exp(-index / 12.0)
+            weighted_sum += value * weight
+            weight_sum += weight
+
+        if weight_sum:
+            profile[field] = weighted_sum / weight_sum
+
+    for index, row in enumerate(likes[:40]):
+        weight = math.exp(-index / 12.0)
+
         root, mode = _radio_key_parts(row.get("musical_key"))
         if root:
             key = (root, mode)
-            profile["keys"][key] = profile["keys"].get(key, 0) + 1
+            profile["keys"][key] = profile["keys"].get(key, 0.0) + weight
 
-        for field, target in (("analyzer_mood", "analyzer_moods"), ("genre", "genres"), ("subgenre", "subgenres")):
+        for field, target in (
+            ("analyzer_mood", "analyzer_moods"),
+            ("genre", "genres"),
+            ("subgenre", "subgenres"),
+        ):
             value = row.get(field)
             if value and str(value).strip():
                 value = str(value).strip().lower()
-                profile[target][value] = profile[target].get(value, 0) + 1
+                profile[target][value] = (
+                    profile[target].get(value, 0.0) + weight
+                )
 
     return profile
 
 
 def _radio_history(uid):
     recent = {}
+
     with db() as c:
         with cur(c) as x:
             x.execute(
                 """
                 SELECT channel_id,message_id,sent_at
                 FROM user_history
-                WHERE user_id=%s AND action='served'
+                WHERE user_id=%s
+                  AND action='served'
                 ORDER BY sent_at DESC,id DESC
                 LIMIT %s
                 """,
                 (uid, HISTORY_LIMIT),
             )
+
             for index, row in enumerate(x.fetchall()):
-                recent[(str(row["channel_id"]), int(row["message_id"]))] = index
+                recent[
+                    (
+                        str(row["channel_id"]),
+                        int(row["message_id"]),
+                    )
+                ] = {
+                    "rank": index,
+                    "sent_at": int(row["sent_at"]),
+                }
+
     return recent
+
+
+def _radio_last_seed(uid):
+    """
+    Return the latest served track with analyzer metadata.
+
+    This gives Radio a local "continuation" signal instead of restarting from
+    the whole user profile on every request.
+    """
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT
+                    t.mood,
+                    t.message_id,
+                    t.channel_id,
+                    t.bpm,
+                    t.musical_key,
+                    t.energy,
+                    t.danceability,
+                    t.loudness,
+                    t.genre,
+                    t.subgenre,
+                    t.analyzer_mood
+                FROM user_history h
+                JOIN tracks t
+                  ON t.channel_id=h.channel_id
+                 AND t.message_id=h.message_id
+                WHERE h.user_id=%s
+                  AND h.action='served'
+                ORDER BY h.sent_at DESC,h.id DESC
+                LIMIT 1
+                """,
+                (uid,),
+            )
+            return x.fetchone()
 
 
 def _radio_candidates(uid):
@@ -1277,12 +1355,49 @@ def _radio_candidates(uid):
         with cur(c) as x:
             x.execute(
                 """
-                SELECT t.id,t.mood,t.message_id,t.channel_id,t.title,
-                       t.bpm,t.musical_key,t.energy,t.danceability,t.loudness,
-                       t.genre,t.subgenre,t.analyzer_mood
+                SELECT
+                    t.id,
+                    t.mood,
+                    t.message_id,
+                    t.channel_id,
+                    t.title,
+                    t.created_at,
+                    t.bpm,
+                    t.musical_key,
+                    t.energy,
+                    t.danceability,
+                    t.loudness,
+                    t.genre,
+                    t.subgenre,
+                    t.analyzer_mood,
+                    COALESCE(gl.global_likes,0) AS global_likes,
+                    COALESCE(gs.global_served,0) AS global_served
                 FROM tracks t
+                LEFT JOIN (
+                    SELECT
+                        channel_id,
+                        message_id,
+                        COUNT(*) AS global_likes
+                    FROM track_feedback
+                    WHERE feedback='like'
+                    GROUP BY channel_id,message_id
+                ) gl
+                  ON gl.channel_id=t.channel_id
+                 AND gl.message_id=t.message_id
+                LEFT JOIN (
+                    SELECT
+                        channel_id,
+                        message_id,
+                        COUNT(*) AS global_served
+                    FROM user_history
+                    WHERE action='served'
+                    GROUP BY channel_id,message_id
+                ) gs
+                  ON gs.channel_id=t.channel_id
+                 AND gs.message_id=t.message_id
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM track_feedback f
+                    SELECT 1
+                    FROM track_feedback f
                     WHERE f.user_id=%s
                       AND f.channel_id=t.channel_id
                       AND f.message_id=t.message_id
@@ -1295,8 +1410,168 @@ def _radio_candidates(uid):
             return x.fetchall()
 
 
+def _radio_feature_similarity(a, b):
+    """
+    Audio/content similarity in [0,1].
+
+    The weighting intentionally favours genre/subgenre and audio feel over
+    exact musical key, which is closer to how a practical music radio should
+    behave.  Missing analyzer fields are simply ignored.
+    """
+    parts = []
+
+    for field, scale, weight in (
+        ("bpm", 28.0, 0.20),
+        ("energy", 0.30, 0.18),
+        ("danceability", 0.30, 0.12),
+        ("loudness", 10.0, 0.08),
+    ):
+        sim = _numeric_similarity(a.get(field), b.get(field), scale)
+        if sim is not None:
+            parts.append((sim, weight))
+
+    # Categorical similarity.
+    genre_a = str(a.get("genre") or "").strip().lower()
+    genre_b = str(b.get("genre") or "").strip().lower()
+    if genre_a and genre_b:
+        parts.append((1.0 if genre_a == genre_b else 0.0, 0.15))
+
+    sub_a = str(a.get("subgenre") or "").strip().lower()
+    sub_b = str(b.get("subgenre") or "").strip().lower()
+    if sub_a and sub_b:
+        parts.append((1.0 if sub_a == sub_b else 0.0, 0.13))
+
+    mood_a = str(a.get("analyzer_mood") or "").strip().lower()
+    mood_b = str(b.get("analyzer_mood") or "").strip().lower()
+    if mood_a and mood_b:
+        parts.append((1.0 if mood_a == mood_b else 0.0, 0.08))
+
+    root_a, mode_a = _radio_key_parts(a.get("musical_key"))
+    root_b, mode_b = _radio_key_parts(b.get("musical_key"))
+    if root_a and root_b:
+        if root_a == root_b and mode_a == mode_b:
+            parts.append((1.0, 0.04))
+        elif root_a == root_b:
+            parts.append((0.65, 0.04))
+        else:
+            parts.append((0.0, 0.04))
+
+    if not parts:
+        return None
+
+    total_weight = sum(weight for _, weight in parts)
+    return sum(sim * weight for sim, weight in parts) / total_weight
+
+
+def _radio_seed_similarity(row, seeds):
+    """
+    Compare a candidate against multiple liked seeds.
+
+    Recent seeds are weighted more heavily, while the strongest similarity is
+    retained so one very strong match is not drowned out by unrelated Likes.
+    """
+    if not seeds:
+        return None
+
+    scored = []
+
+    for index, seed in enumerate(seeds[:20]):
+        sim = _radio_feature_similarity(row, seed)
+        if sim is None:
+            continue
+
+        recency = math.exp(-index / 8.0)
+        scored.append((sim, recency))
+
+    if not scored:
+        return None
+
+    best = max(sim for sim, _ in scored)
+    weighted_avg = (
+        sum(sim * weight for sim, weight in scored)
+        / sum(weight for _, weight in scored)
+    )
+
+    # Best seed match dominates; the weighted average keeps the profile stable.
+    return (best * 0.62) + (weighted_avg * 0.38)
+
+
+def _radio_negative_similarity(row, dislikes):
+    """
+    Penalize candidates that resemble tracks the user explicitly rejected.
+    """
+    if not dislikes:
+        return 0.0
+
+    scores = []
+
+    for index, seed in enumerate(dislikes[:20]):
+        sim = _radio_feature_similarity(row, seed)
+        if sim is None:
+            continue
+
+        weight = math.exp(-index / 10.0)
+        scores.append((sim, weight))
+
+    if not scores:
+        return 0.0
+
+    return (
+        sum(sim * weight for sim, weight in scores)
+        / sum(weight for _, weight in scores)
+    )
+
+
+def radio_weights(uid, baseline_mood=None):
+    """
+    Rule-based mood prior used only as a light fallback/tie-breaker.
+
+    Radio is global and never locks to the currently selected mood.
+    """
+    r = ratios(uid)
+    weights = {}
+
+    for mood in MOODS:
+        likes = float(r[mood]["like"])
+        nots = float(r[mood]["not"])
+
+        positive = (likes + 1.0) / (likes + nots + 2.0)
+        volume = math.log1p(likes)
+        rejection = nots / (likes + nots + 2.0)
+
+        weights[mood] = (
+            0.35
+            + 0.75 * positive
+            + 0.20 * volume
+            - 0.45 * rejection
+        )
+
+    # The selected mood is intentionally only a tiny prior.  It must not
+    # override feedback/audio similarity.
+    if baseline_mood in MOODS:
+        weights[baseline_mood] += 0.08
+
+    return {
+        mood: max(0.05, value)
+        for mood, value in weights.items()
+    }
+
+
 def radio_track(uid, baseline_mood=None):
-    """Select a rule-based Radio track across all moods."""
+    """
+    Spotify-like rule-based Radio.
+
+    No AI/ML/API is used here.  Selection is based on:
+      1) recent liked tracks as similarity seeds,
+      2) audio-feature similarity,
+      3) genre/subgenre/mood/key similarity,
+      4) similarity to the last served track for smooth continuation,
+      5) negative similarity from Not For Me tracks,
+      6) recency/anti-repeat logic,
+      7) a small popularity + exploration component.
+
+    The result is intentionally not locked to the selected mood.
+    """
     rows = _radio_candidates(uid)
     if not rows:
         return None
@@ -1304,89 +1579,185 @@ def radio_track(uid, baseline_mood=None):
     feedback = feedback_map(uid)
     history_map = _radio_history(uid)
     profile = _radio_profile(uid)
+    last_seed = _radio_last_seed(uid)
     mood_weights = radio_weights(uid, baseline_mood)
-    liked_exact = {key for key, value in feedback.items() if value == "like"}
-    has_likes = bool(liked_exact)
+
+    liked_seeds = profile["likes"]
+    disliked_seeds = profile["dislikes"]
+    has_profile = bool(liked_seeds)
 
     scored = []
+
     for row in rows:
         mood = row.get("mood")
         if mood not in MOODS:
             continue
 
-        key = (str(row["channel_id"]), int(row["message_id"]))
+        key = (
+            str(row["channel_id"]),
+            int(row["message_id"]),
+        )
+
         fb = feedback.get(key)
         if fb == "not_for_me":
             continue
 
-        score = mood_weights[mood] * 2.2
+        # Base is deliberately small.  Similarity should be the main driver.
+        score = 10.0 * mood_weights[mood]
 
-        # Radio is not locked to the currently selected mood.
-        # Mood preference comes from the user's feedback profile.
+        # -------------------------------------------------------------
+        # 1. Seed-track similarity — strongest Radio signal.
+        # -------------------------------------------------------------
+        seed_sim = _radio_seed_similarity(row, liked_seeds)
+        if seed_sim is not None:
+            score += 48.0 * seed_sim
 
-        # Liked tracks can return, but not at the expense of exploration.
+        # -------------------------------------------------------------
+        # 2. Last-played continuity — keeps consecutive Radio tracks
+        #    musically coherent without locking to one genre.
+        # -------------------------------------------------------------
+        if last_seed:
+            transition_sim = _radio_feature_similarity(row, last_seed)
+            if transition_sim is not None:
+                score += 14.0 * transition_sim
+
+        # -------------------------------------------------------------
+        # 3. Negative taste boundary.
+        # -------------------------------------------------------------
+        negative_sim = _radio_negative_similarity(row, disliked_seeds)
+        if negative_sim:
+            score -= 24.0 * negative_sim
+
+        # -------------------------------------------------------------
+        # 4. Explicit feedback.
+        # -------------------------------------------------------------
         if fb == "like":
-            score += 7.5
+            # A liked track is a strong seed, but Radio should still discover
+            # similar tracks instead of replaying the exact same song.
+            score += 5.0
 
-        # Strongly prefer unserved tracks. Old served tracks remain eligible.
-        if key not in history_map:
-            score += 15.0
-        else:
-            rank = history_map[key]
-            score -= max(0.0, 12.0 - rank * 0.35)
+        # -------------------------------------------------------------
+        # 5. Centroid similarity as a stabilizer when there are many Likes.
+        # -------------------------------------------------------------
+        centroid_sims = []
 
-        sims = []
-        for field, scale in (("bpm",35.0),("energy",35.0),("danceability",35.0),("loudness",12.0)):
-            sim = _numeric_similarity(row.get(field), profile.get(field), scale)
+        for field, scale, weight in (
+            ("bpm", 30.0, 0.18),
+            ("energy", 0.32, 0.20),
+            ("danceability", 0.32, 0.12),
+            ("loudness", 10.0, 0.08),
+        ):
+            sim = _numeric_similarity(
+                row.get(field),
+                profile.get(field),
+                scale,
+            )
             if sim is not None:
-                sims.append(sim)
-        if sims:
-            # Analyzer audio-feature similarity:
-            # BPM, Energy, Danceability, Loudness.
-            score += 12.0 * (sum(sims) / len(sims))
+                centroid_sims.append((sim, weight))
 
-        # Analyzer Mood learned from the user's liked tracks.
-        analyzer_mood = row.get("analyzer_mood")
-        if analyzer_mood:
-            count = profile["analyzer_moods"].get(str(analyzer_mood).strip().lower(), 0)
-            if count:
-                score += min(7.0, 2.0 + count * 0.9)
+        if centroid_sims:
+            total = sum(weight for _, weight in centroid_sims)
+            centroid = (
+                sum(sim * weight for sim, weight in centroid_sims)
+                / total
+            )
+            score += 13.0 * centroid
 
-        genre = row.get("genre")
-        if genre:
-            count = profile["genres"].get(str(genre).strip().lower(), 0)
-            if count:
-                score += min(4.0, 1.0 + count * 0.5)
-
-        subgenre = row.get("subgenre")
-        if subgenre:
-            count = profile["subgenres"].get(str(subgenre).strip().lower(), 0)
-            if count:
-                score += min(5.0, 1.5 + count * 0.6)
+        # Genre / subgenre / analyzer mood / key profile.
+        for field, table, max_bonus, base_bonus in (
+            ("genre", profile["genres"], 7.0, 1.5),
+            ("subgenre", profile["subgenres"], 8.0, 1.8),
+            ("analyzer_mood", profile["analyzer_moods"], 5.0, 1.2),
+        ):
+            value = row.get(field)
+            if value:
+                value = str(value).strip().lower()
+                count = float(table.get(value, 0.0))
+                if count:
+                    score += min(max_bonus, base_bonus + count * 1.4)
 
         root, key_mode = _radio_key_parts(row.get("musical_key"))
         if root:
-            exact = profile["keys"].get((root, key_mode), 0)
-            root_matches = sum(count for (liked_root, _), count in profile["keys"].items() if liked_root == root)
-            if exact:
-                score += min(3.5, 1.5 + exact * 0.4)
-            elif root_matches:
-                score += min(1.5, 0.5 + root_matches * 0.15)
+            exact = profile["keys"].get((root, key_mode), 0.0)
+            root_matches = sum(
+                count
+                for (liked_root, _), count in profile["keys"].items()
+                if liked_root == root
+            )
 
-        # Controlled exploration; recommendation score remains dominant.
-        score += random.uniform(0.0, 2.5)
-        if not has_likes:
-            score += random.uniform(0.0, 2.0)
+            if exact:
+                score += min(3.5, 1.0 + exact * 0.8)
+            elif root_matches:
+                score += min(1.5, 0.4 + root_matches * 0.25)
+
+        # -------------------------------------------------------------
+        # 6. Anti-repeat / freshness.
+        # -------------------------------------------------------------
+        history = history_map.get(key)
+
+        if history is None:
+            score += 13.0
+        else:
+            rank = int(history["rank"])
+
+            # Strong penalty for the newest repeats, then a smooth recovery.
+            if rank < 8:
+                score -= 22.0 - (rank * 1.5)
+            elif rank < 25:
+                score -= 10.0 - ((rank - 8) * 0.35)
+            else:
+                score -= 1.0
+
+        # -------------------------------------------------------------
+        # 7. Mild global popularity signal.
+        #    Popularity should break ties, not dominate personalization.
+        # -------------------------------------------------------------
+        global_likes = float(row.get("global_likes") or 0.0)
+        global_served = float(row.get("global_served") or 0.0)
+
+        if global_likes:
+            score += min(5.0, math.log1p(global_likes) * 0.9)
+
+        if global_served:
+            # Small "known-good" signal, capped very tightly.
+            score += min(2.0, math.log1p(global_served) * 0.25)
+
+        # -------------------------------------------------------------
+        # 8. Controlled exploration.
+        # -------------------------------------------------------------
+        # Exploration is smaller when the user has enough feedback, larger
+        # during cold-start so Radio does not get stuck on one mood.
+        exploration = 1.0 if has_profile else 2.5
+        score += random.uniform(0.0, exploration)
 
         scored.append((score, row))
 
     if not scored:
         return None
 
-    scored.sort(key=lambda item: item[0], reverse=True)
-    pool = scored[:min(8, len(scored))]
-    choice_weights = [max(0.05, item[0] - pool[-1][0] + 1.0) for item in pool]
-    row = random.choices(pool, weights=choice_weights, k=1)[0][1]
+    scored.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    # Do not simply choose the #1 every time.  Spotify-like radio benefits
+    # from a small high-quality candidate pool with weighted choice.
+    pool_size = 10 if len(scored) >= 10 else len(scored)
+    pool = scored[:pool_size]
+
+    top_score = pool[0][0]
+    temperature = 4.5 if has_profile else 6.0
+
+    choice_weights = [
+        math.exp(max(-20.0, (item[0] - top_score) / temperature))
+        for item in pool
+    ]
+
+    row = random.choices(
+        pool,
+        weights=choice_weights,
+        k=1,
+    )[0][1]
 
     return (
         row["mood"],
@@ -1394,7 +1765,6 @@ def radio_track(uid, baseline_mood=None):
         str(row["channel_id"]),
         row.get("title"),
     )
-
 
 
 # =========================================================
