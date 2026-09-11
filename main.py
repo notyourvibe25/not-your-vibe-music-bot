@@ -1448,8 +1448,8 @@ def _radio_feature_similarity(a, b):
     parts = []
 
     for field, scale, weight in (
-        ("bpm", 35.0, 0.08),
-        ("energy", 0.30, 0.22),
+        ("bpm", 60.0, 0.01),
+        ("energy", 0.30, 0.25),
         ("danceability", 0.30, 0.14),
         ("loudness", 10.0, 0.10),
     ):
@@ -1523,21 +1523,16 @@ def _radio_seed_similarity(row, seeds):
     return (best * 0.62) + (weighted_avg * 0.38)
 
 
-def _radio_bpm_smooth_transition_score(candidate_bpm, last_bpm):
-    """
-    Prefer gradual BPM movement between consecutive Radio tracks.
+def _radio_bpm_smooth_transition_score(candidate_bpm, last_bpm, recent_bpms=None):
+    """Score BPM continuity without turning BPM into a fixed target.
 
-    BPM is NOT treated as an exact target and is NOT forced to stay around
-    the user's Like centroid.  Instead, the previous Radio track is used as
-    the transition anchor:
-      * 0-1 BPM change: slight penalty (avoid getting stuck)
-      * 2-4 BPM change: strongest preference
-      * 5-7 BPM change: good preference
-      * 8-10 BPM change: mild preference
-      * >10 BPM change: progressively penalized
+    Radio should *travel* through BPM space instead of repeatedly selecting
+    the two values nearest the user's Like centroid.  The previous BPM is
+    therefore only a transition anchor. Small-to-medium moves are preferred,
+    while exact repeats and large jumps are discouraged.
 
-    This makes sequences such as 134 -> 137 -> 141 -> 145 -> 148 possible,
-    while discouraging abrupt jumps such as 134 -> 150 or 134 -> 82.
+    A short recent-BPM window also discourages immediate back-and-forth
+    patterns such as 134 -> 126 -> 134.
     """
     if last_bpm is None:
         return 0.0
@@ -1553,17 +1548,48 @@ def _radio_bpm_smooth_transition_score(candidate_bpm, last_bpm):
 
     delta = abs(bpm - previous)
 
+    # Avoid exact/near repeats: they are a common cause of BPM lock.
     if delta < 1.0:
-        return -3.0
-    if delta <= 4.0:
-        return 9.0
-    if delta <= 7.0:
-        return 6.0
-    if delta <= 10.0:
-        return 2.0
-    if delta <= 14.0:
-        return -5.0 - ((delta - 10.0) * 1.0)
-    return -9.0 - min(10.0, (delta - 14.0) * 0.7)
+        score = -6.0
+    elif delta < 2.0:
+        score = -1.0
+    elif delta <= 5.0:
+        score = 8.0
+    elif delta <= 8.0:
+        score = 7.0
+    elif delta <= 11.0:
+        score = 4.0
+    elif delta <= 14.0:
+        score = 0.0
+    elif delta <= 18.0:
+        score = -5.0
+    else:
+        score = -10.0 - min(10.0, (delta - 18.0) * 0.5)
+
+    # If the last two moves went in one direction, gently continue that
+    # direction. This prevents a 134 <-> 126 ping-pong while still allowing
+    # the radio to turn around after a few tracks.
+    if recent_bpms and len(recent_bpms) >= 2:
+        try:
+            prev2 = float(recent_bpms[-2])
+            prev1 = float(recent_bpms[-1])
+        except (TypeError, ValueError):
+            prev2 = prev1 = None
+
+        if prev2 is not None and prev1 is not None:
+            direction = prev1 - prev2
+            move = bpm - previous
+
+            if abs(direction) >= 1.0 and abs(move) >= 1.0:
+                same_direction = (direction > 0 and move > 0) or (direction < 0 and move < 0)
+                opposite_direction = (direction > 0 and move < 0) or (direction < 0 and move > 0)
+
+                if same_direction and abs(move) <= 8.0:
+                    score += 2.5
+                elif opposite_direction and abs(move) <= 5.0:
+                    score -= 2.0
+
+    return score
 
 
 def _radio_negative_similarity(row, dislikes):
@@ -1658,6 +1684,40 @@ def radio_track(uid, baseline_mood=None):
     # target, so Radio does not get stuck around one value.
     last_bpm = last_seed.get("bpm") if last_seed else None
 
+    # Build a tiny recent BPM trail from the served history.  This is only
+    # used to keep transitions flowing instead of bouncing between two BPMs.
+    recent_bpms = []
+    if history_map:
+        recent_history = sorted(
+            history_map.values(),
+            key=lambda item: (item["sent_at"], -item["rank"]),
+            reverse=True,
+        )[:4]
+        recent_keys = [
+            key for key, item in sorted(
+                history_map.items(),
+                key=lambda pair: (pair[1]["sent_at"], -pair[1]["rank"]),
+                reverse=True,
+            )[:4]
+        ]
+        if recent_keys:
+            with db() as c:
+                with cur(c) as x:
+                    for channel_id, message_id in recent_keys:
+                        x.execute(
+                            "SELECT bpm FROM tracks WHERE channel_id=%s AND message_id=%s LIMIT 1",
+                            (channel_id, message_id),
+                        )
+                        r = x.fetchone()
+                        if r and r.get("bpm") is not None:
+                            try:
+                                value = float(r.get("bpm"))
+                                if math.isfinite(value):
+                                    recent_bpms.append(value)
+                            except (TypeError, ValueError):
+                                pass
+            recent_bpms.reverse()
+
     liked_seeds = profile["likes"]
     disliked_seeds = profile["dislikes"]
     has_profile = bool(liked_seeds)
@@ -1701,6 +1761,7 @@ def radio_track(uid, baseline_mood=None):
         score += _radio_bpm_smooth_transition_score(
             row.get("bpm"),
             last_bpm,
+            recent_bpms,
         )
 
         # -------------------------------------------------------------
@@ -1733,8 +1794,7 @@ def radio_track(uid, baseline_mood=None):
         centroid_sims = []
 
         for field, scale, weight in (
-            ("bpm", 40.0, 0.06),
-            ("energy", 0.32, 0.22),
+            ("energy", 0.32, 0.25),
             ("danceability", 0.32, 0.14),
             ("loudness", 10.0, 0.10),
         ):
