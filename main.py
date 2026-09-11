@@ -1633,11 +1633,12 @@ def radio_weights(uid, baseline_mood=None):
 
 
 def radio_track(uid, baseline_mood=None):
-    """Choose a Spotify-like Radio track using transparent database rules.
+    """Choose Radio tracks from user taste ratios without AI.
 
-    Recommendation signals are limited to user feedback, mood, freshness, and
-    aggregate likes/plays. No AI, embeddings, analyzer metadata, or external
-    recommendation service is used here.
+    Radio deliberately ignores the currently selected mood. It samples fresh
+    tracks the user has not liked yet 70% of the time and tracks the user has
+    liked 30% of the time, then ranks each bucket by mood Like ratio,
+    freshness, popularity, and a smooth BPM transition from the last track.
     """
     rows = _radio_candidates(uid)
     if not rows:
@@ -1646,81 +1647,87 @@ def radio_track(uid, baseline_mood=None):
     feedback = feedback_map(uid)
     recent = _radio_history(uid)
     today_served = _radio_today_served(uid)
-    mood_weights = radio_weights(uid, baseline_mood)
+    mood_weights = radio_weights(uid, baseline_mood=None)
     last_seed = _radio_last_seed(uid)
     last_bpm = last_seed.get("bpm") if last_seed else None
-    scored = []
 
+    usable = []
     for row in rows:
         mood = row.get("mood")
         if mood not in MOODS:
             continue
         key = (str(row["channel_id"]), int(row["message_id"]))
-        if key in today_served:
+        if key in today_served or feedback.get(key) == "not_for_me":
             continue
-        if feedback.get(key) == "not_for_me":
-            continue
+        usable.append((row, key))
 
-        # Mood affinity is the main personalization signal.
-        score = 42.0 * float(mood_weights.get(mood, 0.5))
-
-        # Keep a liked mood in the rotation without replaying the exact track.
-        if feedback.get(key) == "like":
-            score += 4.0
-
-        # Strong freshness preference, with gradual recovery for old tracks.
-        if key not in recent:
-            score += 24.0
-        else:
-            rank = int(recent[key]["rank"])
-            score -= max(0.0, 18.0 - min(rank, 18) * 0.85)
-
-        # Prefer a gentle BPM move from the last Radio track.
-        # Small/medium changes score higher; abrupt jumps are penalized.
-        score += 2.0 * _radio_bpm_smooth_transition_score(
-            row.get("bpm"),
-            last_bpm,
-        )
-
-        # Community popularity breaks ties but cannot overpower personalization.
-        try:
-            score += min(6.0, math.log1p(float(row.get("global_likes") or 0)) * 1.15)
-            score += min(2.0, math.log1p(float(row.get("global_served") or 0)) * 0.20)
-        except (TypeError, ValueError):
-            pass
-
-        # Small randomness prevents the same top track on every request.
-        score += random.uniform(0.0, 3.0)
-        scored.append((score, row))
-
-    if not scored:
-        # If the user's whole catalogue was served today, keep Radio usable
-        # by falling back to the same rules while allowing today's tracks.
+    if not usable:
+        # Preserve the existing bot's usability when the user has exhausted
+        # today's catalogue: allow older tracks, but still exclude dislikes.
         for row in rows:
             mood = row.get("mood")
             if mood not in MOODS:
                 continue
             key = (str(row["channel_id"]), int(row["message_id"]))
-            if feedback.get(key) == "not_for_me":
-                continue
-            score = 42.0 * float(mood_weights.get(mood, 0.5))
-            score += 4.0 if feedback.get(key) == "like" else 0.0
-            score += 2.0 * _radio_bpm_smooth_transition_score(
-                row.get("bpm"),
-                last_bpm,
-            )
-            score += min(6.0, math.log1p(float(row.get("global_likes") or 0)) * 1.15)
-            score += random.uniform(0.0, 3.0)
-            scored.append((score, row))
+            if feedback.get(key) != "not_for_me":
+                usable.append((row, key))
 
-    if not scored:
+    if not usable:
         return None
 
+    liked_pool = [item for item in usable if feedback.get(item[1]) == "like"]
+    fresh_pool = [
+        item for item in usable
+        if feedback.get(item[1]) != "like" and item[1] not in recent
+    ]
+    unliked_pool = [item for item in usable if feedback.get(item[1]) != "like"]
+
+    # Exact target mix: fresh/unliked 70%, liked 30%, with sensible fallback
+    # when one side is empty for a new or small catalogue.
+    if fresh_pool and liked_pool:
+        pool = fresh_pool if random.random() < 0.70 else liked_pool
+    elif fresh_pool:
+        pool = fresh_pool
+    elif liked_pool:
+        pool = liked_pool
+    else:
+        pool = unliked_pool or usable
+
+    scored = []
+    for row, key in pool:
+        mood = row["mood"]
+        score = 48.0 * float(mood_weights.get(mood, 0.5))
+
+        # Fresh tracks are preferred inside the 70% discovery bucket.
+        if key not in recent:
+            score += 18.0
+        else:
+            rank = int(recent[key]["rank"])
+            score -= max(0.0, 14.0 - min(rank, 16) * 0.8)
+
+        # BPM continuity: small/medium changes are preferred; large jumps lose.
+        score += 2.2 * _radio_bpm_smooth_transition_score(
+            row.get("bpm"),
+            last_bpm,
+        )
+
+        try:
+            score += min(5.0, math.log1p(float(row.get("global_likes") or 0)) * 1.0)
+            score += min(1.5, math.log1p(float(row.get("global_served") or 0)) * 0.18)
+        except (TypeError, ValueError):
+            pass
+
+        score += random.uniform(0.0, 2.5)
+        scored.append((score, row))
+
     scored.sort(key=lambda item: item[0], reverse=True)
-    pool = scored[:min(8, len(scored))]
-    top = pool[0][0]
-    weights = [math.exp(max(-20.0, (score - top) / 5.0)) for score, _ in pool]
-    row = random.choices(pool, weights=weights, k=1)[0][1]
+    shortlist = scored[:min(8, len(scored))]
+    top = shortlist[0][0]
+    weights = [
+        math.exp(max(-20.0, (score - top) / 5.0))
+        for score, _ in shortlist
+    ]
+    row = random.choices(shortlist, weights=weights, k=1)[0][1]
     return (
         row["mood"],
         int(row["message_id"]),
