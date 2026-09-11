@@ -802,7 +802,16 @@ def get_track(track_id):
                     mood,
                     channel_id,
                     message_id,
-                    title
+                    title,
+                    bpm,
+                    musical_key,
+                    energy,
+                    danceability,
+                    loudness,
+                    genre,
+                    subgenre,
+                    analyzer_mood,
+                    analyzed
                 FROM tracks
                 WHERE id=%s
                 """,
@@ -1158,9 +1167,9 @@ def radio_weights(uid, baseline_mood=None):
             + 1.5 * confidence
         )
 
-        if baseline_mood == m:
-            score += 3.0
-
+        # Radio is global across moods. The currently selected mood
+        # must not force Radio to keep serving that mood.
+        # User feedback remains the main mood preference signal.
         w[m] = max(0.05, score)
 
     return w
@@ -1312,9 +1321,8 @@ def radio_track(uid, baseline_mood=None):
 
         score = mood_weights[mood] * 2.2
 
-        # Selected mood is context, never a hard filter.
-        if mood == baseline_mood:
-            score += 2.5
+        # Radio is not locked to the currently selected mood.
+        # Mood preference comes from the user's feedback profile.
 
         # Liked tracks can return, but not at the expense of exploration.
         if fb == "like":
@@ -1333,8 +1341,11 @@ def radio_track(uid, baseline_mood=None):
             if sim is not None:
                 sims.append(sim)
         if sims:
+            # Analyzer audio-feature similarity:
+            # BPM, Energy, Danceability, Loudness.
             score += 12.0 * (sum(sims) / len(sims))
 
+        # Analyzer Mood learned from the user's liked tracks.
         analyzer_mood = row.get("analyzer_mood")
         if analyzer_mood:
             count = profile["analyzer_moods"].get(str(analyzer_mood).strip().lower(), 0)
@@ -1635,45 +1646,6 @@ def copy_music(
     )
 
 
-
-def analyzer_stats():
-    """Return analyzer progress counts for the admin panel."""
-    with db() as c:
-        with cur(c) as x:
-            x.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE COALESCE(analyzed, FALSE) = TRUE) AS analyzed,
-                    COUNT(*) FILTER (WHERE COALESCE(analyzed, FALSE) = FALSE) AS pending,
-                    COUNT(*) FILTER (WHERE ai_error IS NOT NULL AND TRIM(ai_error) <> '') AS errors
-                FROM tracks
-                """
-            )
-            row = x.fetchone() or {}
-
-    total = int(row.get("total") or 0)
-    analyzed = int(row.get("analyzed") or 0)
-    pending = int(row.get("pending") or 0)
-    errors = int(row.get("errors") or 0)
-    percent = (analyzed / total * 100.0) if total else 0.0
-    return total, analyzed, pending, errors, percent
-
-
-def analyzer_stats_text():
-    total, analyzed, pending, errors, percent = analyzer_stats()
-    return (
-        "🎚 AUDIO ANALYZER STATUS\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎵 Total tracks: {total}\n"
-        f"✅ Analyzed: {analyzed}\n"
-        f"⏳ Remaining: {pending}\n"
-        f"❌ Errors: {errors}\n"
-        f"📊 Progress: {percent:.1f}%"
-    )
-
-
-
 def track_details(ch, msg):
 
     try:
@@ -1702,17 +1674,18 @@ def track_details(ch, msg):
 
         lines = []
         v = num(row.get("bpm"))
-        if v is not None: lines.append(f"🥁 BPM: {v:.1f}")
-        if row.get("musical_key"): lines.append(f"🎼 Key: {str(row['musical_key'])[:40]}")
+        if v is not None: lines.append(f"💿 BPM: {v:.1f}")
+        if row.get("musical_key"): lines.append(f"🎹 Key: {str(row['musical_key'])[:40]}")
         v = num(row.get("energy"))
         if v is not None: lines.append(f"⚡ Energy: {v:.1f}")
         v = num(row.get("danceability"))
         if v is not None: lines.append(f"💃 Danceability: {v:.1f}")
         v = num(row.get("loudness"))
         if v is not None: lines.append(f"🔊 Loudness: {v:.1f} dB")
-        if row.get("genre"): lines.append(f"🎚 Genre: {str(row['genre'])[:40]}")
-        if row.get("subgenre"): lines.append(f"🎛 Subgenre: {str(row['subgenre'])[:40]}")
-        return "📊 TRACK DETAILS\n" + "\n".join(lines) if lines else ""
+        if row.get("analyzer_mood"): lines.append(f"🌙 Analyzer Mood: {str(row['analyzer_mood'])[:40]}")
+        if row.get("genre"): lines.append(f"🎧 Genre: {str(row['genre'])[:40]}")
+        if row.get("subgenre"): lines.append(f"🎵 Subgenre: {str(row['subgenre'])[:40]}")
+        return "🎚 AUDIO ANALYSIS\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) if lines else ""
     except Exception:
         log.exception("track details lookup failed channel=%s message=%s", ch, msg)
         return ""
