@@ -480,6 +480,27 @@ def init_db():
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_mood TEXT;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ;
 
+    -- Older scanner/database versions created analyzed_at as BIGINT epoch
+    -- seconds. Convert that existing column before the scanner writes NOW().
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'tracks'
+              AND column_name = 'analyzed_at'
+              AND data_type = 'bigint'
+        ) THEN
+            ALTER TABLE tracks
+            ALTER COLUMN analyzed_at TYPE TIMESTAMPTZ
+            USING CASE
+                WHEN analyzed_at IS NULL THEN NULL
+                ELSE to_timestamp(analyzed_at)
+            END;
+        END IF;
+    END $$;
+
     CREATE INDEX IF NOT EXISTS idx_tracks_analyzed ON tracks(analyzed);
     CREATE INDEX IF NOT EXISTS idx_tracks_analyzer_mood ON tracks(analyzer_mood);
 
