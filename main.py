@@ -1430,11 +1430,95 @@ def _radio_candidates(uid):
                       AND f.message_id=t.message_id
                       AND f.feedback='not_for_me'
                 )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM user_history failed
+                    WHERE failed.user_id=%s
+                      AND failed.channel_id=t.channel_id
+                      AND failed.message_id=t.message_id
+                      AND failed.action='delivery_failed'
+                )
                 ORDER BY t.id ASC
                 """,
-                (uid,),
+                (uid, uid),
             )
             return x.fetchall()
+
+
+def _radio_harmonic_transition_score(candidate_key, last_key):
+    """Prefer Camelot-compatible keys and avoid large harmonic jumps."""
+    if not candidate_key or not last_key:
+        return 0.0
+
+    def camelot(value):
+        text = str(value).strip().upper().replace("♯", "#").replace("♭", "B")
+        import re
+        match = re.search(r"(?:^|\s)(1[0-2]|[1-9])\s*([AB])(?:\s|$)", text)
+        if not match:
+            return None
+        return int(match.group(1)), match.group(2)
+
+    left = camelot(candidate_key)
+    right = camelot(last_key)
+    if left and right:
+        number, mode = left
+        previous_number, previous_mode = right
+        distance = abs(number - previous_number)
+        distance = min(distance, 12 - distance)
+        if distance == 0 and mode == previous_mode:
+            return 8.0
+        if distance == 1 and mode == previous_mode:
+            return 6.0
+        if distance == 0 and mode != previous_mode:
+            return 5.5
+        if distance == 1 and mode != previous_mode:
+            return 2.0
+        return -min(8.0, 2.0 + distance * 1.5)
+
+    # Also support analyzed keys such as "F minor" / "Ab major".
+    note_order = {"C": 0, "B#": 0, "C#": 1, "DB": 1, "D": 2,
+                  "D#": 3, "EB": 3, "E": 4, "FB": 4, "E#": 5,
+                  "F": 5, "F#": 6, "GB": 6, "G": 7, "G#": 8,
+                  "AB": 8, "A": 9, "A#": 10, "BB": 10, "B": 11, "CB": 11}
+
+    def note_key(value):
+        parts = str(value).strip().upper().replace("♯", "#").replace("♭", "B").split()
+        if len(parts) < 2:
+            return None
+        root = note_order.get(parts[0])
+        mode = "MINOR" if parts[1].startswith("MIN") else "MAJOR" if parts[1].startswith("MAJ") else None
+        return (root, mode) if root is not None and mode else None
+
+    left = note_key(candidate_key)
+    right = note_key(last_key)
+    if not left or not right:
+        return 0.0
+    distance = abs(left[0] - right[0])
+    distance = min(distance, 12 - distance)
+    if distance == 0 and left[1] == right[1]:
+        return 8.0
+    if distance == 1 and left[1] == right[1]:
+        return 6.0
+    # Relative major/minor (for example F minor <-> Ab major) is harmonic-
+    # mixing compatible even though the tonic names are different.
+    if ((right[1] == "MINOR" and left[1] == "MAJOR" and left[0] == (right[0] + 3) % 12)
+            or (right[1] == "MAJOR" and left[1] == "MINOR" and left[0] == (right[0] + 9) % 12)):
+        return 5.5
+    if distance == 0 and left[1] != right[1]:
+        return 3.0
+    return -min(8.0, 2.0 + distance * 1.5)
+
+
+def _radio_bpm_is_smooth(candidate_bpm, last_bpm, max_delta=12.0):
+    """Trending/top-list tracks are eligible only when BPM transition is smooth."""
+    if last_bpm is None:
+        return candidate_bpm is not None
+    try:
+        candidate = float(candidate_bpm)
+        previous = float(last_bpm)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(candidate) and math.isfinite(previous) and abs(candidate - previous) <= max_delta
 
 
 def _radio_feature_similarity(a, b):
@@ -1635,10 +1719,10 @@ def radio_weights(uid, baseline_mood=None):
 def radio_track(uid, baseline_mood=None):
     """Choose Radio tracks from user taste ratios without AI.
 
-    Radio deliberately ignores the currently selected mood. It samples fresh
-    tracks the user has not liked yet 70% of the time and tracks the user has
-    liked 30% of the time, then ranks each bucket by mood Like ratio,
-    freshness, popularity, and a smooth BPM transition from the last track.
+    Radio deliberately ignores the currently selected mood. It uses a strict
+    70/20/10 source mix: fresh tracks, tracks the user liked, and the global
+    trending/top-10-liked set. The last set is admitted only when its BPM is a
+    smooth transition from the previous track.
     """
     rows = _radio_candidates(uid)
     if not rows:
@@ -1650,6 +1734,17 @@ def radio_track(uid, baseline_mood=None):
     mood_weights = radio_weights(uid, baseline_mood=None)
     last_seed = _radio_last_seed(uid)
     last_bpm = last_seed.get("bpm") if last_seed else None
+    last_key = last_seed.get("musical_key") if last_seed else None
+
+    top_ids = {
+        (str(row["channel_id"]), int(row["message_id"]))
+        for row in top_liked_tracks(10)
+    }
+    trending_ids = {
+        (str(row["channel_id"]), int(row["message_id"]))
+        for row in trending_rows(10)
+    }
+    special_ids = top_ids | trending_ids
 
     usable = []
     for row in rows:
@@ -1675,23 +1770,37 @@ def radio_track(uid, baseline_mood=None):
     if not usable:
         return None
 
-    liked_pool = [item for item in usable if feedback.get(item[1]) == "like"]
+    special_pool = [
+        item for item in usable
+        if item[1] in special_ids
+        and _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
+    ]
+    liked_pool = [
+        item for item in usable
+        if feedback.get(item[1]) == "like" and item[1] not in special_ids
+    ]
     fresh_pool = [
         item for item in usable
-        if feedback.get(item[1]) != "like" and item[1] not in recent
+        if feedback.get(item[1]) != "like"
+        and item[1] not in recent
+        and item[1] not in special_ids
     ]
     unliked_pool = [item for item in usable if feedback.get(item[1]) != "like"]
 
-    # Exact target mix: fresh/unliked 70%, liked 30%, with sensible fallback
-    # when one side is empty for a new or small catalogue.
-    if fresh_pool and liked_pool:
-        pool = fresh_pool if random.random() < 0.70 else liked_pool
-    elif fresh_pool:
-        pool = fresh_pool
-    elif liked_pool:
-        pool = liked_pool
-    else:
+    # Exact target mix: fresh 70%, liked 20%, trending/top-10 10%.
+    # If a bucket is unavailable, redistribute only that bucket's share.
+    buckets = ((fresh_pool, 0.70), (liked_pool, 0.20), (special_pool, 0.10))
+    available = [(pool, weight) for pool, weight in buckets if pool]
+    if not available:
         pool = unliked_pool or usable
+    else:
+        pick = random.random() * sum(weight for _, weight in available)
+        pool = available[-1][0]
+        for candidate_pool, weight in available:
+            pick -= weight
+            if pick <= 0:
+                pool = candidate_pool
+                break
 
     scored = []
     for row, key in pool:
@@ -1709,6 +1818,12 @@ def radio_track(uid, baseline_mood=None):
         score += 2.2 * _radio_bpm_smooth_transition_score(
             row.get("bpm"),
             last_bpm,
+        )
+        # Harmonic compatibility has a smaller, deliberate priority than
+        # taste/content similarity, while discouraging large key jumps.
+        score += 1.25 * _radio_harmonic_transition_score(
+            row.get("musical_key"),
+            last_key,
         )
 
         try:
@@ -1829,6 +1944,34 @@ def reserve(
             )
 
     return track
+
+
+def mark_delivery_failed(uid, track):
+    """Remember an unavailable Telegram message without marking it served."""
+    if not track:
+        return
+
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute(
+                    """
+                    INSERT INTO user_history(
+                        user_id, mood, channel_id, message_id, action, sent_at
+                    )
+                    VALUES(%s,%s,%s,%s,'delivery_failed',%s)
+                    """,
+                    (
+                        uid,
+                        track[0],
+                        str(track[2]),
+                        int(track[1]),
+                        int(time.time()),
+                    ),
+                )
+    except Exception:
+        # Keep the original delivery error as the user-facing result.
+        log.exception("could not record failed delivery uid=%s", uid)
 
 
 # =========================================================
@@ -3831,6 +3974,24 @@ def send_music(
         track_title = None
 
     result = copy_music(chat, channel, msg)
+    if radio and not result.get("ok"):
+        # A DB row can outlive its Telegram message. Mark it unavailable and
+        # immediately choose another track instead of stopping Radio.
+        mark_delivery_failed(uid, track)
+        for _ in range(4):
+            retry_track = radio_track(uid, baseline_mood=mood)
+            if not retry_track:
+                break
+            retry_mood, retry_msg, retry_channel, retry_title = retry_track
+            retry_result = copy_music(chat, retry_channel, retry_msg)
+            if retry_result.get("ok"):
+                track = retry_track
+                selected_mood, msg, channel, track_title = (
+                    retry_mood, retry_msg, retry_channel, retry_title
+                )
+                result = retry_result
+                break
+            mark_delivery_failed(uid, retry_track)
 
     if not result.get("ok"):
         log.warning(
