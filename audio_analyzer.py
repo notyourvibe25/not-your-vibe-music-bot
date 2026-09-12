@@ -17,7 +17,6 @@ from typing import Optional
 import numpy as np
 import psycopg
 from psycopg.rows import dict_row
-
 from telethon import TelegramClient
 from telethon.errors import (
     RPCError,
@@ -31,7 +30,16 @@ from telethon.sessions import StringSession
 
 
 # ============================================================
-# CONFIG
+# NOT YOUR VIBE - AUDIO ANALYZER
+# No AI. Audio analysis only.
+#
+# Features:
+# - Shows TOTAL / ANALYZED / REMAINING while scanning
+# - Continues until all analyzable tracks are finished
+# - Temporary Telegram/DB/network errors are retried
+# - Permanently missing/deleted Telegram messages are skipped
+# - After finishing, keeps WATCHING PostgreSQL for new tracks
+# - New tracks are automatically analyzed without restarting
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -48,124 +56,54 @@ TELETHON_API_HASH = (
     or ""
 ).strip()
 
-TELETHON_SESSION = os.getenv(
-    "TELETHON_SESSION",
-    "",
-).strip()
+TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 
-ANALYZER_LIMIT = int(
-    os.getenv("ANALYZER_LIMIT", "10")
-)
+ANALYZER_LIMIT = int(os.getenv("ANALYZER_LIMIT", "10"))
+WATCH_INTERVAL = int(os.getenv("ANALYZER_WATCH_INTERVAL", "60"))
 
 SAMPLE_RATE = 22050
 CHANNELS = 1
 MAX_SECONDS = 90
 
-TEMP_DIR = os.getenv(
-    "ANALYZER_TEMP_DIR",
-    tempfile.gettempdir(),
+TEMP_DIR = os.getenv("ANALYZER_TEMP_DIR", tempfile.gettempdir())
+MAX_FILE_MB = int(os.getenv("ANALYZER_MAX_FILE_MB", "250"))
+
+TELEGRAM_RETRIES_PER_TRACK = int(
+    os.getenv("TELEGRAM_RETRIES_PER_TRACK", "4")
 )
-
-MAX_FILE_MB = int(
-    os.getenv("ANALYZER_MAX_FILE_MB", "250")
-)
-
-# ------------------------------------------------------------
-# Telegram retry settings
-# ------------------------------------------------------------
-
-TELEGRAM_MAX_RETRIES = int(
-    os.getenv("TELEGRAM_MAX_RETRIES", "6")
-)
-
 TELEGRAM_RETRY_DELAY = float(
     os.getenv("TELEGRAM_RETRY_DELAY", "3")
 )
-
 TELEGRAM_MAX_RETRY_DELAY = float(
     os.getenv("TELEGRAM_MAX_RETRY_DELAY", "30")
 )
+TELEGRAM_TIMEOUT = int(os.getenv("TELEGRAM_TIMEOUT", "60"))
 
-TELEGRAM_TIMEOUT = int(
-    os.getenv("TELEGRAM_TIMEOUT", "60")
-)
+DB_RETRY_DELAY = float(os.getenv("DB_RETRY_DELAY", "2"))
+DB_MAX_RETRY_DELAY = float(os.getenv("DB_MAX_RETRY_DELAY", "20"))
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "15"))
 
-# These are kept for compatibility with existing ENV settings.
-TELEGRAM_RECONNECT_RETRIES = int(
-    os.getenv("TELEGRAM_RECONNECT_RETRIES", "5")
-)
+TRACK_DELAY = float(os.getenv("ANALYZER_TRACK_DELAY", "1.5"))
+FFMPEG_TIMEOUT = int(os.getenv("ANALYZER_FFMPEG_TIMEOUT", "180"))
 
-TELEGRAM_RECONNECT_DELAY = float(
-    os.getenv("TELEGRAM_RECONNECT_DELAY", "5")
-)
-
-# Delay between tracks
-TRACK_DELAY = float(
-    os.getenv("ANALYZER_TRACK_DELAY", "1.5")
-)
-
-# ------------------------------------------------------------
-# Database retry settings
-# ------------------------------------------------------------
-
-DB_CONNECT_RETRIES = int(
-    os.getenv("DB_CONNECT_RETRIES", "5")
-)
-
-DB_RETRY_DELAY = float(
-    os.getenv("DB_RETRY_DELAY", "2")
-)
-
-DB_MAX_RETRY_DELAY = float(
-    os.getenv("DB_MAX_RETRY_DELAY", "20")
-)
-
-DB_CONNECT_TIMEOUT = int(
-    os.getenv("DB_CONNECT_TIMEOUT", "15")
-)
-
-# ------------------------------------------------------------
-# FFmpeg
-# ------------------------------------------------------------
-
-FFMPEG_TIMEOUT = int(
-    os.getenv("ANALYZER_FFMPEG_TIMEOUT", "180")
-)
-
-# ------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------
-
-LOG_LEVEL = os.getenv(
-    "LOG_LEVEL",
-    "INFO",
-).upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level=getattr(
-        logging,
-        LOG_LEVEL,
-        logging.INFO,
-    ),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-log = logging.getLogger(
-    "not-your-vibe-audio-analyzer"
-)
+log = logging.getLogger("not-your-vibe-audio-analyzer")
 
 
 # ============================================================
-# CUSTOM ERRORS
+# ERRORS
 # ============================================================
 
 class PermanentTelegramMessageError(Exception):
-    """Telegram message is permanently unavailable."""
     pass
 
 
 class TemporaryTelegramError(Exception):
-    """Telegram/network error that should be retried."""
     pass
 
 
@@ -174,86 +112,32 @@ class TemporaryTelegramError(Exception):
 # ============================================================
 
 def normalize_database_url(url: str) -> str:
-    if not url:
-        return ""
-
     if url.startswith("postgres://"):
         return "postgresql://" + url[len("postgres://"):]
-
     return url
 
 
-def retry_delay(
-    attempt: int,
-    base: float,
-    maximum: float,
-) -> float:
-    value = min(
-        maximum,
-        base * (2 ** max(0, attempt - 1)),
-    )
-
-    jitter = random.uniform(
-        0,
-        min(1.0, value * 0.15),
-    )
-
-    return value + jitter
-
-
-async def sleep_backoff(
-    attempt: int,
-    base: float,
-    maximum: float,
-):
-    await asyncio.sleep(
-        retry_delay(
-            attempt,
-            base,
-            maximum,
-        )
-    )
+def backoff(attempt: int, base: float, maximum: float) -> float:
+    value = min(maximum, base * (2 ** max(0, attempt - 1)))
+    return value + random.uniform(0, min(1.0, value * 0.15))
 
 
 def is_retryable_db_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-
-    if isinstance(
-        exc,
-        (
-            psycopg.OperationalError,
-            psycopg.InterfaceError,
-        ),
-    ):
+    if isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)):
         return True
 
-    retry_words = (
-        "timeout",
-        "timed out",
-        "connection",
-        "network",
-        "dns",
-        "resolve",
-        "server closed",
-        "connection reset",
-        "broken pipe",
-        "could not connect",
-        "temporarily unavailable",
+    text = str(exc).lower()
+    words = (
+        "timeout", "timed out", "connection", "network", "dns",
+        "resolve", "server closed", "connection reset", "broken pipe",
+        "could not connect", "temporarily unavailable",
         "no address associated with hostname",
-        "network is unreachable",
-        "name or service not known",
+        "network is unreachable", "name or service not known",
     )
-
-    return any(
-        word in text
-        for word in retry_words
-    )
+    return any(x in text for x in words)
 
 
-def is_retryable_telegram_error(
-    exc: Exception,
-) -> bool:
-
+def is_retryable_telegram_error(exc: Exception) -> bool:
     if isinstance(
         exc,
         (
@@ -266,27 +150,14 @@ def is_retryable_telegram_error(
         return True
 
     text = str(exc).lower()
-
-    retry_words = (
-        "timeout",
-        "timed out",
-        "connection",
-        "network",
-        "internal",
-        "getfilerequest",
-        "file reference",
-        "server error",
-        "temporarily unavailable",
-        "network is unreachable",
-        "connection reset",
-        "connection refused",
-        "cannot connect",
+    words = (
+        "timeout", "timed out", "connection", "network", "internal",
+        "getfilerequest", "file reference", "server error",
+        "temporarily unavailable", "network is unreachable",
+        "connection reset", "connection refused", "cannot connect",
+        "request was unsuccessful",
     )
-
-    return any(
-        word in text
-        for word in retry_words
-    )
+    return any(x in text for x in words)
 
 
 # ============================================================
@@ -295,31 +166,18 @@ def is_retryable_telegram_error(
 
 def _db_connect():
     if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is missing"
-        )
+        raise RuntimeError("DATABASE_URL is missing")
 
     return psycopg.connect(
-        normalize_database_url(
-            DATABASE_URL
-        ),
+        normalize_database_url(DATABASE_URL),
         connect_timeout=DB_CONNECT_TIMEOUT,
         row_factory=dict_row,
-        application_name=(
-            "not-your-vibe-audio-analyzer"
-        ),
+        application_name="not-your-vibe-audio-analyzer",
     )
 
 
 @contextmanager
 def db():
-    """
-    PostgreSQL connection with INDEFINITE retry.
-
-    If Wi-Fi/mobile data/DNS/Render DB temporarily disappears,
-    the analyzer waits and keeps trying instead of exiting.
-    """
-
     attempt = 0
 
     while True:
@@ -328,14 +186,12 @@ def db():
 
         try:
             conn = _db_connect()
-
+            log.info("PostgreSQL: CONNECTED")
             yield conn
-
             conn.commit()
             return
 
         except Exception as exc:
-
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.rollback()
@@ -343,44 +199,77 @@ def db():
             if not is_retryable_db_error(exc):
                 raise
 
-            delay = retry_delay(
-                attempt,
-                DB_RETRY_DELAY,
-                DB_MAX_RETRY_DELAY,
-            )
-
+            delay = backoff(attempt, DB_RETRY_DELAY, DB_MAX_RETRY_DELAY)
             log.warning(
-                "PostgreSQL unavailable. "
-                "Retrying in %.1fs: %s",
+                "PostgreSQL unavailable. Retrying in %.1fs: %s",
                 delay,
                 exc,
             )
-
             time.sleep(delay)
 
         finally:
-
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
 
 
-def get_pending_tracks(
-    limit: int,
-):
+def get_progress() -> dict:
+    query = """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (
+                WHERE COALESCE(analyzed,FALSE)=TRUE
+            ) AS analyzed,
+            COUNT(*) FILTER (
+                WHERE COALESCE(analyzed,FALSE)=FALSE
+                AND (
+                    ai_error IS NULL
+                    OR ai_error NOT LIKE 'PERMANENT:%'
+                )
+            ) AS remaining,
+            COUNT(*) FILTER (
+                WHERE COALESCE(analyzed,FALSE)=FALSE
+                AND ai_error LIKE 'PERMANENT:%'
+            ) AS permanent_failed
+        FROM tracks
     """
-    Get pending tracks.
 
-    Temporary DB/network failure:
-        WAIT + RETRY FOREVER
+    while True:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query)
+                    row = cur.fetchone()
+                    return dict(row)
+        except Exception as exc:
+            if not is_retryable_db_error(exc):
+                raise
+            time.sleep(DB_RETRY_DELAY)
 
-    Permanent Telegram failures:
-        excluded.
 
-    analyzed=TRUE:
-        excluded.
-    """
+def print_progress(prefix="SCAN PROGRESS"):
+    p = get_progress()
+    total = int(p["total"] or 0)
+    analyzed = int(p["analyzed"] or 0)
+    remaining = int(p["remaining"] or 0)
+    permanent = int(p["permanent_failed"] or 0)
 
+    percent = (analyzed / total * 100) if total else 100.0
+
+    print()
+    print("=" * 60)
+    print(prefix)
+    print(
+        f"TOTAL TRACKS : {total}\n"
+        f"ANALYZED     : {analyzed}\n"
+        f"REMAINING    : {remaining}\n"
+        f"PERMANENT    : {permanent}\n"
+        f"PROGRESS     : {percent:.2f}%"
+    )
+    print("=" * 60)
+
+
+def get_pending_tracks(limit: int):
     query = """
         SELECT
             id,
@@ -392,7 +281,7 @@ def get_pending_tracks(
             ai_error
         FROM tracks
         WHERE
-            COALESCE(analyzed, FALSE) = FALSE
+            COALESCE(analyzed,FALSE)=FALSE
             AND (
                 ai_error IS NULL
                 OR ai_error NOT LIKE 'PERMANENT:%'
@@ -401,100 +290,48 @@ def get_pending_tracks(
         LIMIT %s
     """
 
-    while True:
-
-        try:
-
-            with db() as conn:
-                with conn.cursor() as cur:
-
-                    cur.execute(
-                        query,
-                        (limit,),
-                    )
-
-                    return cur.fetchall()
-
-        except Exception as exc:
-
-            if not is_retryable_db_error(exc):
-                raise
-
-            log.warning(
-                "Could not read pending tracks. "
-                "Waiting for PostgreSQL..."
-            )
-
-            time.sleep(
-                retry_delay(
-                    1,
-                    DB_RETRY_DELAY,
-                    DB_MAX_RETRY_DELAY,
-                )
-            )
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (limit,))
+            return cur.fetchall()
 
 
-def mark_error(
-    track_id: int,
-    error: Exception | str,
-    permanent: bool = False,
-):
+def mark_error(track_id: int, error: Exception | str, permanent=False):
     message = str(error).strip()
-
     if permanent:
-        message = (
-            "PERMANENT: "
-            + message
-        )
+        message = "PERMANENT: " + message
 
     with db() as conn:
         with conn.cursor() as cur:
-
             cur.execute(
                 """
                 UPDATE tracks
-                SET
-                    analyzed = FALSE,
-                    ai_error = %s
-                WHERE id = %s
+                SET analyzed=FALSE, ai_error=%s
+                WHERE id=%s
                 """,
-                (
-                    message[:2000],
-                    track_id,
-                ),
+                (message[:2000], track_id),
             )
 
 
-def save_analysis(
-    track_id: int,
-    result: dict,
-):
-    """
-    Save analysis.
-
-    If PostgreSQL temporarily disappears after audio analysis,
-    this waits until DB comes back instead of losing the result.
-    """
-
+def save_analysis(track_id: int, result: dict):
     with db() as conn:
         with conn.cursor() as cur:
-
             cur.execute(
                 """
                 UPDATE tracks
                 SET
-                    bpm = %s,
-                    musical_key = %s,
-                    energy = %s,
-                    danceability = %s,
-                    loudness = %s,
-                    genre = %s,
-                    subgenre = %s,
-                    analyzer_mood = %s,
-                    analyzed = TRUE,
-                    analyzed_at = NOW(),
-                    ai_error = NULL
-                WHERE id = %s
+                    bpm=%s,
+                    musical_key=%s,
+                    energy=%s,
+                    danceability=%s,
+                    loudness=%s,
+                    genre=%s,
+                    subgenre=%s,
+                    analyzer_mood=%s,
+                    analyzed=TRUE,
+                    analyzed_at=NOW(),
+                    ai_error=NULL
+                WHERE id=%s
                 """,
                 (
                     result.get("bpm"),
@@ -515,36 +352,20 @@ def save_analysis(
 # ============================================================
 
 def build_telegram_client():
-
     if not TELETHON_API_ID:
-        raise RuntimeError(
-            "TELETHON_API_ID/API_ID is missing"
-        )
-
+        raise RuntimeError("TELETHON_API_ID/API_ID is missing")
     if not TELETHON_API_HASH:
-        raise RuntimeError(
-            "TELETHON_API_HASH/API_HASH is missing"
-        )
-
+        raise RuntimeError("TELETHON_API_HASH/API_HASH is missing")
     if not TELETHON_SESSION:
-        raise RuntimeError(
-            "TELETHON_SESSION is missing"
-        )
+        raise RuntimeError("TELETHON_SESSION is missing")
 
     try:
-        api_id = int(
-            TELETHON_API_ID
-        )
+        api_id = int(TELETHON_API_ID)
     except ValueError:
-        raise RuntimeError(
-            "TELETHON_API_ID/API_ID "
-            "must be an integer"
-        )
+        raise RuntimeError("TELETHON_API_ID/API_ID must be an integer")
 
     return TelegramClient(
-        StringSession(
-            TELETHON_SESSION
-        ),
+        StringSession(TELETHON_SESSION),
         api_id,
         TELETHON_API_HASH,
         connection_retries=10,
@@ -554,246 +375,106 @@ def build_telegram_client():
     )
 
 
-async def ensure_telegram_connected(
-    client: TelegramClient,
-):
-    """
-    IMPORTANT:
-
-    Telegram connection retry is now INFINITE.
-
-    Network down:
-        wait
-
-    Network returns:
-        reconnect automatically
-
-    Analyzer does not exit because of temporary network loss.
-    """
-
+async def ensure_telegram_connected(client):
     if client.is_connected():
         return
 
     attempt = 0
-
     while True:
-
         attempt += 1
-
         try:
-
-            log.warning(
-                "Telegram reconnect attempt #%s...",
-                attempt,
-            )
-
+            log.info("Telegram reconnect attempt #%s...", attempt)
             await client.connect()
 
             if not await client.is_user_authorized():
-                raise RuntimeError(
-                    "Telethon session is not authorized"
-                )
+                raise RuntimeError("Telethon session is not authorized")
 
-            log.info(
-                "Telegram: CONNECTED"
-            )
-
+            log.info("Telegram: CONNECTED")
             return
 
         except Exception as exc:
-
-            log.warning(
-                "Telegram connection unavailable: %s",
-                exc,
-            )
-
+            log.warning("Telegram connection unavailable: %s", exc)
             with contextlib.suppress(Exception):
                 await client.disconnect()
 
-            delay = retry_delay(
-                attempt,
-                TELEGRAM_RECONNECT_DELAY,
-                60.0,
-            )
-
-            log.warning(
-                "Waiting %.1fs before Telegram reconnect...",
-                delay,
-            )
-
             await asyncio.sleep(
-                delay
+                backoff(attempt, 5, 60)
             )
 
 
-async def reconnect_telegram(
-    client: TelegramClient,
-):
-    log.warning(
-        "Refreshing Telegram connection..."
-    )
-
-    with contextlib.suppress(Exception):
-        await client.disconnect()
-
-    await asyncio.sleep(2)
-
-    await ensure_telegram_connected(
-        client
-    )
-
-
-async def get_telegram_message(
-    client: TelegramClient,
-    channel_id: str,
-    message_id: int,
-):
-
+async def get_telegram_message(client, channel_id, message_id):
     try:
-
         entity = await client.get_entity(
             int(channel_id)
             if str(channel_id).lstrip("-").isdigit()
             else channel_id
         )
-
-    except (
-        PeerIdInvalidError,
-        ChannelPrivateError,
-    ) as exc:
-
+    except (PeerIdInvalidError, ChannelPrivateError) as exc:
         raise PermanentTelegramMessageError(
-            f"Telegram channel unavailable: "
-            f"{channel_id}"
+            f"Telegram channel unavailable: {channel_id}"
         ) from exc
-
     except Exception as exc:
-
         if is_retryable_telegram_error(exc):
-            raise TemporaryTelegramError(
-                str(exc)
-            ) from exc
-
+            raise TemporaryTelegramError(str(exc)) from exc
         raise
 
     try:
-
-        message = await client.get_messages(
-            entity,
-            ids=int(message_id),
-        )
-
+        message = await client.get_messages(entity, ids=int(message_id))
     except MessageIdInvalidError as exc:
-
         raise PermanentTelegramMessageError(
-            f"Telegram message not found: "
-            f"{channel_id}/{message_id}"
+            f"Telegram message not found: {channel_id}/{message_id}"
         ) from exc
-
     except Exception as exc:
-
         if is_retryable_telegram_error(exc):
-            raise TemporaryTelegramError(
-                str(exc)
-            ) from exc
-
+            raise TemporaryTelegramError(str(exc)) from exc
         raise
 
     if message is None:
-
         raise PermanentTelegramMessageError(
-            f"Telegram message not found: "
-            f"{channel_id}/{message_id}"
+            f"Telegram message not found: {channel_id}/{message_id}"
         )
 
     return message
 
 
-async def download_track(
-    client: TelegramClient,
-    channel_id: str,
-    message_id: int,
-    output_path: str,
-):
-    """
-    Download one track.
+async def download_track(client, channel_id, message_id, output_path):
+    last_error = None
 
-    Temporary network failure:
-        keep retrying
-
-    Permanent missing message:
-        stop retrying that track
-    """
-
-    attempt = 0
-
-    while True:
-
-        attempt += 1
-
+    for attempt in range(1, TELEGRAM_RETRIES_PER_TRACK + 1):
         try:
-
-            await ensure_telegram_connected(
-                client
-            )
+            await ensure_telegram_connected(client)
 
             message = await get_telegram_message(
-                client,
-                channel_id,
-                message_id,
+                client, channel_id, message_id
             )
 
-            if not getattr(
-                message,
-                "media",
-                None,
-            ):
+            if not getattr(message, "media", None):
                 raise PermanentTelegramMessageError(
                     "Telegram message has no media"
                 )
 
             log.info(
                 "Telegram download attempt #%s: %s/%s",
-                attempt,
-                channel_id,
-                message_id,
+                attempt, channel_id, message_id
             )
 
             downloaded = await asyncio.wait_for(
-                client.download_media(
-                    message,
-                    file=output_path,
-                ),
+                client.download_media(message, file=output_path),
                 timeout=TELEGRAM_TIMEOUT,
             )
 
-            if not downloaded:
+            if not downloaded or not os.path.exists(downloaded):
                 raise TemporaryTelegramError(
                     "Telegram returned no downloaded file"
                 )
 
-            if not os.path.exists(
-                downloaded
-            ):
-                raise TemporaryTelegramError(
-                    "Downloaded file does not exist"
-                )
-
-            size = os.path.getsize(
-                downloaded
-            )
-
+            size = os.path.getsize(downloaded)
             if size <= 0:
-                raise TemporaryTelegramError(
-                    "Downloaded file is empty"
-                )
+                raise TemporaryTelegramError("Downloaded file is empty")
 
-            if size > (
-                MAX_FILE_MB * 1024 * 1024
-            ):
+            if size > MAX_FILE_MB * 1024 * 1024:
                 raise PermanentTelegramMessageError(
-                    "Downloaded file exceeds "
-                    f"{MAX_FILE_MB} MB limit"
+                    f"Downloaded file exceeds {MAX_FILE_MB} MB limit"
                 )
 
             return downloaded
@@ -802,23 +483,10 @@ async def download_track(
             raise
 
         except FloodWaitError as exc:
-
-            wait_seconds = int(
-                getattr(
-                    exc,
-                    "seconds",
-                    5,
-                )
-            )
-
-            log.warning(
-                "Telegram FloodWait: sleeping %ss",
-                wait_seconds,
-            )
-
-            await asyncio.sleep(
-                wait_seconds + 1
-            )
+            wait_seconds = int(getattr(exc, "seconds", 5))
+            log.warning("Telegram FloodWait: sleeping %ss", wait_seconds)
+            await asyncio.sleep(wait_seconds + 1)
+            last_error = exc
 
         except (
             TemporaryTelegramError,
@@ -827,299 +495,160 @@ async def download_track(
             ConnectionError,
             FileReferenceExpiredError,
         ) as exc:
-
+            last_error = exc
             log.warning(
-                "Telegram temporary error "
-                "attempt #%s: %s",
-                attempt,
-                exc,
+                "Temporary Telegram error attempt %s/%s: %s",
+                attempt, TELEGRAM_RETRIES_PER_TRACK, exc
             )
-
             with contextlib.suppress(Exception):
-                await reconnect_telegram(
-                    client
+                await client.disconnect()
+            await asyncio.sleep(
+                backoff(
+                    attempt,
+                    TELEGRAM_RETRY_DELAY,
+                    TELEGRAM_MAX_RETRY_DELAY,
                 )
-
-            await sleep_backoff(
-                attempt,
-                TELEGRAM_RETRY_DELAY,
-                60.0,
             )
 
         except RPCError as exc:
-
-            if not is_retryable_telegram_error(
-                exc
-            ):
+            if not is_retryable_telegram_error(exc):
                 raise
-
+            last_error = exc
             log.warning(
-                "Telegram RPC temporary error "
-                "attempt #%s: %s",
-                attempt,
-                exc,
+                "Telegram RPC error attempt %s/%s: %s",
+                attempt, TELEGRAM_RETRIES_PER_TRACK, exc
             )
-
             with contextlib.suppress(Exception):
-                await reconnect_telegram(
-                    client
+                await client.disconnect()
+            await asyncio.sleep(
+                backoff(
+                    attempt,
+                    TELEGRAM_RETRY_DELAY,
+                    TELEGRAM_MAX_RETRY_DELAY,
                 )
-
-            await sleep_backoff(
-                attempt,
-                TELEGRAM_RETRY_DELAY,
-                60.0,
             )
 
         except Exception as exc:
-
-            if not is_retryable_telegram_error(
-                exc
-            ):
+            if not is_retryable_telegram_error(exc):
                 raise
-
+            last_error = exc
             log.warning(
-                "Telegram unexpected temporary error "
-                "attempt #%s: %s",
-                attempt,
-                exc,
+                "Telegram error attempt %s/%s: %s",
+                attempt, TELEGRAM_RETRIES_PER_TRACK, exc
             )
-
-            with contextlib.suppress(Exception):
-                await reconnect_telegram(
-                    client
+            await asyncio.sleep(
+                backoff(
+                    attempt,
+                    TELEGRAM_RETRY_DELAY,
+                    TELEGRAM_MAX_RETRY_DELAY,
                 )
-
-            await sleep_backoff(
-                attempt,
-                TELEGRAM_RETRY_DELAY,
-                60.0,
             )
+
+    raise TemporaryTelegramError(
+        f"Telegram download failed after "
+        f"{TELEGRAM_RETRIES_PER_TRACK} attempts: {last_error}"
+    )
 
 
 # ============================================================
 # FFMPEG
 # ============================================================
 
-async def convert_to_wav(
-    input_path: str,
-    output_path: str,
-):
-
+async def convert_to_wav(input_path, output_path):
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-v",
-        "error",
-        "-i",
-        input_path,
-        "-ac",
-        str(CHANNELS),
-        "-ar",
-        str(SAMPLE_RATE),
-        "-t",
-        str(MAX_SECONDS),
-        "-f",
-        "wav",
+        "ffmpeg", "-y", "-v", "error",
+        "-i", input_path,
+        "-ac", str(CHANNELS),
+        "-ar", str(SAMPLE_RATE),
+        "-t", str(MAX_SECONDS),
+        "-f", "wav",
         output_path,
     ]
 
     process = None
-
     try:
-
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-
-        stdout, stderr = await asyncio.wait_for(
+        _, stderr = await asyncio.wait_for(
             process.communicate(),
             timeout=FFMPEG_TIMEOUT,
         )
-
     except asyncio.TimeoutError as exc:
-
-        if process is not None:
+        if process:
             with contextlib.suppress(Exception):
                 process.kill()
-
-        raise RuntimeError(
-            "FFmpeg conversion timed out"
-        ) from exc
+        raise RuntimeError("FFmpeg conversion timed out") from exc
 
     if process.returncode != 0:
+        error = stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError("FFmpeg failed: " + error[:1000])
 
-        error = (
-            stderr.decode(
-                "utf-8",
-                errors="ignore",
-            ).strip()
-        )
-
-        raise RuntimeError(
-            "FFmpeg failed: "
-            + error[:1000]
-        )
-
-    if not os.path.exists(
-        output_path
-    ):
-        raise RuntimeError(
-            "FFmpeg did not create WAV file"
-        )
+    if not os.path.exists(output_path):
+        raise RuntimeError("FFmpeg did not create WAV file")
 
     return output_path
 
 
-def read_wav(
-    path: str,
-):
-
-    with wave.open(
-        path,
-        "rb",
-    ) as wf:
-
+def read_wav(path):
+    with wave.open(path, "rb") as wf:
         channels = wf.getnchannels()
         sample_width = wf.getsampwidth()
         sample_rate = wf.getframerate()
-        frames = wf.getnframes()
-
-        raw = wf.readframes(
-            frames
-        )
+        raw = wf.readframes(wf.getnframes())
 
     if sample_width == 1:
-
         audio = (
-            np.frombuffer(
-                raw,
-                dtype=np.uint8,
-            ).astype(
-                np.float32
-            )
-            - 128
+            np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128
         ) / 128.0
-
     elif sample_width == 2:
-
         audio = (
-            np.frombuffer(
-                raw,
-                dtype=np.int16,
-            ).astype(
-                np.float32
-            )
+            np.frombuffer(raw, dtype=np.int16).astype(np.float32)
             / 32768.0
         )
-
     elif sample_width == 4:
-
         audio = (
-            np.frombuffer(
-                raw,
-                dtype=np.int32,
-            ).astype(
-                np.float32
-            )
+            np.frombuffer(raw, dtype=np.int32).astype(np.float32)
             / 2147483648.0
         )
-
     else:
-
         raise RuntimeError(
-            f"Unsupported WAV sample width: "
-            f"{sample_width}"
+            f"Unsupported WAV sample width: {sample_width}"
         )
 
     if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
 
-        audio = audio.reshape(
-            -1,
-            channels,
-        ).mean(
-            axis=1
-        )
-
-    return (
-        audio,
-        sample_rate,
-    )
+    return audio, sample_rate
 
 
 # ============================================================
-# AUDIO ANALYSIS
+# AUDIO ANALYSIS - NO AI
 # ============================================================
 
-def rms_energy(
-    audio: np.ndarray,
-) -> float:
-
+def rms_energy(audio):
     if len(audio) == 0:
         return 0.0
 
-    rms = float(
-        np.sqrt(
-            np.mean(
-                np.square(audio)
-            )
-        )
-    )
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    value = 20.0 * math.log10(max(rms, 1e-8))
+    normalized = ((value + 40.0) / 40.0) * 100.0
 
-    value = (
-        20.0
-        * math.log10(
-            max(rms, 1e-8)
-        )
-    )
-
-    normalized = (
-        (value + 40.0)
-        / 40.0
-        * 100.0
-    )
-
-    return float(
-        np.clip(
-            normalized,
-            0,
-            100,
-        )
-    )
+    return float(np.clip(normalized, 0, 100))
 
 
-def loudness_db(
-    audio: np.ndarray,
-) -> float:
-
+def loudness_db(audio):
     if len(audio) == 0:
         return -100.0
 
-    rms = float(
-        np.sqrt(
-            np.mean(
-                np.square(audio)
-            )
-        )
-    )
-
-    return float(
-        20.0
-        * math.log10(
-            max(rms, 1e-8)
-        )
-    )
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    return float(20.0 * math.log10(max(rms, 1e-8)))
 
 
-def spectral_features(
-    audio: np.ndarray,
-    sr: int,
-):
-
+def spectral_features(audio, sr):
     if len(audio) < 2:
-
         return {
             "centroid": 0.0,
             "bandwidth": 0.0,
@@ -1127,34 +656,15 @@ def spectral_features(
             "flatness": 0.0,
         }
 
-    n = min(
-        len(audio),
-        sr * 30,
-    )
-
+    n = min(len(audio), sr * 30)
     signal = audio[:n]
+    window = np.hanning(len(signal))
 
-    window = np.hanning(
-        len(signal)
-    )
+    spectrum = np.abs(np.fft.rfft(signal * window))
+    freqs = np.fft.rfftfreq(len(signal), 1.0 / sr)
 
-    spectrum = np.abs(
-        np.fft.rfft(
-            signal * window
-        )
-    )
-
-    freqs = np.fft.rfftfreq(
-        len(signal),
-        1.0 / sr,
-    )
-
-    total = float(
-        np.sum(spectrum)
-    )
-
+    total = float(np.sum(spectrum))
     if total <= 1e-12:
-
         return {
             "centroid": 0.0,
             "bandwidth": 0.0,
@@ -1162,66 +672,22 @@ def spectral_features(
             "flatness": 0.0,
         }
 
-    centroid = float(
-        np.sum(
-            freqs * spectrum
-        )
-        / total
-    )
+    centroid = float(np.sum(freqs * spectrum) / total)
 
     bandwidth = float(
         np.sqrt(
-            np.sum(
-                ((freqs - centroid) ** 2)
-                * spectrum
-            )
-            / total
+            np.sum(((freqs - centroid) ** 2) * spectrum) / total
         )
     )
 
-    cumulative = np.cumsum(
-        spectrum
-    )
+    cumulative = np.cumsum(spectrum)
+    target = cumulative[-1] * 0.85
+    idx = int(np.searchsorted(cumulative, target))
+    rolloff = float(freqs[min(idx, len(freqs) - 1)])
 
-    target = (
-        cumulative[-1] * 0.85
-    )
-
-    rolloff_index = int(
-        np.searchsorted(
-            cumulative,
-            target,
-        )
-    )
-
-    rolloff = float(
-        freqs[
-            min(
-                rolloff_index,
-                len(freqs) - 1,
-            )
-        ]
-    )
-
-    geometric = np.exp(
-        np.mean(
-            np.log(
-                spectrum + 1e-12
-            )
-        )
-    )
-
-    arithmetic = np.mean(
-        spectrum + 1e-12
-    )
-
-    flatness = float(
-        geometric
-        / max(
-            arithmetic,
-            1e-12,
-        )
-    )
+    geometric = np.exp(np.mean(np.log(spectrum + 1e-12)))
+    arithmetic = np.mean(spectrum + 1e-12)
+    flatness = float(geometric / max(arithmetic, 1e-12))
 
     return {
         "centroid": centroid,
@@ -1231,45 +697,23 @@ def spectral_features(
     }
 
 
-def estimate_bpm(
-    audio: np.ndarray,
-    sr: int,
-) -> Optional[float]:
-
+def estimate_bpm(audio, sr):
     if len(audio) < sr * 2:
         return None
 
-    audio = audio.astype(
-        np.float32
-    )
+    audio = audio.astype(np.float32)
+    audio = audio[:min(len(audio), sr * 60)]
 
-    max_samples = sr * 60
-
-    if len(audio) > max_samples:
-        audio = audio[:max_samples]
-
-    diff = np.abs(
-        np.diff(audio)
-    )
-
+    diff = np.abs(np.diff(audio))
     if len(diff) < sr:
         return None
 
-    hop = max(
-        1,
-        int(sr * 0.01),
-    )
+    hop = max(1, int(sr * 0.01))
 
     envelope = np.array(
         [
-            np.mean(
-                diff[i:i + hop]
-            )
-            for i in range(
-                0,
-                len(diff),
-                hop,
-            )
+            np.mean(diff[i:i + hop])
+            for i in range(0, len(diff), hop)
         ],
         dtype=np.float32,
     )
@@ -1277,382 +721,161 @@ def estimate_bpm(
     if len(envelope) < 20:
         return None
 
-    envelope -= np.mean(
-        envelope
-    )
-
-    std = np.std(
-        envelope
-    )
-
+    envelope -= np.mean(envelope)
+    std = np.std(envelope)
     if std <= 1e-9:
         return None
 
     envelope /= std
-
     envelope_rate = sr / hop
 
-    min_bpm = 60.0
-    max_bpm = 200.0
-
-    min_lag = int(
-        envelope_rate
-        * 60.0
-        / max_bpm
-    )
-
-    max_lag = int(
-        envelope_rate
-        * 60.0
-        / min_bpm
-    )
-
-    max_lag = min(
-        max_lag,
-        len(envelope) - 1,
-    )
+    min_bpm, max_bpm = 60.0, 200.0
+    min_lag = int(envelope_rate * 60.0 / max_bpm)
+    max_lag = int(envelope_rate * 60.0 / min_bpm)
+    max_lag = min(max_lag, len(envelope) - 1)
 
     if min_lag >= max_lag:
         return None
 
-    correlations = []
+    best_corr = None
+    best_lag = None
 
-    for lag in range(
-        min_lag,
-        max_lag + 1,
-    ):
-
+    for lag in range(min_lag, max_lag + 1):
         a = envelope[:-lag]
         b = envelope[lag:]
-
         if len(a) == 0:
             continue
 
-        corr = float(
-            np.mean(
-                a * b
-            )
-        )
+        corr = float(np.mean(a * b))
+        if best_corr is None or corr > best_corr:
+            best_corr = corr
+            best_lag = lag
 
-        correlations.append(
-            (
-                corr,
-                lag,
-            )
-        )
-
-    if not correlations:
+    if best_lag is None:
         return None
 
-    _, best_lag = max(
-        correlations,
-        key=lambda x: x[0],
-    )
-
-    bpm = (
-        60.0
-        * envelope_rate
-        / best_lag
-    )
+    bpm = 60.0 * envelope_rate / best_lag
 
     while bpm < 80:
         bpm *= 2
-
     while bpm > 180:
         bpm /= 2
 
-    return round(
-        float(bpm),
-        2,
-    )
+    return round(float(bpm), 2)
 
 
-def estimate_key(
-    audio: np.ndarray,
-    sr: int,
-) -> Optional[str]:
-
+def estimate_key(audio, sr):
     if len(audio) < sr * 2:
         return None
 
-    signal = audio[
-        :min(
-            len(audio),
-            sr * 60,
-        )
-    ]
-
+    signal = audio[:min(len(audio), sr * 60)]
     n_fft = 8192
 
     if len(signal) < n_fft:
         return None
 
-    window = np.hanning(
-        n_fft
-    )
+    window = np.hanning(n_fft)
 
     positions = np.linspace(
         0,
         len(signal) - n_fft,
-        num=min(
-            30,
-            max(
-                1,
-                len(signal)
-                // (sr * 2),
-            ),
-        ),
+        num=min(30, max(1, len(signal) // (sr * 2))),
         dtype=int,
     )
 
-    chroma = np.zeros(
-        12,
-        dtype=np.float64,
-    )
+    chroma = np.zeros(12, dtype=np.float64)
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
 
-    freqs = np.fft.rfftfreq(
-        n_fft,
-        1.0 / sr,
-    )
-
-    valid = (
-        freqs >= 50
-    ) & (
-        freqs <= 5000
-    )
-
+    valid = (freqs >= 50) & (freqs <= 5000)
     freqs = freqs[valid]
-
     if len(freqs) == 0:
         return None
 
-    notes = (
-        12.0
-        * np.log2(
-            freqs / 440.0
-        )
-        + 69.0
-    )
-
-    midi = np.round(
-        notes
-    ).astype(int)
+    notes = 12.0 * np.log2(freqs / 440.0) + 69.0
+    midi = np.round(notes).astype(int)
 
     for pos in positions:
-
-        frame = signal[
-            pos:pos + n_fft
-        ]
-
+        frame = signal[pos:pos + n_fft]
         if len(frame) < n_fft:
             continue
 
-        spectrum = np.abs(
-            np.fft.rfft(
-                frame * window
-            )
-        )[valid]
+        spectrum = np.abs(np.fft.rfft(frame * window))[valid]
 
-        for magnitude, note in zip(
-            spectrum,
-            midi,
-        ):
-
+        for magnitude, note in zip(spectrum, midi):
             if 0 <= magnitude:
-                chroma[
-                    note % 12
-                ] += magnitude
+                chroma[note % 12] += magnitude
 
-    total = np.sum(
-        chroma
-    )
-
+    total = np.sum(chroma)
     if total <= 1e-9:
         return None
 
     chroma /= total
 
     names = [
-        "C",
-        "C#",
-        "D",
-        "D#",
-        "E",
-        "F",
-        "F#",
-        "G",
-        "G#",
-        "A",
-        "A#",
-        "B",
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B",
     ]
 
     major = np.array([
-        6.35,
-        2.23,
-        3.48,
-        2.33,
-        4.38,
-        4.09,
-        2.52,
-        5.19,
-        2.39,
-        3.66,
-        2.29,
-        2.88,
+        6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+        2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
     ])
 
     minor = np.array([
-        6.33,
-        2.68,
-        3.52,
-        5.38,
-        2.60,
-        3.53,
-        2.54,
-        4.75,
-        3.98,
-        2.69,
-        3.34,
-        3.17,
+        6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+        2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
     ])
 
-    major /= np.linalg.norm(
-        major
-    )
-
-    minor /= np.linalg.norm(
-        minor
-    )
+    major /= np.linalg.norm(major)
+    minor /= np.linalg.norm(minor)
 
     best = None
 
     for root in range(12):
+        rotated = np.roll(chroma, -root)
+        rotated /= max(np.linalg.norm(rotated), 1e-12)
 
-        rotated = np.roll(
-            chroma,
-            -root,
-        )
+        major_score = float(np.dot(rotated, major))
+        minor_score = float(np.dot(rotated, minor))
 
-        rotated /= max(
-            np.linalg.norm(
-                rotated
-            ),
-            1e-12,
-        )
-
-        major_score = float(
-            np.dot(
-                rotated,
-                major,
-            )
-        )
-
-        minor_score = float(
-            np.dot(
-                rotated,
-                minor,
-            )
-        )
-
-        if (
-            best is None
-            or major_score > best[0]
-        ):
-
-            best = (
-                major_score,
-                names[root],
-                "Major",
-            )
+        if best is None or major_score > best[0]:
+            best = (major_score, names[root], "Major")
 
         if minor_score > best[0]:
+            best = (minor_score, names[root], "Minor")
 
-            best = (
-                minor_score,
-                names[root],
-                "Minor",
-            )
-
-    if best is None:
+    if best is None or best[0] < 0.45:
         return None
 
-    confidence = best[0]
-
-    if confidence < 0.45:
-        return None
-
-    return (
-        f"{best[1]} "
-        f"{best[2]}"
-    )
+    return f"{best[1]} {best[2]}"
 
 
-def estimate_danceability(
-    audio: np.ndarray,
-    sr: int,
-) -> float:
-
+def estimate_danceability(audio, sr):
     if len(audio) == 0:
         return 0.0
 
-    features = spectral_features(
-        audio,
-        sr,
-    )
+    features = spectral_features(audio, sr)
+    centroid = features["centroid"]
+    rolloff = features["rolloff"]
+    flatness = features["flatness"]
 
-    centroid = features[
-        "centroid"
-    ]
-
-    rolloff = features[
-        "rolloff"
-    ]
-
-    flatness = features[
-        "flatness"
-    ]
-
-    bpm = estimate_bpm(
-        audio,
-        sr,
-    )
-
+    bpm = estimate_bpm(audio, sr)
     bpm_score = 50.0
 
     if bpm is not None:
-
-        bpm_score = (
-            100.0
-            - abs(
-                bpm - 125.0
-            ) * 1.3
-        )
+        bpm_score = 100.0 - abs(bpm - 125.0) * 1.3
 
     centroid_score = np.clip(
-        (
-            centroid - 500
-        )
-        / 3500
-        * 100,
-        0,
-        100,
+        (centroid - 500) / 3500 * 100,
+        0, 100,
     )
 
     rolloff_score = np.clip(
-        (
-            rolloff - 1000
-        )
-        / 5000
-        * 100,
-        0,
-        100,
+        (rolloff - 1000) / 5000 * 100,
+        0, 100,
     )
 
-    flatness_score = (
-        100.0
-        - flatness * 100.0
-    )
+    flatness_score = 100.0 - flatness * 100.0
 
     result = (
         bpm_score * 0.45
@@ -1661,129 +884,51 @@ def estimate_danceability(
         + flatness_score * 0.15
     )
 
-    return round(
-        float(
-            np.clip(
-                result,
-                0,
-                100,
-            )
-        ),
-        2,
-    )
+    return round(float(np.clip(result, 0, 100)), 2)
 
 
-def estimate_mood(
-    audio: np.ndarray,
-    sr: int,
-) -> str:
+def estimate_mood(audio, sr):
+    energy = rms_energy(audio)
+    features = spectral_features(audio, sr)
+    centroid = features["centroid"]
 
-    energy = rms_energy(
-        audio
-    )
-
-    features = spectral_features(
-        audio,
-        sr,
-    )
-
-    centroid = features[
-        "centroid"
-    ]
-
-    bpm = estimate_bpm(
-        audio,
-        sr,
-    )
-
+    bpm = estimate_bpm(audio, sr)
     if bpm is None:
         bpm = 120.0
 
     if energy >= 85 and bpm >= 128:
         return "energetic"
-
     if energy >= 80 and bpm >= 120:
         return "hype"
-
     if energy < 35 and centroid < 1200:
         return "sad"
-
     if energy < 45 and bpm < 105:
         return "night"
-
     if centroid < 1400 and energy < 65:
         return "dark"
-
     if centroid < 1800 and energy < 70:
         return "chill"
-
     if centroid >= 2200 and energy >= 65:
         return "melodic"
 
     return "dark"
 
 
-def analyze_file(
-    wav_path: str,
-) -> dict:
-
-    audio, sr = read_wav(
-        wav_path
-    )
+def analyze_file(wav_path):
+    audio, sr = read_wav(wav_path)
 
     if len(audio) == 0:
-        raise RuntimeError(
-            "Audio contains no samples"
-        )
-
-    bpm = estimate_bpm(
-        audio,
-        sr,
-    )
-
-    key = estimate_key(
-        audio,
-        sr,
-    )
-
-    energy = rms_energy(
-        audio
-    )
-
-    danceability = (
-        estimate_danceability(
-            audio,
-            sr,
-        )
-    )
-
-    loudness = loudness_db(
-        audio
-    )
-
-    mood = estimate_mood(
-        audio,
-        sr,
-    )
+        raise RuntimeError("Audio contains no samples")
 
     return {
-        "bpm": bpm,
-        "key": key,
-        "energy": round(
-            energy,
-            2,
-        ),
-        "danceability": round(
-            danceability,
-            2,
-        ),
-        "loudness": round(
-            loudness,
-            2,
-        ),
+        "bpm": estimate_bpm(audio, sr),
+        "key": estimate_key(audio, sr),
+        "energy": round(rms_energy(audio), 2),
+        "danceability": estimate_danceability(audio, sr),
+        "loudness": round(loudness_db(audio), 2),
         "genre": None,
         "subgenre": None,
-        "mood": mood,
+        "mood": estimate_mood(audio, sr),
     }
 
 
@@ -1791,88 +936,43 @@ def analyze_file(
 # TRACK PROCESSING
 # ============================================================
 
-def safe_filename(
-    title: Optional[str],
-    track_id: int,
-):
-
-    title = (
-        title
-        or f"track_{track_id}"
-    )
-
-    title = str(
-        title
-    ).strip()
-
+def safe_filename(title, track_id):
+    title = str(title or f"track_{track_id}").strip()
     if not title:
         title = f"track_{track_id}"
 
-    title = (
+    return (
         title
         .replace("/", "_")
         .replace("\\", "_")
         .replace("\x00", "")
-    )
-
-    return title[:180]
+    )[:180]
 
 
-async def process_track(
-    client: TelegramClient,
-    track: dict,
-):
-
-    track_id = int(
-        track["id"]
-    )
-
-    channel_id = str(
-        track["channel_id"]
-    )
-
-    message_id = int(
-        track["message_id"]
-    )
-
-    title = track.get(
-        "title"
-    )
-
-    print()
-    print("=" * 60)
-    print(
-        f"TRACK #{track_id} | "
-        f"{title or 'Unknown'}"
-    )
-    print(
-        f"Telegram: "
-        f"{channel_id}/{message_id}"
-    )
-    print("=" * 60)
+async def process_track(client, track):
+    track_id = int(track["id"])
+    channel_id = str(track["channel_id"])
+    message_id = int(track["message_id"])
+    title = track.get("title") or "Unknown"
 
     temp_audio = os.path.join(
         TEMP_DIR,
-        safe_filename(
-            title,
-            track_id,
-        ),
+        f"{safe_filename(title, track_id)}_{track_id}_{message_id}.media",
     )
-
-    temp_audio += (
-        f"_{track_id}_{message_id}.media"
-    )
-
     temp_wav = os.path.join(
         TEMP_DIR,
         f"nyv_analyzer_{track_id}.wav",
     )
 
-    try:
+    print()
+    print("-" * 60)
+    print(f"TRACK ID : {track_id}")
+    print(f"TITLE    : {title}")
+    print(f"TELEGRAM : {channel_id}/{message_id}")
+    print("-" * 60)
 
-        print(
-            "1/4 Downloading Telegram audio..."
-        )
+    try:
+        print("1/4 Downloading Telegram audio...")
 
         downloaded = await download_track(
             client,
@@ -1881,377 +981,180 @@ async def process_track(
             temp_audio,
         )
 
-        print(
-            f"Downloaded: {downloaded}"
-        )
+        print("2/4 Running FFmpeg...")
+        await convert_to_wav(downloaded, temp_wav)
 
-        print(
-            "2/4 Running FFmpeg..."
-        )
+        print("3/4 Analyzing audio...")
+        result = analyze_file(temp_wav)
 
-        await convert_to_wav(
-            downloaded,
-            temp_wav,
-        )
+        print("4/4 Saving PostgreSQL...")
+        save_analysis(track_id, result)
 
-        print(
-            "3/4 Analyzing audio..."
-        )
-
-        result = analyze_file(
-            temp_wav
-        )
-
-        print(
-            "4/4 Saving to PostgreSQL..."
-        )
-
-        save_analysis(
-            track_id,
-            result,
-        )
-
-        print()
-        print(
-            "✅ ANALYZED"
-        )
-        print(
-            f"   BPM:          "
-            f"{result.get('bpm')}"
-        )
-        print(
-            f"   Key:          "
-            f"{result.get('key')}"
-        )
-        print(
-            f"   Energy:       "
-            f"{result.get('energy')}"
-        )
-        print(
-            f"   Danceability: "
-            f"{result.get('danceability')}"
-        )
-        print(
-            f"   Loudness:     "
-            f"{result.get('loudness')}"
-        )
-        print(
-            f"   Mood:         "
-            f"{result.get('mood')}"
-        )
+        print("✅ ANALYZED")
+        print(f"   BPM:          {result.get('bpm')}")
+        print(f"   Key:          {result.get('key')}")
+        print(f"   Energy:       {result.get('energy')}")
+        print(f"   Danceability: {result.get('danceability')}")
+        print(f"   Loudness:     {result.get('loudness')}")
+        print(f"   Mood:         {result.get('mood')}")
 
         return True
 
     except PermanentTelegramMessageError as exc:
-
-        print()
-        print(
-            "❌ PERMANENT FAILURE: "
-            f"{exc}"
-        )
-
-        mark_error(
-            track_id,
-            exc,
-            permanent=True,
-        )
-
+        print(f"❌ PERMANENT: {exc}")
+        mark_error(track_id, exc, permanent=True)
         return False
 
     except Exception as exc:
-
-        print()
-        print(
-            f"❌ FAILED: {exc}"
-        )
-
-        # Temporary failure stays pending.
-        mark_error(
-            track_id,
-            exc,
-            permanent=False,
-        )
-
+        print(f"❌ TEMPORARY FAILED: {exc}")
+        mark_error(track_id, exc, permanent=False)
         return False
 
     finally:
-
-        with contextlib.suppress(Exception):
-
-            if os.path.exists(
-                temp_audio
-            ):
-                os.remove(
-                    temp_audio
-                )
-
-        with contextlib.suppress(Exception):
-
-            if os.path.exists(
-                temp_wav
-            ):
-                os.remove(
-                    temp_wav
-                )
+        for path in (temp_audio, temp_wav):
+            with contextlib.suppress(Exception):
+                if os.path.exists(path):
+                    os.remove(path)
 
 
 # ============================================================
-# MAIN ANALYZER
+# MAIN LOOP
 # ============================================================
 
-async def run_analyzer(
-    limit: int,
-):
-
+async def run_analyzer(limit):
     print()
-    print(
-        "NOT YOUR VIBE AUDIO ANALYZER"
-    )
+    print("NOT YOUR VIBE AUDIO ANALYZER")
+    print("AI: OFF")
+    print("AUTO WATCH: ON")
     print("=" * 60)
 
     client = build_telegram_client()
 
-    total_success = 0
-    total_failed = 0
-    batch_number = 0
+    success_total = 0
+    failed_total = 0
 
     try:
-
-        # ----------------------------------------------------
-        # Keep the Telegram connection alive for the whole run.
-        # ----------------------------------------------------
-
-        await ensure_telegram_connected(
-            client
-        )
-
-        print()
-        print(
-            "Telethon: CONNECTED"
-        )
+        await ensure_telegram_connected(client)
 
         while True:
+            print_progress("CURRENT SCAN")
 
-            batch_number += 1
-
-            print()
-            print(
-                "=" * 60
-            )
-            print(
-                f"SCAN BATCH #{batch_number}"
-            )
-            print(
-                "=" * 60
-            )
-
-            # DB/network failure here waits automatically.
-            tracks = get_pending_tracks(
-                limit
-            )
-
-            print(
-                f"Tracks selected: {len(tracks)}"
-            )
-
-            # ------------------------------------------------
-            # Nothing left to analyze.
-            # ------------------------------------------------
+            tracks = get_pending_tracks(limit)
 
             if not tracks:
+                print()
+                print("✅ CURRENT QUEUE FINISHED")
+                print("No analyzable pending tracks right now.")
+                print(
+                    f"New tracks will be checked every "
+                    f"{WATCH_INTERVAL} seconds."
+                )
+
+                # Keep running forever.
+                # If new tracks are inserted into tracks,
+                # they will automatically be picked up.
+                while True:
+                    await asyncio.sleep(WATCH_INTERVAL)
+
+                    print()
+                    print("🔎 CHECKING FOR NEW TRACKS...")
+                    print_progress("AUTO WATCH")
+
+                    new_tracks = get_pending_tracks(limit)
+
+                    if new_tracks:
+                        print(
+                            f"🆕 FOUND {len(new_tracks)} "
+                            f"PENDING TRACK(S)"
+                        )
+                        tracks = new_tracks
+                        break
+
+                    print("No new tracks yet.")
+
+            for index, track in enumerate(tracks, start=1):
+                await ensure_telegram_connected(client)
+
+                p = get_progress()
 
                 print()
                 print(
-                    "✅ NO PENDING TRACKS"
-                )
-                print(
-                    f"Total Success: {total_success}"
-                )
-                print(
-                    f"Total Failed:  {total_failed}"
+                    f"QUEUE {index}/{len(tracks)} | "
+                    f"TOTAL={p['total']} | "
+                    f"ANALYZED={p['analyzed']} | "
+                    f"REMAINING={p['remaining']}"
                 )
 
-                return 0
+                ok = await process_track(client, track)
 
-            batch_success = 0
-            batch_failed = 0
+                if ok:
+                    success_total += 1
+                else:
+                    failed_total += 1
 
-            for index, track in enumerate(
-                tracks,
-                start=1,
-            ):
-
-                try:
-
-                    # If connection disappeared between tracks,
-                    # this waits and reconnects automatically.
-                    await ensure_telegram_connected(
-                        client
-                    )
-
-                    result = await process_track(
-                        client,
-                        track,
-                    )
-
-                    if result:
-
-                        batch_success += 1
-                        total_success += 1
-
-                    else:
-
-                        batch_failed += 1
-                        total_failed += 1
-
-                except Exception as exc:
-
-                    batch_failed += 1
-                    total_failed += 1
-
-                    log.exception(
-                        "Unhandled track error "
-                        "track_id=%s",
-                        track.get("id"),
-                    )
-
-                    # Do not allow one track to kill analyzer.
-                    with contextlib.suppress(Exception):
-
-                        mark_error(
-                            int(track["id"]),
-                            exc,
-                            permanent=False,
-                        )
+                print_progress("AFTER TRACK")
 
                 if index < len(tracks):
-
-                    await asyncio.sleep(
-                        TRACK_DELAY
-                    )
+                    await asyncio.sleep(TRACK_DELAY)
 
             print()
+            print("=" * 60)
+            print("BATCH FINISHED")
             print(
-                "=" * 60
+                f"RUN SUCCESS={success_total} | "
+                f"RUN FAILED={failed_total}"
             )
-            print(
-                f"BATCH #{batch_number} DONE"
-            )
-            print(
-                f"Success={batch_success} | "
-                f"Failed={batch_failed}"
-            )
-            print(
-                f"TOTAL Success={total_success} | "
-                f"Failed={total_failed}"
-            )
-            print(
-                "=" * 60
-            )
+            print_progress("BATCH RESULT")
+            print("=" * 60)
 
-            # ------------------------------------------------
             # IMPORTANT:
-            #
-            # Do NOT exit after a batch.
-            #
-            # Query PostgreSQL again for pending tracks.
-            # This automatically resumes after temporary
-            # failures and continues until everything is done.
-            # ------------------------------------------------
-
-            await asyncio.sleep(
-                1
-            )
+            # Immediately ask DB for pending tracks again.
+            # Temporary failures remain pending.
+            # Permanent missing/deleted Telegram messages are excluded.
+            await asyncio.sleep(1)
 
     finally:
-
         with contextlib.suppress(Exception):
-
             if client.is_connected():
                 await client.disconnect()
 
-        print()
-        print(
-            "Telethon: DISCONNECTED"
-        )
+        print("Telethon: DISCONNECTED")
 
-
-# ============================================================
-# CLI
-# ============================================================
 
 def parse_args():
-
     parser = argparse.ArgumentParser(
-        description=(
-            "NOT YOUR VIBE Audio Analyzer"
-        )
+        description="NOT YOUR VIBE Audio Analyzer - no AI"
     )
-
     parser.add_argument(
         "--limit",
         type=int,
         default=ANALYZER_LIMIT,
-        help=(
-            "Number of pending tracks "
-            "to process per batch"
-        ),
+        help="Tracks per batch",
     )
-
     return parser.parse_args()
 
 
 def main():
-
     args = parse_args()
 
     if args.limit <= 0:
-
-        raise SystemExit(
-            "--limit must be greater than 0"
-        )
+        raise SystemExit("--limit must be greater than 0")
 
     try:
-
-        failed = asyncio.run(
-            run_analyzer(
-                args.limit
-            )
-        )
-
-        return (
-            2
-            if failed
-            else 0
-        )
-
+        asyncio.run(run_analyzer(args.limit))
     except KeyboardInterrupt:
-
         print()
-        print(
-            "Analyzer stopped by user."
-        )
-
+        print("Analyzer stopped by user.")
         return 130
-
     except Exception as exc:
-
         print()
-        print(
-            "❌ FATAL ANALYZER ERROR:"
-        )
-        print(
-            str(exc)
-        )
-
-        log.exception(
-            "Fatal analyzer error"
-        )
-
+        print("❌ FATAL ANALYZER ERROR:")
+        print(exc)
+        log.exception("Fatal analyzer error")
         return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        main()
-)
+    raise SystemExit(main())
