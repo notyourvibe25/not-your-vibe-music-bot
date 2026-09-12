@@ -1787,11 +1787,35 @@ def radio_track(uid, baseline_mood=None):
     ]
     unliked_pool = [item for item in usable if feedback.get(item[1]) != "like"]
 
+    # Hard BPM gate for every Radio source. A 150 BPM seed must not jump
+    # directly to 120/130 BPM just because taste/popularity scored higher.
+    # Keep the transition within 12 BPM; if no candidate is in range, Radio
+    # reports no suitable track instead of breaking the transition.
+    if last_bpm is not None:
+        fresh_pool = [
+            item for item in fresh_pool
+            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
+        ]
+        liked_pool = [
+            item for item in liked_pool
+            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
+        ]
+        special_pool = [
+            item for item in special_pool
+            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
+        ]
+        unliked_pool = [
+            item for item in unliked_pool
+            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
+        ]
+
     # Exact target mix: fresh 70%, liked 20%, trending/top-10 10%.
     # If a bucket is unavailable, redistribute only that bucket's share.
     buckets = ((fresh_pool, 0.70), (liked_pool, 0.20), (special_pool, 0.10))
     available = [(pool, weight) for pool, weight in buckets if pool]
     if not available:
+        if last_bpm is not None:
+            return None
         pool = unliked_pool or usable
     else:
         pick = random.random() * sum(weight for _, weight in available)
