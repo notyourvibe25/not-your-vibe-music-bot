@@ -8,6 +8,7 @@ import math
 import os
 import random
 import subprocess
+import shutil
 import tempfile
 import time
 import wave
@@ -85,6 +86,10 @@ DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "15"))
 
 TRACK_DELAY = float(os.getenv("ANALYZER_TRACK_DELAY", "1.5"))
 FFMPEG_TIMEOUT = int(os.getenv("ANALYZER_FFMPEG_TIMEOUT", "180"))
+RETRY_BASE_DELAY = float(os.getenv("ANALYZER_RETRY_BASE_DELAY", "300"))
+RETRY_MAX_DELAY = float(os.getenv("ANALYZER_RETRY_MAX_DELAY", "21600"))
+MAX_TRACK_RETRIES = int(os.getenv("ANALYZER_MAX_TRACK_RETRIES", "8"))
+TEMP_FILE_MAX_AGE = int(os.getenv("ANALYZER_TEMP_MAX_AGE", str(24 * 60 * 60)))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -110,6 +115,39 @@ class TemporaryTelegramError(Exception):
 # ============================================================
 # HELPERS
 # ============================================================
+
+def cleanup_old_temp_files():
+    """Delete only analyzer-owned temp folders/files older than 24 hours."""
+    if not os.path.isdir(TEMP_DIR):
+        return
+
+    cutoff = time.time() - TEMP_FILE_MAX_AGE
+    removed = 0
+    for name in os.listdir(TEMP_DIR):
+        if not (
+            name.startswith("nyv_analyzer_")
+            or name.startswith("nyv_analyzer")
+            or name.endswith(".media")
+        ):
+            continue
+        path = os.path.join(TEMP_DIR, name)
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                continue
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.warning("Could not remove old analyzer temp path: %s", path, exc_info=True)
+
+    if removed:
+        log.info("Removed %s analyzer temp path(s) older than %ss", removed, TEMP_FILE_MAX_AGE)
+
+
 
 def normalize_database_url(url: str) -> str:
     if url.startswith("postgres://"):
@@ -213,6 +251,16 @@ def db():
                     conn.close()
 
 
+def ensure_analyzer_schema():
+    """Add retry metadata columns without changing existing track data."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_retry_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_retry_after TIMESTAMPTZ")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tracks_analyzer_retry_after ON tracks(analyzer_retry_after)")
+
+
+
 def get_progress() -> dict:
     query = """
         SELECT
@@ -286,6 +334,7 @@ def get_pending_tracks(limit: int):
                 ai_error IS NULL
                 OR ai_error NOT LIKE 'PERMANENT:%'
             )
+            AND (analyzer_retry_after IS NULL OR analyzer_retry_after <= NOW())
         ORDER BY id ASC
         LIMIT %s
     """
@@ -298,19 +347,42 @@ def get_pending_tracks(limit: int):
 
 def mark_error(track_id: int, error: Exception | str, permanent=False):
     message = str(error).strip()
-    if permanent:
-        message = "PERMANENT: " + message
 
     with db() as conn:
         with conn.cursor() as cur:
+            if permanent:
+                cur.execute(
+                    "UPDATE tracks SET analyzed=FALSE, ai_error=%s, analyzer_retry_after=NULL WHERE id=%s",
+                    ("PERMANENT: " + message[:1980], track_id),
+                )
+                return
+
             cur.execute(
                 """
                 UPDATE tracks
-                SET analyzed=FALSE, ai_error=%s
+                SET analyzed=FALSE,
+                    ai_error=%s,
+                    analyzer_retry_count=COALESCE(analyzer_retry_count, 0) + 1,
+                    analyzer_retry_after=CASE
+                        WHEN COALESCE(analyzer_retry_count, 0) + 1 >= %s THEN NULL
+                        ELSE NOW() + (LEAST(%s, %s * POWER(2, LEAST(COALESCE(analyzer_retry_count, 0), 6))) * INTERVAL '1 second')
+                    END
                 WHERE id=%s
+                RETURNING analyzer_retry_count
                 """,
-                (message[:2000], track_id),
+                (message[:2000], MAX_TRACK_RETRIES, RETRY_MAX_DELAY, RETRY_BASE_DELAY, track_id),
             )
+            row = cur.fetchone()
+            retry_count = int(row["analyzer_retry_count"]) if row else 0
+            if retry_count >= MAX_TRACK_RETRIES:
+                cur.execute(
+                    "UPDATE tracks SET ai_error=%s, analyzer_retry_after=NULL WHERE id=%s",
+                    (f"PERMANENT: retry limit reached ({MAX_TRACK_RETRIES}): {message[:1800]}", track_id),
+                )
+                log.error("Track %s disabled after %s analyzer retries", track_id, retry_count)
+            else:
+                delay = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ** min(retry_count - 1, 6)))
+                log.warning("Track %s retry %s/%s scheduled in %.0fs", track_id, retry_count, MAX_TRACK_RETRIES, delay)
 
 
 def save_analysis(track_id: int, result: dict):
@@ -457,6 +529,11 @@ async def download_track(client, channel_id, message_id, output_path):
                 "Telegram download attempt #%s: %s/%s",
                 attempt, channel_id, message_id
             )
+
+            # Remove a partial file before every retry.
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(output_path)
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
             downloaded = await asyncio.wait_for(
                 client.download_media(message, file=output_path),
@@ -955,14 +1032,13 @@ async def process_track(client, track):
     message_id = int(track["message_id"])
     title = track.get("title") or "Unknown"
 
+    # Isolate every track so retries cannot collide or leave numbered copies.
+    work_dir = tempfile.mkdtemp(prefix=f"nyv_analyzer_{track_id}_", dir=TEMP_DIR)
     temp_audio = os.path.join(
-        TEMP_DIR,
-        f"{safe_filename(title, track_id)}_{track_id}_{message_id}.media",
+        work_dir,
+        f"{safe_filename(title, track_id)}_{track_id}_{message_id}.part",
     )
-    temp_wav = os.path.join(
-        TEMP_DIR,
-        f"nyv_analyzer_{track_id}.wav",
-    )
+    temp_wav = os.path.join(work_dir, f"nyv_analyzer_{track_id}.wav")
 
     print()
     print("-" * 60)
@@ -1011,10 +1087,9 @@ async def process_track(client, track):
         return False
 
     finally:
-        for path in (temp_audio, temp_wav):
-            with contextlib.suppress(Exception):
-                if os.path.exists(path):
-                    os.remove(path)
+        # Remove partial downloads and converted files even after timeout/error.
+        with contextlib.suppress(Exception):
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ============================================================
@@ -1028,6 +1103,8 @@ async def run_analyzer(limit):
     print("AUTO WATCH: ON")
     print("=" * 60)
 
+    ensure_analyzer_schema()
+    cleanup_old_temp_files()
     client = build_telegram_client()
 
     success_total = 0
@@ -1058,6 +1135,7 @@ async def run_analyzer(limit):
 
                     print()
                     print("🔎 CHECKING FOR NEW TRACKS...")
+                    cleanup_old_temp_files()
                     print_progress("AUTO WATCH")
 
                     new_tracks = get_pending_tracks(limit)
