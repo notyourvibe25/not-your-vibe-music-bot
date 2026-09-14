@@ -6,6 +6,7 @@ import contextlib
 import logging
 import math
 import os
+from pathlib import Path
 import random
 import subprocess
 import shutil
@@ -120,14 +121,17 @@ def cleanup_old_temp_files():
     """Delete only analyzer-owned temp folders/files older than 24 hours."""
     if not os.path.isdir(TEMP_DIR):
         return
-
     cutoff = time.time() - TEMP_FILE_MAX_AGE
     removed = 0
+    audio_extensions = {
+        ".aac", ".flac", ".m4a", ".mkv", ".mp3", ".mp4",
+        ".ogg", ".opus", ".wav", ".webm", ".media", ".part",
+    }
     for name in os.listdir(TEMP_DIR):
         if not (
             name.startswith("nyv_analyzer_")
             or name.startswith("nyv_analyzer")
-            or name.endswith(".media")
+            or Path(name).suffix.lower() in audio_extensions
         ):
             continue
         path = os.path.join(TEMP_DIR, name)
