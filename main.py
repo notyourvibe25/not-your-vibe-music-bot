@@ -6348,6 +6348,38 @@ async def scan_all():
     )
 
 
+async def periodic_scan():
+
+    while True:
+
+        await asyncio.sleep(SCAN_INTERVAL)
+
+        if not ready.is_set() or client is None:
+            continue
+
+        try:
+
+            log.info(
+                "periodic channel rescan starting"
+            )
+
+            await scan_all()
+
+            log.info(
+                "periodic channel rescan complete"
+            )
+
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception:
+
+            log.exception(
+                "periodic channel rescan"
+            )
+
+
 # =========================================================
 # TELETHON WORKER
 # =========================================================
@@ -6463,58 +6495,71 @@ def tele_worker():
             asyncio.get_running_loop()
         )
 
-        while True:
+        rescan_task = asyncio.create_task(
+            periodic_scan()
+        )
 
-            try:
+        try:
 
-                await client.connect()
-
-                if not await client.is_user_authorized():
-
-                    log.error(
-                        "Telethon unauthorized"
-                    )
-
-                    return
-
-                ready.set()
-
-                log.info(
-                    "Telethon connected"
-                )
-
-                await scan_all()
-
-                await client.run_until_disconnected()
-
-            except Exception:
-
-                log.exception(
-                    "Telethon error"
-                )
-
-            finally:
-
-                ready.clear()
+            while True:
 
                 try:
 
-                    if client.is_connected():
+                    await client.connect()
 
-                        await client.disconnect()
+                    if not await client.is_user_authorized():
+
+                        log.error(
+                            "Telethon unauthorized"
+                        )
+
+                        return
+
+                    ready.set()
+
+                    log.info(
+                        "Telethon connected"
+                    )
+
+                    await scan_all()
+
+                    await client.run_until_disconnected()
 
                 except Exception:
 
-                    pass
+                    log.exception(
+                        "Telethon error"
+                    )
 
-            log.warning(
-                "Telethon reconnecting in %ss",
-                RECONNECT,
-            )
+                finally:
 
-            await asyncio.sleep(
-                RECONNECT
-            )
+                    ready.clear()
+
+                    try:
+
+                        if client.is_connected():
+
+                            await client.disconnect()
+
+                    except Exception:
+
+                        pass
+
+                log.warning(
+                    "Telethon reconnecting in %ss",
+                    RECONNECT,
+                )
+
+                await asyncio.sleep(
+                    RECONNECT
+                )
+
+        finally:
+
+            rescan_task.cancel()
+
+            with contextlib.suppress(asyncio.CancelledError):
+                await rescan_task
 
     asyncio.run(
         run()
