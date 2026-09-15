@@ -490,6 +490,20 @@ def init_db():
         created_at BIGINT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS pending_comment_replies(
+        admin_id BIGINT PRIMARY KEY,
+        comment_id BIGINT NOT NULL,
+        created_at BIGINT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS broadcast_comment_replies(
+        id BIGSERIAL PRIMARY KEY,
+        comment_id BIGINT NOT NULL,
+        admin_id BIGINT NOT NULL,
+        reply TEXT NOT NULL,
+        created_at BIGINT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS pending_broadcasts(
         user_id BIGINT PRIMARY KEY,
         chat_id BIGINT NOT NULL,
@@ -2561,6 +2575,14 @@ def cleanup_pending():
                 (cutoff,),
             )
 
+            x.execute(
+                """
+                DELETE FROM pending_comment_replies
+                WHERE created_at < %s
+                """,
+                (cutoff,),
+            )
+
 
 def set_pending_broadcast(
     uid,
@@ -2869,6 +2891,68 @@ def save_comment(
                 """,
                 (uid,),
             )
+
+
+def set_pending_comment_reply(admin_id, comment_id):
+
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                INSERT INTO pending_comment_replies(admin_id, comment_id, created_at)
+                VALUES(%s,%s,%s)
+                ON CONFLICT(admin_id) DO UPDATE SET
+                    comment_id=EXCLUDED.comment_id,
+                    created_at=EXCLUDED.created_at
+                """,
+                (admin_id, comment_id, int(time.time())),
+            )
+
+
+def get_pending_comment_reply(admin_id):
+    with db() as c:
+        with cur(c) as x:
+            x.execute("SELECT comment_id FROM pending_comment_replies WHERE admin_id=%s", (admin_id,))
+            r=x.fetchone()
+    return int(r["comment_id"]) if r else None
+
+
+def send_comment_reply(admin_id, comment_id, reply):
+    with db() as c:
+        with cur(c) as x:
+            x.execute("SELECT user_id, broadcast_id, comment FROM broadcast_comments WHERE id=%s", (comment_id,))
+            row=x.fetchone()
+            if not row: return None
+            x.execute(
+                "INSERT INTO broadcast_comment_replies(comment_id, admin_id, reply, created_at) VALUES(%s,%s,%s,%s)",
+                (comment_id, admin_id, reply, int(time.time())),
+            )
+            x.execute("DELETE FROM pending_comment_replies WHERE admin_id=%s", (admin_id,))
+    return row
+
+
+def listener_top5_text():
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT h.user_id, COUNT(*) AS listens, u.username, u.first_name, u.last_name
+                FROM user_history h
+                LEFT JOIN users u ON u.user_id=h.user_id
+                WHERE h.action='served'
+                GROUP BY h.user_id, u.username, u.first_name, u.last_name
+                ORDER BY listens DESC, h.user_id ASC
+                LIMIT 5
+            """)
+            rows=x.fetchall()
+    lines=["🎧 TOP 5 LISTENERS", "━━━━━━━━━━━━━━━━━━", ""]
+    if not rows:
+        lines.append("No listening activity yet.")
+        return "\n".join(lines)
+    for i,row in enumerate(rows,1):
+        name=" ".join(v for v in (row.get("first_name") or "", row.get("last_name") or "") if v).strip()
+        display=f"@{row['username']}" if row.get("username") else (name or f"User {row['user_id']}")
+        lines.append(f"{i}. {display} — 🎵 {int(row['listens'])} tracks")
+    return "\n".join(lines)
 
 
 # =========================================================
@@ -3446,61 +3530,37 @@ def daily_stats():
 # COMMENTS
 # =========================================================
 
-def comments_text(
-    limit=20,
-):
+def comments_text(limit=20):
 
     with db() as c:
-
         with cur(c) as x:
-
-            x.execute(
-                """
-                SELECT
-                    c.id,
-                    c.broadcast_id,
-                    c.user_id,
-                    c.comment,
-                    c.created_at
+            x.execute("""
+                SELECT c.id, c.broadcast_id, c.user_id, c.comment, c.created_at,
+                       u.username, u.first_name, u.last_name
                 FROM broadcast_comments c
-                ORDER BY c.id DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-
-            rows = x.fetchall()
+                LEFT JOIN users u ON u.user_id=c.user_id
+                ORDER BY c.id DESC LIMIT %s
+            """, (limit,))
+            rows=x.fetchall()
 
     if not rows:
+        return "💬 COMMENTS\n\nNo comments yet."
 
-        return (
-            "💬 COMMENTS\n\n"
-            "No comments yet."
-        )
-
-    lines = [
-        "💬 LATEST COMMENTS",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
+    lines=["💬 LATEST COMMENTS", "━━━━━━━━━━━━━━━━━━", ""]
     for a in rows:
-
-        txt = (
-            a["comment"] or ""
-        ).replace(
-            "\n",
-            " ",
-        )[:180]
-
-        lines.append(
-            f"Comment #{a['id']} • "
-            f"Broadcast #{a['broadcast_id']} • "
-            f"User {a['user_id']}\n"
-            f"{txt}\n"
-        )
-
+        txt=(a["comment"] or "").replace("\n"," ")[:180]
+        name=" ".join(v for v in (a.get("first_name") or "", a.get("last_name") or "") if v).strip()
+        username=f"@{a['username']}" if a.get("username") else (name or f"User {a['user_id']}")
+        lines.append(f"💬 #{a['id']} • {username}\nBroadcast #{a['broadcast_id']}\n{txt}\n")
     return "\n".join(lines)
+
+
+def comments_keyboard(limit=20):
+    with db() as c:
+        with cur(c) as x:
+            x.execute("SELECT id FROM broadcast_comments ORDER BY id DESC LIMIT %s", (limit,))
+            rows=x.fetchall()
+    return {"inline_keyboard":[[{"text":f"↩️ Reply #{r['id']}","callback_data":f"cr:{r['id']}"}] for r in rows]} if rows else None
 
 
 # =========================================================
@@ -3545,6 +3605,12 @@ def admin_panel():
                         "🏆 TOP 10 LIKED",
                     "callback_data":
                         "admin:top",
+                },
+                {
+                    "text":
+                        "🎧 TOP 5 LISTENERS",
+                    "callback_data":
+                        "admin:listeners",
                 }
             ],
             [
@@ -5017,6 +5083,16 @@ def callback(c):
             send(
                 chat,
                 comments_text(),
+                comments_keyboard() or admin_panel(),
+            )
+
+            return
+
+        if action == "listeners":
+
+            send(
+                chat,
+                listener_top5_text(),
                 admin_panel(),
             )
 
@@ -5209,6 +5285,29 @@ def callback(c):
             ),
         )
 
+        return
+
+    # =====================================================
+    # COMMENT REPLY (ADMIN)
+    # =====================================================
+
+    if data.startswith("cr:"):
+        if str(uid) != ADMIN_USER_ID:
+            answer(callback_id, "Admin only")
+            return
+        try:
+            comment_id=int(data.split(":",1)[1])
+        except Exception:
+            return
+        with db() as dbc:
+            with cur(dbc) as x:
+                x.execute("SELECT 1 FROM broadcast_comments WHERE id=%s", (comment_id,))
+                if not x.fetchone():
+                    answer(callback_id, "Comment not found")
+                    return
+        set_pending_comment_reply(uid, comment_id)
+        answer(callback_id, "Send your reply")
+        send(chat, f"↩️ Reply to comment #{comment_id} below 👇", {"force_reply":True,"input_field_placeholder":"Write a reply..."})
         return
 
     # =====================================================
@@ -5939,6 +6038,22 @@ def message(m):
             return
 
     # =====================================================
+    # COMMENT REPLY
+    # =====================================================
+
+    pending_reply = get_pending_comment_reply(uid) if str(uid) == ADMIN_USER_ID else None
+    if pending_reply and (m.get("text") or "").strip() and not (m.get("text") or "").strip().startswith("/"):
+        reply_text=(m.get("text") or "").strip()[:2000]
+        row=send_comment_reply(uid, pending_reply, reply_text)
+        if not row:
+            send(chat, "❌ Comment not found.", admin_panel())
+            return
+        target_user=int(row["user_id"])
+        send(target_user, "↩️ REPLY FROM NOT YOUR VIBE\n━━━━━━━━━━━━━━━━━━\n\n" f"Your comment: {str(row['comment'])[:500]}\n\n" f"{reply_text}")
+        send(chat, f"✅ Reply sent to {target_user}.", comments_keyboard() or admin_panel())
+        return
+
+    # =====================================================
     # COMMENT
     # =====================================================
 
@@ -6384,6 +6499,7 @@ def message(m):
         send(
             chat,
             comments_text(),
+            comments_keyboard() or admin_panel(),
         )
 
         return
