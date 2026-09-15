@@ -2152,6 +2152,7 @@ def normal_track(
 def reserve(
     uid,
     track,
+    no_repeat_today=False,
 ):
 
     if not track:
@@ -2167,6 +2168,35 @@ def reserve(
                 """,
                 (uid,),
             )
+
+            if no_repeat_today:
+                today = datetime.now(ZoneInfo("Asia/Yangon")).date()
+                start = int(datetime.combine(
+                    today,
+                    datetime.min.time(),
+                    tzinfo=ZoneInfo("Asia/Yangon"),
+                ).timestamp())
+                end = int(datetime.combine(
+                    today + timedelta(days=1),
+                    datetime.min.time(),
+                    tzinfo=ZoneInfo("Asia/Yangon"),
+                ).timestamp())
+                x.execute(
+                    """
+                    SELECT 1
+                    FROM user_history
+                    WHERE user_id=%s
+                      AND channel_id=%s
+                      AND message_id=%s
+                      AND action='served'
+                      AND sent_at >= %s
+                      AND sent_at < %s
+                    LIMIT 1
+                    """,
+                    (uid, str(track[2]), int(track[1]), start, end),
+                )
+                if x.fetchone():
+                    return None
 
             x.execute(
                 """
@@ -2203,6 +2233,25 @@ def mark_delivery_failed(uid, track):
     try:
         with db() as c:
             with cur(c) as x:
+                x.execute(
+                    """
+                    UPDATE user_history
+                    SET action='delivery_failed'
+                    WHERE id=(
+                        SELECT id
+                        FROM user_history
+                        WHERE user_id=%s
+                          AND channel_id=%s
+                          AND message_id=%s
+                          AND action='served'
+                        ORDER BY sent_at DESC,id DESC
+                        LIMIT 1
+                    )
+                    """,
+                    (uid, str(track[2]), int(track[1])),
+                )
+                if x.rowcount:
+                    return
                 x.execute(
                     """
                     INSERT INTO user_history(
@@ -4222,6 +4271,29 @@ def send_music(
         selected_mood, msg, channel = track
         track_title = None
 
+    # Reserve before sending in Radio. The per-user scheduler lock normally
+    # prevents overlap, but reserving first also protects against duplicate
+    # Radio jobs running in different workers/processes.
+    if radio:
+        reserved = reserve(
+            uid,
+            (selected_mood, msg, channel),
+            no_repeat_today=True,
+        )
+        for _ in range(4):
+            if reserved:
+                break
+            retry_track = radio_track(uid, baseline_mood=mood)
+            if not retry_track:
+                break
+            selected_mood, msg, channel, track_title = retry_track
+            reserved = reserve(
+                uid,
+                (selected_mood, msg, channel),
+                no_repeat_today=True,
+            )
+        if not reserved:
+            return send(chat, "⚠️ No suitable track found.", mood_menu())
     result = copy_music(chat, channel, msg)
     if radio and not result.get("ok"):
         # A DB row can outlive its Telegram message. Mark it unavailable and
@@ -4232,6 +4304,13 @@ def send_music(
             if not retry_track:
                 break
             retry_mood, retry_msg, retry_channel, retry_title = retry_track
+            retry_reserved = reserve(
+                uid,
+                (retry_mood, retry_msg, retry_channel),
+                no_repeat_today=True,
+            )
+            if not retry_reserved:
+                continue
             retry_result = copy_music(chat, retry_channel, retry_msg)
             if retry_result.get("ok"):
                 track = retry_track
@@ -4249,7 +4328,8 @@ def send_music(
         )
         return send(chat, "⚠️ This track could not be delivered.", mood_menu())
 
-    reserve(uid, (selected_mood, msg, channel))
+    if not radio:
+        reserve(uid, (selected_mood, msg, channel))
 
     if radio:
         title = "📻 YOUR RADIO"
