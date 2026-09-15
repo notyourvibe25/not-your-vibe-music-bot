@@ -8,6 +8,7 @@ import random
 import threading
 import math
 import time
+from urllib.parse import quote
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -77,20 +78,14 @@ def norm_db(u):
     )
 
 
-from urllib.parse import quote
-from html import escape
-
 # =========================================================
 # ENVIRONMENT
 # =========================================================
 
 BOT_TOKEN = env("BOT_TOKEN")
-BOT_USERNAME = (
-    env("BOT_USERNAME", "NotYourVibeMusicBot")
-    or "NotYourVibeMusicBot"
-).lstrip("@")
 ADMIN_USER_ID = env("ADMIN_USER_ID")
 DATABASE_URL = env("DATABASE_URL")
+BOT_USERNAME = env("BOT_USERNAME") or "NotYourVibeMusicBot"
 
 RENDER_EXTERNAL_URL = env("RENDER_EXTERNAL_URL") or (
     ("https://" + env("RENDER_EXTERNAL_HOSTNAME"))
@@ -484,8 +479,7 @@ def init_db():
         broadcast_id BIGINT NOT NULL,
         user_id BIGINT NOT NULL,
         comment TEXT NOT NULL,
-        created_at BIGINT NOT NULL,
-        reply_to_comment_id BIGINT
+        created_at BIGINT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS pending_comments(
@@ -499,25 +493,6 @@ def init_db():
         chat_id BIGINT NOT NULL,
         created_at BIGINT NOT NULL
     );
-
-    ALTER TABLE broadcast_comments
-        ADD COLUMN IF NOT EXISTS reply_to_comment_id BIGINT;
-
-    ALTER TABLE pending_comments
-        ADD COLUMN IF NOT EXISTS reply_to_comment_id BIGINT;
-
-    CREATE TABLE IF NOT EXISTS radio_history(
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT NOT NULL,
-        channel_id TEXT NOT NULL,
-        message_id BIGINT NOT NULL,
-        served_day DATE NOT NULL,
-        sent_at BIGINT NOT NULL,
-        UNIQUE(user_id,channel_id,message_id,served_day)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_radio_history_day
-        ON radio_history(user_id,served_day,channel_id,message_id);
 
     CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood);
     CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC);
@@ -905,6 +880,112 @@ def get_track(track_id):
             )
 
             return x.fetchone()
+
+
+def get_shared_track(mood, message_id):
+    try:
+        message_id = int(message_id)
+    except Exception:
+        return None
+
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT
+                    id,
+                    mood,
+                    channel_id,
+                    message_id,
+                    title
+                FROM tracks
+                WHERE mood=%s
+                  AND message_id=%s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (mood, message_id),
+            )
+            return x.fetchone()
+
+
+def track_share_url(mood, message_id, title=None):
+    payload = f"track-{mood}-{int(message_id)}"
+    bot_url = (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start={quote(payload, safe='_-')}"
+    )
+    share_text = (
+        f"🎧 {title or 'Listen on NOT YOUR VIBE'}\n"
+        "Discover this track on NOT YOUR VIBE."
+    )
+    return (
+        "https://t.me/share/url?"
+        f"url={quote(bot_url, safe='')}"
+        f"&text={quote(share_text, safe='')}"
+    )
+
+
+def send_shared_track(chat, uid, payload):
+    parts = payload.split("-", 2)
+    if len(parts) != 3 or parts[0] != "track":
+        return False
+
+    mood = parts[1]
+    message_id = parts[2]
+    if mood not in MOODS:
+        return False
+
+    row = get_shared_track(mood, message_id)
+    if not row:
+        send(
+            chat,
+            "⚠️ This shared track is no longer available.\n\n"
+            "Try /start to discover something new.",
+            mood_menu(),
+        )
+        return True
+
+    result = copy_music(
+        chat,
+        str(row["channel_id"]),
+        int(row["message_id"]),
+    )
+
+    if not result.get("ok"):
+        send(
+            chat,
+            "⚠️ I found the track, but Telegram could not deliver it right now.\n\n"
+            "Please try again in a moment.",
+            mood_menu(),
+        )
+        return True
+
+    reserve(
+        uid,
+        (
+            row["mood"],
+            int(row["message_id"]),
+            str(row["channel_id"]),
+        ),
+    )
+
+    title = row.get("title") or f"Track #{row['message_id']}"
+    send(
+        chat,
+        "🎧 SHARED TRACK\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"{title}\n"
+        f"{INFO[row['mood']][0]}\n\n"
+        "Enjoy the vibe. ✨",
+        buttons(
+            uid,
+            str(row["channel_id"]),
+            int(row["message_id"]),
+            row["mood"],
+        ),
+    )
+    return True
 
 
 # =========================================================
@@ -1400,24 +1481,37 @@ def _radio_history(uid):
 
 
 def _radio_today_served(uid):
-    """Return tracks sent by Radio to this user today only.
+    """Return every track already served to this user today.
 
-    Normal Mood, selected-track, and other special features do not consume
-    Radio's daily no-repeat pool. The date is Yangon-local.
+    Radio treats this as a hard daily freshness boundary: a track served once
+    today must not be sent again by Radio until the date changes.
     """
     served = set()
+
     today = datetime.now(ZoneInfo("Asia/Yangon")).date()
+    start = int(datetime.combine(
+        today,
+        datetime.min.time(),
+        tzinfo=ZoneInfo("Asia/Yangon"),
+    ).timestamp())
+    end = int(datetime.combine(
+        today + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=ZoneInfo("Asia/Yangon"),
+    ).timestamp())
 
     with db() as c:
         with cur(c) as x:
             x.execute(
                 """
                 SELECT channel_id,message_id
-                FROM radio_history
+                FROM user_history
                 WHERE user_id=%s
-                  AND served_day=%s
+                  AND action='served'
+                  AND sent_at >= %s
+                  AND sent_at < %s
                 """,
-                (uid, today),
+                (uid, start, end),
             )
 
             for row in x.fetchall():
@@ -2185,39 +2279,31 @@ def reserve(
 
             if no_repeat_today:
                 today = datetime.now(ZoneInfo("Asia/Yangon")).date()
+                start = int(datetime.combine(
+                    today,
+                    datetime.min.time(),
+                    tzinfo=ZoneInfo("Asia/Yangon"),
+                ).timestamp())
+                end = int(datetime.combine(
+                    today + timedelta(days=1),
+                    datetime.min.time(),
+                    tzinfo=ZoneInfo("Asia/Yangon"),
+                ).timestamp())
                 x.execute(
                     """
                     SELECT 1
-                    FROM radio_history
+                    FROM user_history
                     WHERE user_id=%s
                       AND channel_id=%s
                       AND message_id=%s
-                      AND served_day=%s
+                      AND action='served'
+                      AND sent_at >= %s
+                      AND sent_at < %s
                     LIMIT 1
                     """,
-                    (uid, str(track[2]), int(track[1]), today),
+                    (uid, str(track[2]), int(track[1]), start, end),
                 )
                 if x.fetchone():
-                    return None
-
-                x.execute(
-                    """
-                    INSERT INTO radio_history(
-                        user_id,channel_id,message_id,served_day,sent_at
-                    )
-                    VALUES(%s,%s,%s,%s,%s)
-                    ON CONFLICT(user_id,channel_id,message_id,served_day)
-                    DO NOTHING
-                    """,
-                    (
-                        uid,
-                        str(track[2]),
-                        int(track[1]),
-                        today,
-                        int(time.time()),
-                    ),
-                )
-                if x.rowcount != 1:
                     return None
 
             x.execute(
@@ -2255,23 +2341,6 @@ def mark_delivery_failed(uid, track):
     try:
         with db() as c:
             with cur(c) as x:
-                # A failed Radio delivery must be eligible for retry today.
-                x.execute(
-                    """
-                    DELETE FROM radio_history
-                    WHERE user_id=%s
-                      AND channel_id=%s
-                      AND message_id=%s
-                      AND served_day=%s
-                    """,
-                    (
-                        uid,
-                        str(track[2]),
-                        int(track[1]),
-                        datetime.now(ZoneInfo("Asia/Yangon")).date(),
-                    ),
-                )
-
                 x.execute(
                     """
                     UPDATE user_history
@@ -2512,45 +2581,6 @@ def track_details(ch, msg):
 # BROADCAST
 # =========================================================
 
-def share_broadcast_url(bid):
-    base = (RENDER_EXTERNAL_URL or "").rstrip("/")
-    if not base:
-        return f"https://t.me/{BOT_USERNAME}"
-    return f"{base}/share/broadcast/{int(bid)}"
-
-
-def share_track_url(track_id):
-    base = (RENDER_EXTERNAL_URL or "").rstrip("/")
-    if not base:
-        return f"https://t.me/{BOT_USERNAME}"
-    return f"{base}/share/track/{int(track_id)}"
-
-
-def telegram_share_url(url, text):
-    return (
-        "https://t.me/share/url?url="
-        + quote(url, safe="")
-        + "&text="
-        + quote(text, safe="")
-    )
-
-
-def track_id_by_key(ch, msg):
-    with db() as c:
-        with cur(c) as x:
-            x.execute(
-                """
-                SELECT id, title, mood
-                FROM tracks
-                WHERE channel_id=%s AND message_id=%s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (str(ch), int(msg)),
-            )
-            return x.fetchone()
-
-
 def broadcast_buttons(bid):
 
     with db() as c:
@@ -2559,7 +2589,9 @@ def broadcast_buttons(bid):
 
             x.execute(
                 """
-                SELECT reaction, COUNT(*) AS count
+                SELECT
+                    reaction,
+                    COUNT(*) AS count
                 FROM broadcast_reactions
                 WHERE broadcast_id=%s
                 GROUP BY reaction
@@ -2568,53 +2600,39 @@ def broadcast_buttons(bid):
             )
 
             r = {
-                a["reaction"]: int(a["count"])
+                a["reaction"]:
+                    int(a["count"])
                 for a in x.fetchall()
             }
-
-            x.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM broadcast_comments
-                WHERE broadcast_id=%s
-                """,
-                (bid,),
-            )
-            comment_count = int(x.fetchone()["count"])
 
     return {
         "inline_keyboard": [
             [
                 {
-                    "text": f"❤️ {r.get('love',0)}",
-                    "callback_data": f"br:{bid}:love",
+                    "text":
+                        f"❤️ {r.get('love',0)}",
+                    "callback_data":
+                        f"br:{bid}:love",
                 },
                 {
-                    "text": f"🔥 {r.get('fire',0)}",
-                    "callback_data": f"br:{bid}:fire",
+                    "text":
+                        f"🔥 {r.get('fire',0)}",
+                    "callback_data":
+                        f"br:{bid}:fire",
                 },
                 {
-                    "text": f"👍 {r.get('like',0)}",
-                    "callback_data": f"br:{bid}:like",
-                },
-            ],
-            [
-                {
-                    "text": f"💬 {comment_count}",
-                    "callback_data": f"bcl:{bid}",
-                },
-                {
-                    "text": "↗ SHARE",
-                    "url": telegram_share_url(
-                        share_broadcast_url(bid),
-                        "NOT YOUR VIBE ✨",
-                    ),
+                    "text":
+                        f"👍 {r.get('like',0)}",
+                    "callback_data":
+                        f"br:{bid}:like",
                 },
             ],
             [
                 {
-                    "text": "✍️ COMMENT",
-                    "callback_data": f"bc:{bid}",
+                    "text":
+                        "💬 COMMENT",
+                    "callback_data":
+                        f"bc:{bid}",
                 }
             ],
         ]
@@ -2868,7 +2886,6 @@ def start_broadcast(
 def set_pending_comment(
     uid,
     bid,
-    reply_to_comment_id=None,
 ):
 
     with db() as c:
@@ -2880,20 +2897,18 @@ def set_pending_comment(
                 INSERT INTO pending_comments(
                     user_id,
                     broadcast_id,
-                    reply_to_comment_id,
                     created_at
                 )
-                VALUES(%s,%s,%s,%s)
+                VALUES(%s,%s,%s)
+
                 ON CONFLICT(user_id)
                 DO UPDATE SET
                     broadcast_id=EXCLUDED.broadcast_id,
-                    reply_to_comment_id=EXCLUDED.reply_to_comment_id,
                     created_at=EXCLUDED.created_at
                 """,
                 (
                     uid,
                     bid,
-                    reply_to_comment_id,
                     int(time.time()),
                 ),
             )
@@ -2907,7 +2922,7 @@ def get_pending_comment(uid):
 
             x.execute(
                 """
-                SELECT broadcast_id, reply_to_comment_id
+                SELECT broadcast_id
                 FROM pending_comments
                 WHERE user_id=%s
                 """,
@@ -2916,56 +2931,17 @@ def get_pending_comment(uid):
 
             r = x.fetchone()
 
-    if not r:
-        return None
-
-    return {
-        "broadcast_id": int(r["broadcast_id"]),
-        "reply_to_comment_id": (
-            int(r["reply_to_comment_id"])
-            if r.get("reply_to_comment_id") is not None
-            else None
-        ),
-    }
-
-
-def user_display_name(uid):
-
-    with db() as c:
-
-        with cur(c) as x:
-
-            x.execute(
-                """
-                SELECT username, first_name, last_name
-                FROM users
-                WHERE user_id=%s
-                """,
-                (uid,),
-            )
-
-            u = x.fetchone() or {}
-
-    if u.get("username"):
-        return f"@{u['username']}"
-
-    name = " ".join(
-        value
-        for value in (
-            u.get("first_name") or "",
-            u.get("last_name") or "",
-        )
-        if value
-    ).strip()
-
-    return name or "Vibe Listener"
+    return (
+        int(r["broadcast_id"])
+        if r
+        else None
+    )
 
 
 def save_comment(
     uid,
     bid,
     text,
-    reply_to_comment_id=None,
 ):
 
     with db() as c:
@@ -2978,22 +2954,17 @@ def save_comment(
                     broadcast_id,
                     user_id,
                     comment,
-                    created_at,
-                    reply_to_comment_id
+                    created_at
                 )
-                VALUES(%s,%s,%s,%s,%s)
-                RETURNING id
+                VALUES(%s,%s,%s,%s)
                 """,
                 (
                     bid,
                     uid,
                     text,
                     int(time.time()),
-                    reply_to_comment_id,
                 ),
             )
-
-            comment_id = int(x.fetchone()["id"])
 
             x.execute(
                 """
@@ -3002,122 +2973,6 @@ def save_comment(
                 """,
                 (uid,),
             )
-
-    return comment_id
-
-
-def broadcast_comments_text(bid, limit=20):
-
-    with db() as c:
-
-        with cur(c) as x:
-
-            x.execute(
-                """
-                SELECT
-                    c.id,
-                    c.user_id,
-                    c.comment,
-                    c.created_at,
-                    c.reply_to_comment_id,
-                    u.username,
-                    u.first_name,
-                    u.last_name
-                FROM broadcast_comments c
-                LEFT JOIN users u ON u.user_id=c.user_id
-                WHERE c.broadcast_id=%s
-                ORDER BY c.id DESC
-                LIMIT %s
-                """,
-                (bid, limit),
-            )
-
-            rows = x.fetchall()
-
-    if not rows:
-        return (
-            "💬 COMMENTS\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "No comments yet.\n\n"
-            "Be the first to say something. ✨"
-        )
-
-    lines = [
-        "💬 COMMENTS",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
-    for row in rows:
-        if row.get("username"):
-            author = f"@{row['username']}"
-        else:
-            author = " ".join(
-                value
-                for value in (
-                    row.get("first_name") or "",
-                    row.get("last_name") or "",
-                )
-                if value
-            ).strip() or "Vibe Listener"
-
-        text = (row.get("comment") or "").replace("\n", " ")[:280]
-        prefix = "↳ " if row.get("reply_to_comment_id") else ""
-        lines.append(
-            f"{prefix}💬 {author}\n{text}\n"
-        )
-
-    return "\n".join(lines)
-
-
-def broadcast_comment_buttons(bid, limit=20):
-
-    with db() as c:
-
-        with cur(c) as x:
-
-            x.execute(
-                """
-                SELECT id
-                FROM broadcast_comments
-                WHERE broadcast_id=%s
-                ORDER BY id DESC
-                LIMIT %s
-                """,
-                (bid, limit),
-            )
-
-            ids = [int(row["id"]) for row in x.fetchall()]
-
-    keyboard = [
-        [
-            {
-                "text": "✍️ COMMENT",
-                "callback_data": f"bc:{bid}",
-            },
-            {
-                "text": "↗ SHARE",
-                "url": share_broadcast_url(bid),
-            },
-        ]
-    ]
-
-    for cid in ids:
-        keyboard.append([
-            {
-                "text": f"↩️ Reply #{cid}",
-                "callback_data": f"bcr:{cid}",
-            }
-        ])
-
-    keyboard.append([
-        {
-            "text": "⬅️ BACK",
-            "callback_data": f"bcb:{bid}",
-        }
-    ])
-
-    return {"inline_keyboard": keyboard}
 
 
 # =========================================================
@@ -3710,13 +3565,8 @@ def comments_text(
                     c.broadcast_id,
                     c.user_id,
                     c.comment,
-                    c.created_at,
-                    c.reply_to_comment_id,
-                    u.username,
-                    u.first_name,
-                    u.last_name
+                    c.created_at
                 FROM broadcast_comments c
-                LEFT JOIN users u ON u.user_id=c.user_id
                 ORDER BY c.id DESC
                 LIMIT %s
                 """,
@@ -3740,18 +3590,6 @@ def comments_text(
 
     for a in rows:
 
-        if a.get("username"):
-            author = f"@{a['username']}"
-        else:
-            author = " ".join(
-                value
-                for value in (
-                    a.get("first_name") or "",
-                    a.get("last_name") or "",
-                )
-                if value
-            ).strip() or f"User {a['user_id']}"
-
         txt = (
             a["comment"] or ""
         ).replace(
@@ -3759,16 +3597,496 @@ def comments_text(
             " ",
         )[:180]
 
-        reply = (
-            f" ↩️ reply #{a['reply_to_comment_id']}"
-            if a.get("reply_to_comment_id")
-            else ""
+        lines.append(
+            f"Comment #{a['id']} • "
+            f"Broadcast #{a['broadcast_id']} • "
+            f"User {a['user_id']}\n"
+            f"{txt}\n"
         )
 
+    return "\n".join(lines)
+
+
+# =========================================================
+# ADMIN
+# =========================================================
+
+def admin_panel():
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text":
+                        "📊 DAILY USERS",
+                    "callback_data":
+                        "admin:daily",
+                },
+                {
+                    "text":
+                        "📈 STATS",
+                    "callback_data":
+                        "admin:stats",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "💬 COMMENTS",
+                    "callback_data":
+                        "admin:comments",
+                },
+                {
+                    "text":
+                        "📣 BROADCAST",
+                    "callback_data":
+                        "admin:broadcast",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "🏆 TOP 10 LIKED",
+                    "callback_data":
+                        "admin:top",
+                }
+            ],
+            [
+                {
+                    "text":
+                        "📡 TELETHON",
+                    "callback_data":
+                        "admin:telegram",
+                }
+            ],
+        ]
+    }
+
+
+def admin_dashboard():
+
+    total, today_n, week_n, rows = (
+        daily_stats()
+    )
+
+    track_counts = counts()
+
+    track_total = sum(
+        track_counts.values()
+    )
+
+    with db() as c:
+
+        with cur(c) as x:
+
+            x.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE analyzed=TRUE) AS analyzed
+                FROM tracks
+                """
+            )
+
+            analyzer_row = x.fetchone() or {}
+
+            x.execute(
+                """
+                SELECT COUNT(*) n
+                FROM broadcasts
+                WHERE created_at >= %s
+                """,
+                (
+                    int(time.time())
+                    - 86400,
+                ),
+            )
+
+            recent_24h = int(
+                x.fetchone()["n"]
+            )
+
+    return (
+        "🛠 NOT YOUR VIBE — ADMIN\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Total Users: {total}\n"
+        f"🟢 Today Active: {today_n}\n"
+        f"📅 7-Day Active: {week_n}\n"
+        f"🎵 Tracks: {track_total}\n"
+        f"🎚 Analyzer: {int(analyzer_row.get('analyzed') or 0)} / {int(analyzer_row.get('total') or 0)} scanned\n"
+        f"📣 Broadcasts (24h): {recent_24h}\n\n"
+        f"📡 Telethon: "
+        f"{'CONNECTED' if ready.is_set() else 'DISCONNECTED'}\n"
+        f"🗄 PostgreSQL: "
+        f"{'ONLINE' if db_pool else 'OFFLINE'}"
+    )
+
+
+# =========================================================
+# MOOD MENU
+# =========================================================
+
+def mood_menu():
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": INFO["sad"][0],
+                    "callback_data":
+                        "mood_sad",
+                },
+                {
+                    "text": INFO["love"][0],
+                    "callback_data":
+                        "mood_love",
+                },
+            ],
+            [
+                {
+                    "text": INFO["chill"][0],
+                    "callback_data":
+                        "mood_chill",
+                },
+                {
+                    "text": INFO["hype"][0],
+                    "callback_data":
+                        "mood_hype",
+                },
+            ],
+            [
+                {
+                    "text": INFO["dark"][0],
+                    "callback_data":
+                        "mood_dark",
+                },
+                {
+                    "text": INFO["energetic"][0],
+                    "callback_data":
+                        "mood_energetic",
+                },
+            ],
+            [
+                {
+                    "text": INFO["night"][0],
+                    "callback_data":
+                        "mood_night",
+                },
+                {
+                    "text": INFO["melodic"][0],
+                    "callback_data":
+                        "mood_melodic",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "🔥 DAILY VIBE",
+                    "callback_data":
+                        "daily_vibe",
+                },
+                {
+                    "text":
+                        "🧠 FOR YOU",
+                    "callback_data":
+                        "for_you",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "🎲 SURPRISE ME",
+                    "callback_data":
+                        "surprise_me",
+                },
+                {
+                    "text":
+                        "📈 TRENDING",
+                    "callback_data":
+                        "trending",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "🎵 TRACK OF THE DAY",
+                    "callback_data":
+                        "track_of_day",
+                }
+            ],
+            [
+                {
+                    "text":
+                        "🏆 TOP 10 LIKED",
+                    "callback_data":
+                        "top_liked",
+                }
+            ],
+        ]
+    }
+
+
+# =========================================================
+# ELIGIBLE TRACKS
+# =========================================================
+
+def eligible_tracks(
+    uid,
+    extra_where="",
+    params=(),
+):
+
+    hist = history(uid)
+
+    with db() as c:
+
+        with cur(c) as x:
+
+            q = """
+                SELECT
+                    id,
+                    mood,
+                    message_id,
+                    channel_id,
+                    title
+                FROM tracks
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM track_feedback f
+                    WHERE f.user_id=%s
+                      AND f.channel_id=
+                          tracks.channel_id
+                      AND f.message_id=
+                          tracks.message_id
+                      AND f.feedback=
+                          'not_for_me'
+                )
+            """
+
+            args = [uid]
+
+            if extra_where:
+
+                q += (
+                    " AND "
+                    + extra_where
+                )
+
+                args.extend(
+                    params
+                )
+
+            x.execute(
+                q,
+                args,
+            )
+
+            rows = x.fetchall()
+
+    unseen = [
+        r
+        for r in rows
+        if (
+            str(r["channel_id"]),
+            int(r["message_id"]),
+        ) not in hist
+    ]
+
+    return (
+        unseen
+        or rows
+    )
+
+
+def stable_pick(
+    rows,
+    key,
+):
+
+    if not rows:
+        return None
+
+    idx = int(
+        hashlib.md5(
+            key.encode()
+        ).hexdigest()[:8],
+        16,
+    ) % len(rows)
+
+    r = rows[idx]
+
+    return (
+        r["mood"],
+        int(r["message_id"]),
+        str(r["channel_id"]),
+        r.get("title"),
+    )
+
+
+# =========================================================
+# SPECIAL TRACKS
+# =========================================================
+
+def daily_vibe_track(uid):
+
+    rows = eligible_tracks(uid)
+
+    today = datetime.now(
+        ZoneInfo("Asia/Yangon")
+    ).date().isoformat()
+
+    return stable_pick(
+        rows,
+        f"daily:{uid}:{today}",
+    )
+
+
+def track_of_day(uid):
+
+    rows = eligible_tracks(uid)
+
+    today = datetime.now(
+        ZoneInfo("Asia/Yangon")
+    ).date().isoformat()
+
+    return stable_pick(
+        rows,
+        f"today:{uid}:{today}",
+    )
+
+
+def for_you_track(uid):
+    # FOR YOU = ONLY tracks explicitly liked by this user.
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT t.mood,t.message_id,t.channel_id,t.title
+                FROM tracks t
+                JOIN track_feedback f
+                  ON f.channel_id=t.channel_id
+                 AND f.message_id=t.message_id
+                WHERE f.user_id=%s AND f.feedback='like'
+                ORDER BY f.created_at DESC,t.id DESC
+            """, (uid,))
+            rows=x.fetchall()
+    if not rows: return None
+    h=history(uid)
+    unseen=[r for r in rows if (str(r['channel_id']),int(r['message_id'])) not in h]
+    r=random.choice(unseen or rows)
+    return (r['mood'],int(r['message_id']),str(r['channel_id']),r.get('title'))
+
+def surprise_track(uid):
+
+    r = ratios(uid)
+
+    mood_scores = sorted(
+        [
+            (
+                (
+                    r[m]["not"] + 1
+                )
+                / (
+                    r[m]["like"]
+                    + r[m]["not"]
+                    + 2
+                ),
+                m,
+            )
+            for m in MOODS
+        ],
+        reverse=True,
+    )
+
+    for _, mood in mood_scores:
+
+        rows = eligible_tracks(
+            uid,
+            "mood=%s",
+            (mood,),
+        )
+
+        if rows:
+
+            z = random.choice(
+                rows
+            )
+
+            return (
+                z["mood"],
+                int(
+                    z["message_id"]
+                ),
+                str(
+                    z["channel_id"]
+                ),
+                z.get("title"),
+            )
+
+    return None
+
+
+# =========================================================
+# TASTE
+# =========================================================
+
+def taste_analytics(uid):
+
+    r = ratios(uid)
+
+    total_like = sum(
+        v["like"]
+        for v in r.values()
+    )
+
+    total_not = sum(
+        v["not"]
+        for v in r.values()
+    )
+
+    ranked = sorted(
+        MOODS,
+        key=lambda m: (
+            r[m]["like"],
+            r[m]["like"]
+            - r[m]["not"],
+        ),
+        reverse=True,
+    )
+
+    lines = [
+        "📊 TASTE ANALYTICS",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"❤️ Likes: {total_like}    "
+        f"😴 Not for me: {total_not}",
+    ]
+
+    if total_like + total_not:
+
         lines.append(
-            f"#{a['id']} • {author}{reply}\n"
-            f"Broadcast #{a['broadcast_id']}\n"
-            f"{txt}\n"
+            f"🎯 Positive ratio: "
+            f"{total_like / (total_like + total_not) * 100:.0f}%"
+        )
+
+    lines.append("")
+
+    for mood in ranked:
+
+        likes = r[mood]["like"]
+        nots = r[mood]["not"]
+
+        if likes + nots:
+
+            lines.append(
+                f"{INFO[mood][0]} → "
+                f"❤️ {likes} / 😴 {nots}"
+            )
+
+    if not total_like + total_not:
+
+        lines.append(
+            "Like or skip tracks to "
+            "build your taste profile."
         )
 
     return "\n".join(lines)
@@ -3786,64 +4104,87 @@ def buttons(
     mode=None,
 ):
 
-    f = feedback(uid, ch, msg)
-    radio_active = is_radio(uid)
-    radio_text = "📻 RADIO ✓" if radio_active else "📻 RADIO"
-
-    track_row = track_id_by_key(ch, msg)
-    track_id = int(track_row["id"]) if track_row else None
-    track_title = (
-        (track_row.get("title") if track_row else None)
-        or "NOT YOUR VIBE track"
+    f = feedback(
+        uid,
+        ch,
+        msg,
     )
 
-    keyboard = [
-        [
-            {
-                "text": "❤️✓" if f == "like" else "❤️",
-                "callback_data": f"like:{mood}:{ch}:{msg}",
-            },
-            {
-                "text": "😴✓" if f == "not_for_me" else "😴",
-                "callback_data": f"notme:{mood}:{ch}:{msg}",
-            },
-        ],
-        [
-            {
-                "text": "⏭ NEXT",
-                "callback_data": f"next_special:{mode}" if mode else "next_music",
-            },
-            {
-                "text": radio_text,
-                "callback_data": "radio",
-            },
-        ],
-        [
-            {
-                "text": "↗ SHARE",
-                "url": telegram_share_url(
-                    share_track_url(track_id) if track_id else f"https://t.me/{BOT_USERNAME}",
-                    f"🎵 {track_title} • NOT YOUR VIBE",
-                ),
-            },
-            {
-                "text": "👤 PROFILE",
-                "callback_data": "profile",
-            },
-        ],
-        [
-            {
-                "text": "🆕 NEW TRACKS",
-                "callback_data": "new_tracks",
-            },
-            {
-                "text": "🎛 CHANGE MOOD",
-                "callback_data": "change_mood",
-            },
-        ],
-    ]
+    radio_active = is_radio(uid)
 
-    return {"inline_keyboard": keyboard}
+    radio_text = (
+        "📻 RADIO ✓"
+        if radio_active
+        else "📻 RADIO"
+    )
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text":
+                        "❤️✓"
+                        if f == "like"
+                        else "❤️",
+                    "callback_data":
+                        f"like:{mood}:{ch}:{msg}",
+                },
+                {
+                    "text":
+                        "😴✓"
+                        if f == "not_for_me"
+                        else "😴",
+                    "callback_data":
+                        f"notme:{mood}:{ch}:{msg}",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "⏭ NEXT",
+                    "callback_data":
+                        f"next_special:{mode}" if mode else "next_music",
+                },
+                {
+                    "text":
+                        radio_text,
+                    "callback_data":
+                        "radio",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "👤 PROFILE",
+                    "callback_data":
+                        "profile",
+                },
+                {
+                    "text":
+                        "🆕 NEW TRACKS",
+                    "callback_data":
+                        "new_tracks",
+                },
+            ],
+            [
+                {
+                    "text":
+                        "↗️ SHARE",
+                    "url":
+                        track_share_url(
+                            mood,
+                            msg,
+                        ),
+                },
+                {
+                    "text":
+                        "🎛 CHANGE MOOD",
+                    "callback_data":
+                        "change_mood",
+                }
+            ],
+        ]
+    }
 
 
 # =========================================================
@@ -4062,7 +4403,6 @@ def send_music(
             retry_track = radio_track(uid, baseline_mood=mood)
             if not retry_track:
                 break
-            track = retry_track
             selected_mood, msg, channel, track_title = retry_track
             reserved = reserve(
                 uid,
@@ -4232,12 +4572,6 @@ def schedule_next(
 # PROFILE
 # =========================================================
 
-def share_profile_url(uid):
-    base = (RENDER_EXTERNAL_URL or "").rstrip("/")
-    if not base:
-        return f"https://t.me/{BOT_USERNAME}"
-    return f"{base}/share/profile/{int(uid)}"
-
 def profile_text(uid):
 
     with db() as c:
@@ -4347,87 +4681,19 @@ def profile_text(uid):
     )
 
     return (
-        "👤 VIBE PROFILE 2.0\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"Name: {name}\n"
-        f"Username: {username}\n"
-        f"Current mood: "
-        f"{INFO[mood][0] if mood else 'Not selected'}\n"
-        f"Mode: {radio_status}\n\n"
-        f"🎵 Tracks served: {served}\n"
-        f"❤️ Likes: {likes}\n"
-        f"😴 Not for me: {nots}\n\n"
-        f"🏆 Top mood: {INFO[fav][0]}\n"
-        f"🥈 Second: {INFO[second][0]}\n\n"
-        "Your Radio learns from your "
-        "feedback across all moods."
-    )
-
-
-def public_profile_text(uid):
-
-    with db() as c:
-        with cur(c) as x:
-            x.execute(
-                """
-                SELECT username, first_name, last_name
-                FROM users
-                WHERE user_id=%s
-                """,
-                (uid,),
-            )
-            u = x.fetchone()
-
-            if not u:
-                return "👤 PROFILE\n\nProfile not found."
-
-            x.execute(
-                """
-                SELECT COUNT(*) n
-                FROM track_feedback
-                WHERE user_id=%s AND feedback='like'
-                """,
-                (uid,),
-            )
-            likes = int(x.fetchone()["n"])
-
-            x.execute(
-                """
-                SELECT COUNT(*) n
-                FROM track_feedback
-                WHERE user_id=%s AND feedback='not_for_me'
-                """,
-                (uid,),
-            )
-            nots = int(x.fetchone()["n"])
-
-    r = ratios(uid)
-    ranked = sorted(
-        MOODS,
-        key=lambda m: (r[m]["like"], r[m]["like"] - r[m]["not"]),
-        reverse=True,
-    )
-
-    name = " ".join(
-        value
-        for value in (
-            u.get("first_name") or "",
-            u.get("last_name") or "",
-        )
-        if value
-    ).strip() or "Vibe Listener"
-
-    username = f"@{u['username']}" if u.get("username") else "No username"
-
-    return (
-        "👤 NOT YOUR VIBE\n"
+        "👤 YOUR VIBE PROFILE\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"{name}\n"
         f"{username}\n\n"
-        f"🏆 Top vibe: {INFO[ranked[0]][0]}\n"
-        f"🥈 Second vibe: {INFO[ranked[1]][0]}\n\n"
-        f"❤️ {likes} Likes  •  😴 {nots} Not For Me\n\n"
-        "Music taste shaped by your vibes. ✨"
+        f"🎧 Listening: {INFO[mood][0] if mood else 'Not selected'}\n"
+        f"{radio_status}\n\n"
+        "YOUR TASTE\n"
+        f"❤️ {likes} likes    😴 {nots} not for me\n"
+        f"🎵 {served} tracks discovered\n\n"
+        f"🏆 {INFO[fav][0]}\n"
+        f"🥈 {INFO[second][0]}\n\n"
+        "Radio keeps learning from what you like\n"
+        "and what you skip — across every mood. ✨"
     )
 
 
@@ -4969,69 +5235,6 @@ def callback(c):
         return
 
     # =====================================================
-    # BROADCAST COMMENTS / REPLIES
-    # =====================================================
-
-    if data.startswith("bcl:"):
-        try:
-            bid = int(data.split(":", 1)[1])
-        except Exception:
-            return
-
-        answer(callback_id, "💬 Comments")
-        send(
-            chat,
-            broadcast_comments_text(bid),
-            broadcast_comment_buttons(bid),
-        )
-        return
-
-    if data.startswith("bcb:"):
-        try:
-            bid = int(data.split(":", 1)[1])
-        except Exception:
-            return
-
-        answer(callback_id)
-        edit_k(chat, msg.get("message_id"), broadcast_buttons(bid))
-        return
-
-    if data.startswith("bcr:"):
-        try:
-            comment_id = int(data.split(":", 1)[1])
-        except Exception:
-            return
-
-        with db() as dbc:
-            with cur(dbc) as x:
-                x.execute(
-                    """
-                    SELECT id, broadcast_id
-                    FROM broadcast_comments
-                    WHERE id=%s
-                    """,
-                    (comment_id,),
-                )
-                row = x.fetchone()
-
-        if not row:
-            answer(callback_id, "Comment not found")
-            return
-
-        set_pending_comment(uid, int(row["broadcast_id"]), comment_id)
-        answer(callback_id, "Reply ready")
-        send(
-            chat,
-            f"↩️ Replying to comment #{comment_id}\n\n"
-            "Send your reply below 👇",
-            {
-                "force_reply": True,
-                "input_field_placeholder": "Write a reply...",
-            },
-        )
-        return
-
-    # =====================================================
     # BROADCAST COMMENT
     # =====================================================
 
@@ -5295,17 +5498,6 @@ def callback(c):
                             "callback_data":
                                 "radio",
                         },
-                    ],
-                    [
-                        {
-                            "text":
-                                "↗ SHARE PROFILE",
-                            "url":
-                                telegram_share_url(
-                                    share_profile_url(uid),
-                                    "👤 NOT YOUR VIBE profile",
-                                ),
-                        }
                     ],
                     [
                         {
@@ -5739,120 +5931,56 @@ def message(m):
             or ""
         ).strip()[:2000]
 
-        bid = pending_comment["broadcast_id"]
-        reply_to = pending_comment.get("reply_to_comment_id")
-        comment_id = save_comment(
+        save_comment(
             uid,
-            bid,
+            pending_comment,
             text,
-            reply_to,
         )
-
-        author = user_display_name(uid)
-        if reply_to:
-            with db() as dbc:
-                with cur(dbc) as x:
-                    x.execute(
-                        """
-                        SELECT user_id, comment
-                        FROM broadcast_comments
-                        WHERE id=%s
-                        """,
-                        (reply_to,),
-                    )
-                    parent = x.fetchone()
-
-            if parent and int(parent["user_id"]) != uid:
-                send(
-                    int(parent["user_id"]),
-                    "↩️ NEW REPLY\n"
-                    "━━━━━━━━━━━━━━━━━━\n\n"
-                    f"{author} replied to your comment:\n\n"
-                    f"{text}",
-                )
 
         send(
             ADMIN_USER_ID,
             "💬 NEW COMMENT\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"Broadcast: #{bid}\n"
-            f"Comment: #{comment_id}\n"
-            f"User: {author}\n"
-            + (f"Reply to: #{reply_to}\n" if reply_to else "")
-            + f"\n{text}",
+            f"Broadcast: #{pending_comment}\n"
+            f"User: {uid}\n\n"
+            f"{text}",
         )
 
         send(
             chat,
-            "✅ Reply posted. ✨" if reply_to else "✅ Comment posted. ✨",
+            "✅ Thanks! Your comment was sent "
+            "to the Not Your Vibe team.",
             mood_menu(),
         )
 
         return
 
     # =====================================================
-    # START / SHARED LINKS / MOOD
+    # START / MOOD
     # =====================================================
 
-    raw_text = (m.get("text") or "").strip()
-    start_payload = ""
-    if cmd == "/start" and " " in raw_text:
-        start_payload = raw_text.split(" ", 1)[1].strip()
+    raw_text = (
+        m.get("text")
+        or ""
+    ).strip()
 
-    if start_payload.startswith("track_"):
-        try:
-            track_id = int(start_payload.split("_", 1)[1])
-        except Exception:
-            track_id = None
-        if track_id:
-            answer_text = "▶️ Shared track"
-            send(chat, answer_text)
-            play_selected_track(chat, uid, track_id, header="▶️ SHARED TRACK")
-            return
+    if cmd == "/start":
+        start_parts = raw_text.split(
+            maxsplit=1
+        )
+        start_payload = (
+            start_parts[1].strip()
+            if len(start_parts) > 1
+            else ""
+        )
 
-    if start_payload.startswith("profile_"):
-        try:
-            profile_uid = int(start_payload.split("_", 1)[1])
-        except Exception:
-            profile_uid = None
-        if profile_uid:
-            send(
+        if start_payload.startswith("track-"):
+            if send_shared_track(
                 chat,
-                public_profile_text(profile_uid),
-                mood_menu(),
-            )
-            return
-
-    if start_payload.startswith("broadcast_"):
-        try:
-            bid = int(start_payload.split("_", 1)[1])
-        except Exception:
-            bid = None
-        if bid:
-            with db() as dbc:
-                with cur(dbc) as x:
-                    x.execute(
-                        """
-                        SELECT source_chat_id, source_message_id
-                        FROM broadcasts
-                        WHERE id=%s
-                        """,
-                        (bid,),
-                    )
-                    b = x.fetchone()
-            if b:
-                result = tg(
-                    "copyMessage",
-                    {
-                        "chat_id": chat,
-                        "from_chat_id": b["source_chat_id"],
-                        "message_id": b["source_message_id"],
-                        "reply_markup": broadcast_buttons(bid),
-                    },
-                    30,
-                )
-                if result.get("ok"):
-                    return
+                uid,
+                start_payload,
+            ):
+                return
 
     if cmd in (
         "/start",
@@ -5974,29 +6102,7 @@ def message(m):
         send(
             chat,
             profile_text(uid),
-            {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "↗ SHARE PROFILE",
-                            "url": telegram_share_url(
-                                share_profile_url(uid),
-                                "👤 NOT YOUR VIBE profile",
-                            ),
-                        }
-                    ],
-                    [
-                        {
-                            "text": "🎛 CHANGE MOOD",
-                            "callback_data": "change_mood",
-                        },
-                        {
-                            "text": "📻 RADIO",
-                            "callback_data": "radio",
-                        },
-                    ],
-                ]
-            },
+            mood_menu(),
         )
 
         return
@@ -6362,85 +6468,6 @@ def home():
 
     return (
         "🎧 NOT YOUR VIBE MUSIC BOT ONLINE"
-    )
-
-
-def _share_page(title, description, open_url):
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{escape(title)}</title>
-<meta property="og:title" content="{escape(title)}">
-<meta property="og:description" content="{escape(description)}">
-<meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="{escape(title)}">
-<meta name="twitter:description" content="{escape(description)}">
-<style>
-body{{margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,-apple-system,sans-serif}}
-main{{max-width:560px;margin:12vh auto;padding:32px;text-align:center}}
-.card{{padding:32px;border:1px solid #292933;border-radius:24px;background:#121218}}
-h1{{font-size:28px;margin:0 0 12px}}p{{color:#b7b7c2;line-height:1.55}}a{{display:inline-block;margin-top:18px;padding:12px 18px;border-radius:999px;background:#fff;color:#111;text-decoration:none;font-weight:700}}
-.small{{font-size:13px;color:#777784;margin-top:20px}}
-</style>
-</head>
-<body><main><div class="card"><div>🎧</div><h1>{escape(title)}</h1><p>{escape(description)}</p><a href="{escape(open_url)}">Open in NOT YOUR VIBE</a><div class="small">Your music. Your mood. Your vibe.</div></div></main></body></html>"""
-
-
-@app.route("/share/track/<int:track_id>")
-def share_track_page(track_id):
-    row = get_track(track_id)
-    if not row:
-        return _share_page(
-            "NOT YOUR VIBE",
-            "Shared track not found.",
-            f"https://t.me/{BOT_USERNAME}",
-        )
-
-    title = row.get("title") or f"Track #{row['message_id']}"
-    mood = INFO.get(row.get("mood"), ("🎧", ""))[0]
-    bot_url = f"https://t.me/{BOT_USERNAME}?start=track_{track_id}"
-    return _share_page(
-        f"{title} • NOT YOUR VIBE",
-        f"{mood} A track from NOT YOUR VIBE. Tap to open it in Telegram.",
-        bot_url,
-    )
-
-
-@app.route("/share/profile/<int:profile_uid>")
-def share_profile_page(profile_uid):
-    text = public_profile_text(profile_uid)
-    lines = [line for line in text.splitlines() if line.strip()]
-    title = lines[2] if len(lines) > 2 else "Vibe Listener"
-    username = next((line for line in lines if line.startswith("@")), "")
-    bot_url = f"https://t.me/{BOT_USERNAME}?start=profile_{profile_uid}"
-    return _share_page(
-        f"{title} • NOT YOUR VIBE",
-        f"{username} • Music taste and vibes on NOT YOUR VIBE.",
-        bot_url,
-    )
-
-
-@app.route("/share/broadcast/<int:bid>")
-def share_broadcast_page(bid):
-    with db() as c:
-        with cur(c) as x:
-            x.execute(
-                """
-                SELECT text
-                FROM broadcasts
-                WHERE id=%s
-                """,
-                (bid,),
-            )
-            row = x.fetchone()
-    description = (row.get("text") if row else None) or "A NOT YOUR VIBE community post."
-    bot_url = f"https://t.me/{BOT_USERNAME}?start=broadcast_{bid}"
-    return _share_page(
-        "NOT YOUR VIBE • Community",
-        description[:180],
-        bot_url,
     )
 
 
