@@ -8,6 +8,7 @@ import random
 import threading
 import math
 import time
+from html import escape
 from urllib.parse import quote
 
 from datetime import datetime, timedelta
@@ -83,9 +84,9 @@ def norm_db(u):
 # =========================================================
 
 BOT_TOKEN = env("BOT_TOKEN")
+BOT_USERNAME = (env("BOT_USERNAME", "NotYourVibeMusicBot") or "NotYourVibeMusicBot").lstrip("@")
 ADMIN_USER_ID = env("ADMIN_USER_ID")
 DATABASE_URL = env("DATABASE_URL")
-BOT_USERNAME = env("BOT_USERNAME") or "NotYourVibeMusicBot"
 
 RENDER_EXTERNAL_URL = env("RENDER_EXTERNAL_URL") or (
     ("https://" + env("RENDER_EXTERNAL_HOSTNAME"))
@@ -880,112 +881,6 @@ def get_track(track_id):
             )
 
             return x.fetchone()
-
-
-def get_shared_track(mood, message_id):
-    try:
-        message_id = int(message_id)
-    except Exception:
-        return None
-
-    with db() as c:
-        with cur(c) as x:
-            x.execute(
-                """
-                SELECT
-                    id,
-                    mood,
-                    channel_id,
-                    message_id,
-                    title
-                FROM tracks
-                WHERE mood=%s
-                  AND message_id=%s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (mood, message_id),
-            )
-            return x.fetchone()
-
-
-def track_share_url(mood, message_id, title=None):
-    payload = f"track-{mood}-{int(message_id)}"
-    bot_url = (
-        f"https://t.me/{BOT_USERNAME}"
-        f"?start={quote(payload, safe='_-')}"
-    )
-    share_text = (
-        f"🎧 {title or 'Listen on NOT YOUR VIBE'}\n"
-        "Discover this track on NOT YOUR VIBE."
-    )
-    return (
-        "https://t.me/share/url?"
-        f"url={quote(bot_url, safe='')}"
-        f"&text={quote(share_text, safe='')}"
-    )
-
-
-def send_shared_track(chat, uid, payload):
-    parts = payload.split("-", 2)
-    if len(parts) != 3 or parts[0] != "track":
-        return False
-
-    mood = parts[1]
-    message_id = parts[2]
-    if mood not in MOODS:
-        return False
-
-    row = get_shared_track(mood, message_id)
-    if not row:
-        send(
-            chat,
-            "⚠️ This shared track is no longer available.\n\n"
-            "Try /start to discover something new.",
-            mood_menu(),
-        )
-        return True
-
-    result = copy_music(
-        chat,
-        str(row["channel_id"]),
-        int(row["message_id"]),
-    )
-
-    if not result.get("ok"):
-        send(
-            chat,
-            "⚠️ I found the track, but Telegram could not deliver it right now.\n\n"
-            "Please try again in a moment.",
-            mood_menu(),
-        )
-        return True
-
-    reserve(
-        uid,
-        (
-            row["mood"],
-            int(row["message_id"]),
-            str(row["channel_id"]),
-        ),
-    )
-
-    title = row.get("title") or f"Track #{row['message_id']}"
-    send(
-        chat,
-        "🎧 SHARED TRACK\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"{title}\n"
-        f"{INFO[row['mood']][0]}\n\n"
-        "Enjoy the vibe. ✨",
-        buttons(
-            uid,
-            str(row["channel_id"]),
-            int(row["message_id"]),
-            row["mood"],
-        ),
-    )
-    return True
 
 
 # =========================================================
@@ -4096,6 +3991,17 @@ def taste_analytics(uid):
 # MUSIC BUTTONS
 # =========================================================
 
+def share_track_id(channel_id, message_id):
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                "SELECT id FROM tracks WHERE channel_id=%s AND message_id=%s ORDER BY id DESC LIMIT 1",
+                (str(channel_id), int(message_id)),
+            )
+            row = x.fetchone()
+    return int(row["id"]) if row else None
+
+
 def buttons(
     uid,
     ch,
@@ -4155,10 +4061,18 @@ def buttons(
             [
                 {
                     "text":
+                        "↗️ SHARE",
+                    "url":
+                        f"https://t.me/share/url?url={quote(f'{RENDER_EXTERNAL_URL.rstrip("/")}/share/track/{share_track_id(ch, msg)}' if share_track_id(ch, msg) else f'https://t.me/{BOT_USERNAME}', safe='')}&text={quote('🎵 NOT YOUR VIBE', safe='')}",
+                },
+                {
+                    "text":
                         "👤 PROFILE",
                     "callback_data":
                         "profile",
                 },
+            ],
+            [
                 {
                     "text":
                         "🆕 NEW TRACKS",
@@ -4167,15 +4081,6 @@ def buttons(
                 },
             ],
             [
-                {
-                    "text":
-                        "↗️ SHARE",
-                    "url":
-                        track_share_url(
-                            mood,
-                            msg,
-                        ),
-                },
                 {
                     "text":
                         "🎛 CHANGE MOOD",
@@ -4681,19 +4586,72 @@ def profile_text(uid):
     )
 
     return (
-        "👤 YOUR VIBE PROFILE\n"
+        "👤 YOUR VIBE\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"{name}\n"
         f"{username}\n\n"
-        f"🎧 Listening: {INFO[mood][0] if mood else 'Not selected'}\n"
-        f"{radio_status}\n\n"
-        "YOUR TASTE\n"
-        f"❤️ {likes} likes    😴 {nots} not for me\n"
+        f"{INFO[mood][0] if mood else '🎧'}  "
+        f"{INFO[mood][1] if mood else 'Your current vibe'}\n"
+        f"📻 Radio: {radio_status}\n\n"
+        f"❤️ {likes} liked\n"
+        f"😴 {nots} skipped\n"
         f"🎵 {served} tracks discovered\n\n"
-        f"🏆 {INFO[fav][0]}\n"
-        f"🥈 {INFO[second][0]}\n\n"
-        "Radio keeps learning from what you like\n"
-        "and what you skip — across every mood. ✨"
+        f"🏆 Top vibe  {INFO[fav][0]}\n"
+        f"🥈 Next vibe  {INFO[second][0]}"
+    )
+
+
+def public_profile_text(profile_uid):
+
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT username, first_name, last_name
+                FROM users
+                WHERE user_id=%s
+                """,
+                (profile_uid,),
+            )
+            u = x.fetchone()
+
+            if not u:
+                return "👤 PROFILE\n\nProfile not found."
+
+            x.execute(
+                """
+                SELECT COUNT(*) n
+                FROM track_feedback
+                WHERE user_id=%s AND feedback='like'
+                """,
+                (profile_uid,),
+            )
+            likes = int(x.fetchone()["n"])
+
+            x.execute(
+                """
+                SELECT COUNT(*) n
+                FROM user_history
+                WHERE user_id=%s AND action='served'
+                """,
+                (profile_uid,),
+            )
+            served = int(x.fetchone()["n"])
+
+    r = ratios(profile_uid)
+    ranked = sorted(MOODS, key=lambda m: (r[m]["like"], r[m]["like"] - r[m]["not"]), reverse=True)
+    name = " ".join(v for v in (u.get("first_name") or "", u.get("last_name") or "") if v).strip() or "Vibe Listener"
+    username = f"@{u['username']}" if u.get("username") else "Vibe Listener"
+
+    return (
+        "👤 NOT YOUR VIBE\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"{name}\n"
+        f"{username}\n\n"
+        f"🏆 {INFO[ranked[0]][0]}\n"
+        f"🥈 {INFO[ranked[1]][0]}\n\n"
+        f"❤️ {likes} liked  •  🎵 {served} discovered\n\n"
+        "A personal taste profile from NOT YOUR VIBE."
     )
 
 
@@ -5480,6 +5438,14 @@ def callback(c):
                     [
                         {
                             "text":
+                                "↗️ SHARE PROFILE",
+                            "url":
+                                f"https://t.me/share/url?url={quote(f'{RENDER_EXTERNAL_URL.rstrip("/")}/share/profile/{uid}', safe='')}&text={quote('👤 My NOT YOUR VIBE profile', safe='')}",
+                        }
+                    ],
+                    [
+                        {
+                            "text":
                                 "📊 TASTE ANALYTICS",
                             "callback_data":
                                 "taste_analytics",
@@ -5819,12 +5785,59 @@ def message(m):
 
     cleanup_pending()
 
-    cmd = command(
-        (
-            m.get("text")
-            or ""
-        ).strip()
-    )
+    raw_text = (m.get("text") or "").strip()
+    cmd = command(raw_text)
+
+    # =====================================================
+    # TELEGRAM SHARE DEEP LINKS
+    # =====================================================
+
+    if cmd == "/start" and " " in raw_text:
+
+        payload = raw_text.split(" ", 1)[1].strip()
+
+        if payload.startswith("track_"):
+            try:
+                track_id = int(payload.split("_", 1)[1])
+            except Exception:
+                track_id = 0
+
+            if track_id:
+                play_selected_track(
+                    chat,
+                    uid,
+                    track_id,
+                    header="▶️ SHARED TRACK",
+                )
+                return
+
+        if payload.startswith("profile_"):
+            try:
+                profile_uid = int(payload.split("_", 1)[1])
+            except Exception:
+                profile_uid = 0
+
+            if profile_uid:
+                send(
+                    chat,
+                    public_profile_text(profile_uid),
+                    {
+                        "inline_keyboard": [
+                            [{
+                                "text": "↗️ SHARE PROFILE",
+                                "url": f"https://t.me/share/url?url={quote(f'https://t.me/{BOT_USERNAME}?start=profile_{profile_uid}', safe='')}&text={quote('👤 NOT YOUR VIBE profile', safe='')}",
+                            }],
+                            [{
+                                "text": "🎛 CHANGE MOOD",
+                                "callback_data": "change_mood",
+                            }, {
+                                "text": "📻 RADIO",
+                                "callback_data": "radio",
+                            }],
+                        ]
+                    },
+                )
+                return
 
     # =====================================================
     # ADMIN BROADCAST PENDING
@@ -5958,29 +5971,6 @@ def message(m):
     # =====================================================
     # START / MOOD
     # =====================================================
-
-    raw_text = (
-        m.get("text")
-        or ""
-    ).strip()
-
-    if cmd == "/start":
-        start_parts = raw_text.split(
-            maxsplit=1
-        )
-        start_payload = (
-            start_parts[1].strip()
-            if len(start_parts) > 1
-            else ""
-        )
-
-        if start_payload.startswith("track-"):
-            if send_shared_track(
-                chat,
-                uid,
-                start_payload,
-            ):
-                return
 
     if cmd in (
         "/start",
@@ -6470,6 +6460,26 @@ def home():
         "🎧 NOT YOUR VIBE MUSIC BOT ONLINE"
     )
 
+
+def share_page(title, description, bot_link):
+    return f"""<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{escape(title)}</title><meta property=\"og:title\" content=\"{escape(title)}\"><meta property=\"og:description\" content=\"{escape(description)}\"><meta name=\"twitter:card\" content=\"summary\"><meta name=\"twitter:title\" content=\"{escape(title)}\"><meta name=\"twitter:description\" content=\"{escape(description)}\"><style>body{{margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,-apple-system,sans-serif}}main{{max-width:560px;margin:12vh auto;padding:24px}}.card{{border:1px solid #292933;border-radius:24px;padding:30px;text-align:center;background:#121218}}h1{{font-size:28px;margin:8px 0 12px}}p{{color:#b7b7c2;line-height:1.5}}a{{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:999px;background:#fff;color:#111;text-decoration:none;font-weight:700}}</style></head><body><main><div class=\"card\"><div>🎧</div><h1>{escape(title)}</h1><p>{escape(description)}</p><a href=\"{escape(bot_link)}\">Open in Telegram</a></div></main></body></html>"""
+
+@app.route("/share/track/<int:track_id>")
+def share_track_page(track_id):
+    row = get_track(track_id)
+    if not row:
+        return share_page("NOT YOUR VIBE", "This track is no longer available.", f"https://t.me/{BOT_USERNAME}")
+    title = str(row.get("title") or f"Track #{row['message_id']}")[:160]
+    return share_page(f"{title} • NOT YOUR VIBE", "Open this track in NOT YOUR VIBE on Telegram.", f"https://t.me/{BOT_USERNAME}?start=track_{track_id}")
+
+@app.route("/share/profile/<int:profile_uid>")
+def share_profile_page(profile_uid):
+    text = public_profile_text(profile_uid)
+    if "Profile not found" in text:
+        return share_page("NOT YOUR VIBE", "Profile not found.", f"https://t.me/{BOT_USERNAME}")
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    name = lines[2] if len(lines) > 2 else "Vibe Listener"
+    return share_page(f"{name} • NOT YOUR VIBE", "A personal EDM taste profile.", f"https://t.me/{BOT_USERNAME}?start=profile_{profile_uid}")
 
 @app.route("/health")
 def health():
