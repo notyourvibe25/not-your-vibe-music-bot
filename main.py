@@ -57,6 +57,15 @@ def geti(n, d, lo, hi):
     return v if lo <= v <= hi else d
 
 
+def getf(n, d, lo, hi):
+    try:
+        v = float(env(n, str(d)))
+    except (TypeError, ValueError):
+        return d
+
+    return v if lo <= v <= hi else d
+
+
 def norm_db(u):
     if not u:
         return ""
@@ -135,6 +144,17 @@ TRENDING_DAYS = geti(
     7,
     1,
     30,
+)
+
+# Radio mood balancing.  These are environment-configurable so the live
+# recommendation mix can be tuned without changing application code.
+RADIO_MOOD_TEMPERATURE = getf("RADIO_MOOD_TEMPERATURE", 1.5, 0.1, 10.0)
+RADIO_MOOD_MAX_RATIO = getf("RADIO_MOOD_MAX_RATIO", 0.40, 0.05, 1.0)
+RADIO_BASELINE_MOOD_MULTIPLIER = getf(
+    "RADIO_BASELINE_MOOD_MULTIPLIER", 0.22, 0.0, 10.0
+)
+RADIO_FEEDBACK_DECAY_SCALE = getf(
+    "RADIO_FEEDBACK_DECAY_SCALE", 12.0, 1.0, 1000.0
 )
 
 
@@ -1273,7 +1293,7 @@ def _radio_profile(uid):
                 continue
 
             # Smooth recency decay.  The newest Like has weight 1.0.
-            weight = math.exp(-index / 12.0)
+            weight = math.exp(-index / RADIO_FEEDBACK_DECAY_SCALE)
             weighted_sum += value * weight
             weight_sum += weight
 
@@ -1281,7 +1301,7 @@ def _radio_profile(uid):
             profile[field] = weighted_sum / weight_sum
 
     for index, row in enumerate(likes[:40]):
-        weight = math.exp(-index / 12.0)
+        weight = math.exp(-index / RADIO_FEEDBACK_DECAY_SCALE)
 
         root, mode = _radio_key_parts(row.get("musical_key"))
         if root:
@@ -1612,7 +1632,7 @@ def _radio_seed_similarity(row, seeds):
         if sim is None:
             continue
 
-        recency = math.exp(-index / 8.0)
+        recency = math.exp(-index / RADIO_FEEDBACK_DECAY_SCALE)
         scored.append((sim, recency))
 
     if not scored:
@@ -1711,7 +1731,7 @@ def _radio_negative_similarity(row, dislikes):
         if sim is None:
             continue
 
-        weight = math.exp(-index / 10.0)
+        weight = math.exp(-index / RADIO_FEEDBACK_DECAY_SCALE)
         scores.append((sim, weight))
 
     if not scores:
@@ -1723,27 +1743,90 @@ def _radio_negative_similarity(row, dislikes):
     )
 
 
+def adjust_mood_ratios(
+    raw_mood_scores,
+    temperature=RADIO_MOOD_TEMPERATURE,
+    max_cap=RADIO_MOOD_MAX_RATIO,
+):
+    """Convert raw mood scores into stable, capped dynamic ratios.
+
+    Temperature scaling reduces the effect of a single dominant mood.  The
+    cap is applied with iterative water-filling, so redistribution can never
+    push a secondary mood above the same ceiling and the result still sums to
+    one (within floating-point precision).
+    """
+    if not raw_mood_scores:
+        return {}
+
+    temperature = max(0.1, float(temperature))
+    max_cap = min(1.0, max(0.0, float(max_cap)))
+    if max_cap * len(raw_mood_scores) < 1.0:
+        max_cap = 1.0 / len(raw_mood_scores)
+
+    finite_scores = {}
+    for mood, score in raw_mood_scores.items():
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(score):
+            finite_scores[mood] = max(0.0, score)
+    if not finite_scores:
+        return {}
+
+    # Numerically stable softmax variant.
+    scaled = {m: score / temperature for m, score in finite_scores.items()}
+    peak = max(scaled.values())
+    exp_scores = {m: math.exp(value - peak) for m, value in scaled.items()}
+    total = sum(exp_scores.values())
+    ratios = {m: value / total for m, value in exp_scores.items()}
+
+    remaining = set(ratios)
+    result = {}
+    residual = 1.0
+    while remaining:
+        available = sum(ratios[m] for m in remaining)
+        proposed = {
+            m: residual * ratios[m] / available
+            for m in remaining
+        }
+        over = [m for m, value in proposed.items() if value > max_cap]
+        if not over:
+            result.update(proposed)
+            break
+        for mood in over:
+            result[mood] = max_cap
+            residual -= max_cap
+            remaining.remove(mood)
+
+    # A final bounded normalization removes tiny floating-point drift.
+    total_result = sum(result.values())
+    return {m: value / total_result for m, value in result.items()}
+
+
 def radio_weights(uid, baseline_mood=None):
-    """Return rule-based mood weights for Radio; no AI or audio analysis."""
+    """Return temperature-scaled, capped mood ratios for Radio."""
     stats = ratios(uid)
-    weights = {}
+    raw_scores = {}
     for mood in MOODS:
         liked = float(stats[mood]["like"])
         disliked = float(stats[mood]["not"])
         # Bayesian-smoothed preference: neutral users still hear every mood.
-        weights[mood] = (liked + 1.0) / (liked + disliked + 2.0)
-    if baseline_mood in weights:
-        weights[baseline_mood] += 0.22
-    return weights
+        raw_scores[mood] = (liked + 1.0) / (liked + disliked + 2.0)
+
+    if baseline_mood in raw_scores:
+        raw_scores[baseline_mood] += RADIO_BASELINE_MOOD_MULTIPLIER
+
+    return adjust_mood_ratios(raw_scores)
 
 
 def radio_track(uid, baseline_mood=None):
     """Choose Radio tracks from user taste ratios without AI.
 
-    Radio deliberately ignores the currently selected mood. It uses a strict
-    70/20/10 source mix: fresh tracks, tracks the user liked, and the global
-    trending/top-10-liked set. The last set is admitted only when its BPM is a
-    smooth transition from the previous track.
+    It uses a strict 70/20/10 source mix: fresh tracks, tracks the user liked,
+    and the global trending/top-10-liked set. Within each pool, candidates are
+    ranked by mood ratio, recency-weighted nearest-neighbor similarity, BPM and
+    harmonic continuity, and a negative similarity boundary.
     """
     rows = _radio_candidates(uid)
     if not rows:
@@ -1752,7 +1835,10 @@ def radio_track(uid, baseline_mood=None):
     feedback = feedback_map(uid)
     recent = _radio_history(uid)
     today_served = _radio_today_served(uid)
-    mood_weights = radio_weights(uid, baseline_mood=None)
+    mood_weights = radio_weights(uid, baseline_mood=baseline_mood)
+    profile = _radio_profile(uid)
+    liked_seeds = profile.get("likes", [])
+    disliked_seeds = profile.get("dislikes", [])
     last_seed = _radio_last_seed(uid)
     last_bpm = last_seed.get("bpm") if last_seed else None
     last_key = last_seed.get("musical_key") if last_seed else None
@@ -1851,6 +1937,17 @@ def radio_track(uid, baseline_mood=None):
     for row, key in pool:
         mood = row["mood"]
         score = 48.0 * float(mood_weights.get(mood, 0.5))
+
+        # Weighted nearest-neighbor taste matching.  This is deliberately
+        # rule-based: recent Likes receive larger decay weights and the best
+        # matching seed is retained so a strong local match is not diluted.
+        similarity = _radio_seed_similarity(row, liked_seeds)
+        if similarity is not None:
+            score += 16.0 * similarity
+
+        negative_similarity = _radio_negative_similarity(row, disliked_seeds)
+        if negative_similarity:
+            score -= 12.0 * negative_similarity
 
         # Fresh tracks are preferred inside the 70% discovery bucket.
         if key not in recent:
