@@ -4063,7 +4063,7 @@ def buttons(
                     "text":
                         "↗️ SHARE",
                     "url":
-                        f"https://t.me/share/url?url={quote(f'{RENDER_EXTERNAL_URL.rstrip("/")}/share/track/{share_track_id(ch, msg)}' if share_track_id(ch, msg) else f'https://t.me/{BOT_USERNAME}', safe='')}&text={quote('🎵 NOT YOUR VIBE', safe='')}",
+                        f"https://t.me/share/url?url={quote(f'https://t.me/{BOT_USERNAME}?start=track_{share_track_id(ch, msg)}' if share_track_id(ch, msg) else f'https://t.me/{BOT_USERNAME}', safe='')}&text={quote('🎵 NOT YOUR VIBE', safe='')}",
                 },
                 {
                     "text":
@@ -5440,7 +5440,7 @@ def callback(c):
                             "text":
                                 "↗️ SHARE PROFILE",
                             "url":
-                                f"https://t.me/share/url?url={quote(f'{RENDER_EXTERNAL_URL.rstrip("/")}/share/profile/{uid}', safe='')}&text={quote('👤 My NOT YOUR VIBE profile', safe='')}",
+                                f"https://t.me/share/url?url={quote(f'https://t.me/{BOT_USERNAME}?start=profile_{uid}', safe='')}&text={quote('👤 My NOT YOUR VIBE profile', safe='')}",
                         }
                     ],
                     [
@@ -5825,7 +5825,7 @@ def message(m):
                         "inline_keyboard": [
                             [{
                                 "text": "↗️ SHARE PROFILE",
-                                "url": f"https://t.me/share/url?url={quote(f'https://t.me/{BOT_USERNAME}?start=profile_{profile_uid}', safe='')}&text={quote('👤 NOT YOUR VIBE profile', safe='')}",
+                                "url": f"https://t.me/share/url?url={quote(f'https://t.me/{BOT_USERNAME}?start=profile_{profile_uid}', safe='')}&text={quote('👤 My NOT YOUR VIBE profile', safe='')}",
                             }],
                             [{
                                 "text": "🎛 CHANGE MOOD",
