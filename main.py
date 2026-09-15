@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import hashlib
 import logging
 import os
@@ -18,7 +19,7 @@ from contextlib import contextmanager
 from typing import Mapping
 
 import requests
-from flask import Flask, request
+from flask import Flask, request, Response
 
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
@@ -4002,6 +4003,14 @@ def share_track_id(channel_id, message_id):
     return int(row["id"]) if row else None
 
 
+def track_share_url(channel_id, message_id):
+    track_id = share_track_id(channel_id, message_id)
+    if not track_id:
+        return f"https://t.me/{BOT_USERNAME}"
+    base = RENDER_EXTERNAL_URL.rstrip("/")
+    return f"{base}/share/track/{track_id}" if base else f"https://t.me/{BOT_USERNAME}?start=track_{track_id}"
+
+
 def buttons(
     uid,
     ch,
@@ -4063,7 +4072,7 @@ def buttons(
                     "text":
                         "↗️ SHARE",
                     "url":
-                        f"https://t.me/share/url?url={quote(f'https://t.me/{BOT_USERNAME}?start=track_{share_track_id(ch, msg)}' if share_track_id(ch, msg) else f'https://t.me/{BOT_USERNAME}', safe='')}&text={quote('🎵 NOT YOUR VIBE', safe='')}",
+                        f"https://t.me/share/url?url={quote(track_share_url(ch, msg), safe='')}&text={quote('🎵 NOT YOUR VIBE • Listen & discover your vibe.', safe='')}",
                 },
                 {
                     "text":
@@ -6461,8 +6470,44 @@ def home():
     )
 
 
-def share_page(title, description, bot_link):
-    return f"""<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{escape(title)}</title><meta property=\"og:title\" content=\"{escape(title)}\"><meta property=\"og:description\" content=\"{escape(description)}\"><meta name=\"twitter:card\" content=\"summary\"><meta name=\"twitter:title\" content=\"{escape(title)}\"><meta name=\"twitter:description\" content=\"{escape(description)}\"><style>body{{margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,-apple-system,sans-serif}}main{{max-width:560px;margin:12vh auto;padding:24px}}.card{{border:1px solid #292933;border-radius:24px;padding:30px;text-align:center;background:#121218}}h1{{font-size:28px;margin:8px 0 12px}}p{{color:#b7b7c2;line-height:1.5}}a{{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:999px;background:#fff;color:#111;text-decoration:none;font-weight:700}}</style></head><body><main><div class=\"card\"><div>🎧</div><h1>{escape(title)}</h1><p>{escape(description)}</p><a href=\"{escape(bot_link)}\">Open in Telegram</a></div></main></body></html>"""
+def share_page(title, description, bot_link, image_url=None):
+    image_meta = (
+        f'<meta property="og:image" content="{escape(image_url)}">'
+        f'<meta name="twitter:image" content="{escape(image_url)}">'
+        if image_url else ""
+    )
+    return f"""<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{escape(title)}</title><meta property=\"og:title\" content=\"{escape(title)}\"><meta property=\"og:description\" content=\"{escape(description)}\">{image_meta}<meta name=\"twitter:card\" content=\"summary_large_image\"><meta name=\"twitter:title\" content=\"{escape(title)}\"><meta name=\"twitter:description\" content=\"{escape(description)}\"><style>body{{margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,-apple-system,sans-serif}}main{{max-width:560px;margin:8vh auto;padding:24px}}.card{{border:1px solid #292933;border-radius:24px;padding:30px;text-align:center;background:#121218}}h1{{font-size:28px;margin:8px 0 12px}}p{{color:#b7b7c2;line-height:1.5}}a{{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:999px;background:#fff;color:#111;text-decoration:none;font-weight:700}}</style></head><body><main><div class=\"card\"><div>🎧</div><h1>{escape(title)}</h1><p>{escape(description)}</p><a href=\"{escape(bot_link)}\">Open in Telegram</a></div></main></body></html>"""
+
+@app.route("/share/track/<int:track_id>/cover")
+def share_track_cover(track_id):
+    row = get_track(track_id)
+    if not row or client is None or tele_loop is None or not ready.is_set():
+        return ("", 404)
+    try:
+        async def fetch_thumb():
+            message = await client.get_messages(str(row["channel_id"]), ids=int(row["message_id"]))
+            if not message or not message.media:
+                return None
+            buf = io.BytesIO()
+            result = await message.download_media(file=buf, thumb=-1)
+            if not result:
+                return None
+            return buf.getvalue()
+
+        future = asyncio.run_coroutine_threadsafe(fetch_thumb(), tele_loop)
+        data = future.result(timeout=12)
+        if not data:
+            return ("", 404)
+        if data.startswith(b"\x89PNG"):
+            content_type = "image/png"
+        elif data.startswith(b"RIFF") and b"WEBP" in data[:16]:
+            content_type = "image/webp"
+        else:
+            content_type = "image/jpeg"
+        return Response(data, mimetype=content_type, headers={"Cache-Control": "public, max-age=86400"})
+    except Exception:
+        log.exception("share cover failed track=%s", track_id)
+        return ("", 404)
 
 @app.route("/share/track/<int:track_id>")
 def share_track_page(track_id):
@@ -6470,7 +6515,9 @@ def share_track_page(track_id):
     if not row:
         return share_page("NOT YOUR VIBE", "This track is no longer available.", f"https://t.me/{BOT_USERNAME}")
     title = str(row.get("title") or f"Track #{row['message_id']}")[:160]
-    return share_page(f"{title} • NOT YOUR VIBE", "Open this track in NOT YOUR VIBE on Telegram.", f"https://t.me/{BOT_USERNAME}?start=track_{track_id}")
+    base = RENDER_EXTERNAL_URL.rstrip("/")
+    image_url = f"{base}/share/track/{track_id}/cover" if base else None
+    return share_page(f"{title} • NOT YOUR VIBE", "🎧 Listen on NOT YOUR VIBE • Discover your vibe.", f"https://t.me/{BOT_USERNAME}?start=track_{track_id}", image_url=image_url)
 
 @app.route("/share/profile/<int:profile_uid>")
 def share_profile_page(profile_uid):
