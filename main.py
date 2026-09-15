@@ -156,6 +156,21 @@ RADIO_BASELINE_MOOD_MULTIPLIER = getf(
 RADIO_FEEDBACK_DECAY_SCALE = getf(
     "RADIO_FEEDBACK_DECAY_SCALE", 12.0, 1.0, 1000.0
 )
+RADIO_TIME_MOOD_BONUS_SCALE = getf(
+    "RADIO_TIME_MOOD_BONUS_SCALE", 4.0, 0.0, 20.0
+)
+RADIO_TIME_BPM_BONUS = getf(
+    "RADIO_TIME_BPM_BONUS", 2.0, 0.0, 20.0
+)
+RADIO_TIME_EVENING_MAX_BPM = getf(
+    "RADIO_TIME_EVENING_MAX_BPM", 180.0, 150.0, 240.0
+)
+RADIO_TIME_NIGHT_FAST_MIN_BPM = getf(
+    "RADIO_TIME_NIGHT_FAST_MIN_BPM", 170.0, 140.0, 240.0
+)
+RADIO_TIME_NIGHT_FAST_MAX_BPM = getf(
+    "RADIO_TIME_NIGHT_FAST_MAX_BPM", 200.0, 160.0, 260.0
+)
 
 
 # =========================================================
@@ -1743,6 +1758,41 @@ def _radio_negative_similarity(row, dislikes):
     )
 
 
+def get_time_based_mood_bias(now=None):
+    """Return Yangon-local time context as mood bias and ideal BPM range(s).
+
+    The source specification mentions mood labels not present in this bot
+    (happy, acoustic, groove, deep, dance, bass, ambient).  They are mapped to
+    the closest existing channels so time context remains effective without
+    creating unsupported moods or database values.
+    """
+    current = now or datetime.now(ZoneInfo("Asia/Yangon"))
+    hour = current.hour
+    if 6 <= hour < 12:
+        return {"energetic": 0.40, "melodic": 0.40, "chill": 0.20}, ((100, 135),)
+    if 12 <= hour < 17:
+        return {"chill": 0.40, "hype": 0.40, "dark": 0.20}, ((115, 140),)
+    if 17 <= hour < 22:
+        return {"energetic": 0.60, "hype": 0.30, "dark": 0.10}, ((128, RADIO_TIME_EVENING_MAX_BPM),)
+    return (
+        {"sad": 0.50, "chill": 0.40, "melodic": 0.10},
+        ((60, 110), (RADIO_TIME_NIGHT_FAST_MIN_BPM, RADIO_TIME_NIGHT_FAST_MAX_BPM)),
+    )
+
+
+def _radio_time_context_score(row, time_mood_bias, bpm_range):
+    """Score how well a track fits the current time context."""
+    score = time_mood_bias.get(row.get("mood"), 0.0) * RADIO_TIME_MOOD_BONUS_SCALE
+    try:
+        bpm = float(row.get("bpm"))
+    except (TypeError, ValueError):
+        bpm = None
+    if bpm is not None and math.isfinite(bpm):
+        if any(low <= bpm <= high for low, high in bpm_range):
+            score += RADIO_TIME_BPM_BONUS
+    return score
+
+
 def adjust_mood_ratios(
     raw_mood_scores,
     temperature=RADIO_MOOD_TEMPERATURE,
@@ -1839,6 +1889,7 @@ def radio_track(uid, baseline_mood=None):
     profile = _radio_profile(uid)
     liked_seeds = profile.get("likes", [])
     disliked_seeds = profile.get("dislikes", [])
+    time_mood_bias, time_bpm_range = get_time_based_mood_bias()
     last_seed = _radio_last_seed(uid)
     last_bpm = last_seed.get("bpm") if last_seed else None
     last_key = last_seed.get("musical_key") if last_seed else None
@@ -1948,6 +1999,15 @@ def radio_track(uid, baseline_mood=None):
         negative_similarity = _radio_negative_similarity(row, disliked_seeds)
         if negative_similarity:
             score -= 12.0 * negative_similarity
+
+        # Time-of-day is a soft context signal: it steers recommendations
+        # toward the appropriate mood/BPM without overriding user feedback,
+        # dislikes, daily freshness, or hard BPM transition gates.
+        score += _radio_time_context_score(
+            row,
+            time_mood_bias,
+            time_bpm_range,
+        )
 
         # Fresh tracks are preferred inside the 70% discovery bucket.
         if key not in recent:
