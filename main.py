@@ -4007,8 +4007,18 @@ def track_share_url(channel_id, message_id):
     track_id = share_track_id(channel_id, message_id)
     if not track_id:
         return f"https://t.me/{BOT_USERNAME}"
-    base = RENDER_EXTERNAL_URL.rstrip("/")
-    return f"{base}/share/track/{track_id}" if base else f"https://t.me/{BOT_USERNAME}?start=track_{track_id}"
+    return f"https://t.me/{BOT_USERNAME}?start=track_{track_id}"
+
+
+def track_share_title(channel_id, message_id):
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                "SELECT title FROM tracks WHERE channel_id=%s AND message_id=%s ORDER BY id DESC LIMIT 1",
+                (str(channel_id), int(message_id)),
+            )
+            row = x.fetchone()
+    return (row["title"] or "NOT YOUR VIBE") if row else "NOT YOUR VIBE"
 
 
 def buttons(
@@ -4072,7 +4082,7 @@ def buttons(
                     "text":
                         "↗️ SHARE",
                     "url":
-                        f"https://t.me/share/url?url={quote(track_share_url(ch, msg), safe='')}&text={quote('🎵 NOT YOUR VIBE • Listen & discover your vibe.', safe='')}",
+                        f"https://t.me/share/url?url={quote(track_share_url(ch, msg), safe='')}&text={quote('🎵 ' + track_share_title(ch, msg) + ' • NOT YOUR VIBE', safe='')}",
                 },
                 {
                     "text":
