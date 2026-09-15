@@ -159,6 +159,9 @@ RADIO_FEEDBACK_DECAY_SCALE = getf(
 RADIO_TIME_MOOD_BONUS_SCALE = getf(
     "RADIO_TIME_MOOD_BONUS_SCALE", 4.0, 0.0, 20.0
 )
+RADIO_TIME_MOOD_WEIGHT = getf(
+    "RADIO_TIME_MOOD_WEIGHT", 0.35, 0.0, 1.0
+)
 RADIO_TIME_BPM_BONUS = getf(
     "RADIO_TIME_BPM_BONUS", 2.0, 0.0, 20.0
 )
@@ -1782,20 +1785,45 @@ def get_time_based_mood_bias(now=None):
     current = now or datetime.now(ZoneInfo("Asia/Yangon"))
     hour = current.hour
     if 6 <= hour < 12:
-        return {"energetic": 0.40, "melodic": 0.40, "chill": 0.20}, ((100, 135),)
+        return {
+            "energetic": 0.40,
+            "melodic": 0.30,
+            "chill": 0.20,
+            "hype": 0.10,
+        }, ((100, 135),)
     if 12 <= hour < 17:
-        return {"chill": 0.40, "hype": 0.40, "dark": 0.20}, ((115, 140),)
+        return {
+            "chill": 0.35,
+            "hype": 0.30,
+            "dark": 0.20,
+            "melodic": 0.15,
+        }, ((115, 140),)
     if 17 <= hour < 22:
-        return {"energetic": 0.60, "hype": 0.30, "dark": 0.10}, ((128, RADIO_TIME_EVENING_MAX_BPM),)
+        return {
+            "energetic": 0.45,
+            "hype": 0.25,
+            "dark": 0.15,
+            "night": 0.10,
+            "melodic": 0.05,
+        }, ((128, RADIO_TIME_EVENING_MAX_BPM),)
     return (
-        {"sad": 0.50, "chill": 0.40, "melodic": 0.10},
+        {
+            "sad": 0.35,
+            "chill": 0.25,
+            "night": 0.25,
+            "melodic": 0.10,
+            "energetic": 0.05,
+        },
         ((60, 110), (RADIO_TIME_NIGHT_FAST_MIN_BPM, RADIO_TIME_NIGHT_FAST_MAX_BPM)),
     )
 
 
 def _radio_time_context_score(row, time_mood_bias, bpm_range):
     """Score how well a track fits the current time context."""
-    score = time_mood_bias.get(row.get("mood"), 0.0) * RADIO_TIME_MOOD_BONUS_SCALE
+    score = (
+        time_mood_bias.get(row.get("mood"), 0.0)
+        * RADIO_TIME_MOOD_BONUS_SCALE
+    )
     try:
         bpm = float(row.get("bpm"))
     except (TypeError, ValueError):
@@ -1903,6 +1931,20 @@ def radio_track(uid, baseline_mood=None):
     liked_seeds = profile.get("likes", [])
     disliked_seeds = profile.get("dislikes", [])
     time_mood_bias, time_bpm_range = get_time_based_mood_bias()
+    # Context-aware prior: user taste remains dominant, while the timeline
+    # meaningfully steers the mood mix. Unsupported/absent moods contribute 0.
+    context_weight = RADIO_TIME_MOOD_WEIGHT
+    blended_mood_weights = {
+        mood: ((1.0 - context_weight) * float(mood_weights.get(mood, 0.0)))
+        + (context_weight * float(time_mood_bias.get(mood, 0.0)))
+        for mood in MOODS
+    }
+    blended_total = sum(blended_mood_weights.values())
+    if blended_total > 0:
+        mood_weights = {
+            mood: value / blended_total
+            for mood, value in blended_mood_weights.items()
+        }
     last_seed = _radio_last_seed(uid)
     last_bpm = last_seed.get("bpm") if last_seed else None
     last_key = last_seed.get("musical_key") if last_seed else None
