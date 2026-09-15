@@ -1377,6 +1377,18 @@ def _radio_today_served(uid):
     """
     served = set()
 
+    today = datetime.now(ZoneInfo("Asia/Yangon")).date()
+    start = int(datetime.combine(
+        today,
+        datetime.min.time(),
+        tzinfo=ZoneInfo("Asia/Yangon"),
+    ).timestamp())
+    end = int(datetime.combine(
+        today + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=ZoneInfo("Asia/Yangon"),
+    ).timestamp())
+
     with db() as c:
         with cur(c) as x:
             x.execute(
@@ -1385,9 +1397,10 @@ def _radio_today_served(uid):
                 FROM user_history
                 WHERE user_id=%s
                   AND action='served'
-                  AND to_timestamp(sent_at)::date = CURRENT_DATE
+                  AND sent_at >= %s
+                  AND sent_at < %s
                 """,
-                (uid,),
+                (uid, start, end),
             )
 
             for row in x.fetchall():
@@ -1915,23 +1928,11 @@ def radio_track(uid, baseline_mood=None):
         usable.append((row, key))
 
     if not usable:
-        # Preserve the existing bot's usability when the user has exhausted
-        # today's catalogue: allow older tracks, but still exclude dislikes.
-        for row in rows:
-            mood = row.get("mood")
-            if mood not in MOODS:
-                continue
-            key = (str(row["channel_id"]), int(row["message_id"]))
-            if feedback.get(key) != "not_for_me":
-                usable.append((row, key))
-
-    if not usable:
         return None
 
     special_pool = [
         item for item in usable
         if item[1] in special_ids
-        and _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
     ]
     liked_pool = [
         item for item in usable
@@ -1945,44 +1946,48 @@ def radio_track(uid, baseline_mood=None):
     ]
     unliked_pool = [item for item in usable if feedback.get(item[1]) != "like"]
 
-    # Hard BPM gate for every Radio source. A 150 BPM seed must not jump
-    # directly to 120/130 BPM just because taste/popularity scored higher.
-    # Keep the transition within 12 BPM; if no candidate is in range, Radio
-    # reports no suitable track instead of breaking the transition.
-    if last_bpm is not None:
-        fresh_pool = [
-            item for item in fresh_pool
-            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
-        ]
-        liked_pool = [
-            item for item in liked_pool
-            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
-        ]
-        special_pool = [
-            item for item in special_pool
-            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
-        ]
-        unliked_pool = [
-            item for item in unliked_pool
-            if _radio_bpm_is_smooth(item[0].get("bpm"), last_bpm)
-        ]
+    # Progressive fallback: daily-served and disliked tracks remain hard
+    # boundaries, while BPM continuity becomes softer only when necessary.
+    # Time-of-day mood/BPM context remains a scoring signal at every stage.
+    pools = (fresh_pool, liked_pool, special_pool)
+    pool_weights = (0.70, 0.20, 0.10)
+    selected_stage = None
+    for max_delta in (12.0, 20.0, 30.0, None):
+        stage_pools = []
+        for pool in pools:
+            if max_delta is None or last_bpm is None:
+                stage_pools.append(pool)
+            else:
+                stage_pools.append([
+                    item for item in pool
+                    if _radio_bpm_is_smooth(
+                        item[0].get("bpm"),
+                        last_bpm,
+                        max_delta=max_delta,
+                    )
+                ])
 
-    # Exact target mix: fresh 70%, liked 20%, trending/top-10 10%.
-    # If a bucket is unavailable, redistribute only that bucket's share.
-    buckets = ((fresh_pool, 0.70), (liked_pool, 0.20), (special_pool, 0.10))
-    available = [(pool, weight) for pool, weight in buckets if pool]
-    if not available:
-        if last_bpm is not None:
-            return None
+        available = [
+            (pool, weight)
+            for pool, weight in zip(stage_pools, pool_weights)
+            if pool
+        ]
+        if available:
+            selected_stage = max_delta
+            pick = random.random() * sum(weight for _, weight in available)
+            pool = available[-1][0]
+            for candidate_pool, weight in available:
+                pick -= weight
+                if pick <= 0:
+                    pool = candidate_pool
+                    break
+            break
+
+    if selected_stage is None and last_bpm is not None:
+        log.info("radio exhausted uid=%s after progressive BPM fallback", uid)
+        return None
+    if selected_stage is None:
         pool = unliked_pool or usable
-    else:
-        pick = random.random() * sum(weight for _, weight in available)
-        pool = available[-1][0]
-        for candidate_pool, weight in available:
-            pick -= weight
-            if pick <= 0:
-                pool = candidate_pool
-                break
 
     scored = []
     for row, key in pool:
