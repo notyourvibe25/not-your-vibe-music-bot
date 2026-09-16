@@ -510,6 +510,11 @@ def init_db():
         created_at BIGINT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS processed_updates(
+        update_id BIGINT PRIMARY KEY,
+        processed_at BIGINT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood);
     CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_user ON user_history(user_id,sent_at DESC);
@@ -6564,7 +6569,32 @@ def message(m):
 # UPDATE ROUTER
 # =========================================================
 
+def claim_update(update_id):
+    """Process each Telegram webhook update at most once."""
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute(
+                    """
+                    INSERT INTO processed_updates(update_id, processed_at)
+                    VALUES(%s,%s)
+                    ON CONFLICT(update_id) DO NOTHING
+                    """,
+                    (int(update_id), int(time.time())),
+                )
+                return x.rowcount == 1
+    except Exception:
+        # Do not drop a real update when an old database has not migrated yet;
+        # init_db normally creates this table during startup.
+        log.exception("could not claim Telegram update_id=%s", update_id)
+        return True
+
 def update(u):
+
+    update_id = u.get("update_id") if isinstance(u, Mapping) else None
+    if update_id is not None and not claim_update(update_id):
+        log.info("ignored duplicate Telegram update_id=%s", update_id)
+        return
 
     if isinstance(
         u.get("callback_query"),
