@@ -1405,6 +1405,19 @@ def _radio_history(uid):
     return recent
 
 
+def _radio_song_key(title):
+    """Return a conservative normalized song identity for Radio daily dedupe.
+
+    Telegram message/channel identity is still used for feedback/history, but
+    Radio also needs a song-level identity because the same song can exist as
+    multiple Telegram messages in different channels.
+    """
+    import re
+    text = str(title or "").strip().casefold()
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
 def _radio_today_served(uid):
     """Return every track already served to this user today.
 
@@ -1443,6 +1456,40 @@ def _radio_today_served(uid):
                 served.add((str(row["channel_id"]), int(row["message_id"])))
 
     return served
+
+
+def _radio_today_song_keys(uid):
+    """Return normalized song titles already served by Radio today.
+
+    This closes the duplicate-song gap where identical audio/song records have
+    different Telegram channel/message identities.
+    """
+    keys = set()
+    today = datetime.now(ZoneInfo("Asia/Yangon")).date()
+    start = int(datetime.combine(today, datetime.min.time(), tzinfo=ZoneInfo("Asia/Yangon")).timestamp())
+    end = int(datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=ZoneInfo("Asia/Yangon")).timestamp())
+    with db() as c:
+        with cur(c) as x:
+            x.execute(
+                """
+                SELECT t.title
+                FROM user_history h
+                JOIN tracks t
+                  ON t.channel_id=h.channel_id
+                 AND t.message_id=h.message_id
+                WHERE h.user_id=%s
+                  AND h.action='served'
+                  AND h.sent_at >= %s
+                  AND h.sent_at < %s
+                  AND COALESCE(TRIM(t.title),'') <> ''
+                """,
+                (uid, start, end),
+            )
+            for row in x.fetchall():
+                key = _radio_song_key(row.get("title"))
+                if key:
+                    keys.add(key)
+    return keys
 
 
 def _radio_last_seed(uid):
@@ -1959,6 +2006,7 @@ def radio_track(uid, baseline_mood=None):
     feedback = feedback_map(uid)
     recent = _radio_history(uid)
     today_served = _radio_today_served(uid)
+    today_song_keys = _radio_today_song_keys(uid)
     mood_weights = radio_weights(uid, baseline_mood=baseline_mood)
     profile = _radio_profile(uid)
     liked_seeds = profile.get("likes", [])
@@ -1998,7 +2046,8 @@ def radio_track(uid, baseline_mood=None):
         if mood not in MOODS:
             continue
         key = (str(row["channel_id"]), int(row["message_id"]))
-        if key in today_served or feedback.get(key) == "not_for_me":
+        song_key = _radio_song_key(row.get("title"))
+        if key in today_served or song_key in today_song_keys or feedback.get(key) == "not_for_me":
             continue
         usable.append((row, key))
 
@@ -2227,6 +2276,36 @@ def reserve(
                     LIMIT 1
                     """,
                     (uid, str(track[2]), int(track[1]), start, end),
+                )
+                if x.fetchone():
+                    return None
+
+                # Song-level same-day guard. The same song may exist under
+                # different Telegram messages/channels, so source-message
+                # identity alone is not enough for Radio daily freshness.
+                x.execute(
+                    """
+                    SELECT 1
+                    FROM tracks candidate
+                    JOIN user_history h
+                      ON h.user_id=%s
+                     AND h.action='served'
+                     AND h.channel_id=candidate.channel_id
+                     AND h.message_id=candidate.message_id
+                     AND h.sent_at >= %s
+                     AND h.sent_at < %s
+                    JOIN tracks served_track
+                      ON served_track.channel_id=h.channel_id
+                     AND served_track.message_id=h.message_id
+                    WHERE candidate.channel_id=%s
+                      AND candidate.message_id=%s
+                      AND COALESCE(TRIM(candidate.title),'') <> ''
+                      AND COALESCE(TRIM(served_track.title),'') <> ''
+                      AND regexp_replace(lower(trim(candidate.title)), '[^[:alnum:]]+', ' ', 'g')
+                          = regexp_replace(lower(trim(served_track.title)), '[^[:alnum:]]+', ' ', 'g')
+                    LIMIT 1
+                    """,
+                    (uid, start, end, str(track[2]), int(track[1])),
                 )
                 if x.fetchone():
                     return None
