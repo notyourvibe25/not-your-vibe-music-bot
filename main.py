@@ -564,6 +564,7 @@ def init_db():
     ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
     ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS content_type TEXT;
     ALTER TABLE broadcasts ALTER COLUMN text DROP NOT NULL;
+
     """
 
     with db() as c:
