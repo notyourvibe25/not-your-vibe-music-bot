@@ -515,6 +515,15 @@ def init_db():
         processed_at BIGINT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS radio_daily_deliveries(
+        day DATE NOT NULL,
+        user_id BIGINT NOT NULL,
+        channel_id TEXT NOT NULL,
+        message_id BIGINT NOT NULL,
+        reserved_at BIGINT NOT NULL,
+        PRIMARY KEY(day,user_id,channel_id,message_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tracks_mood ON tracks(mood);
     CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_user ON user_history(user_id,sent_at DESC);
@@ -2220,6 +2229,29 @@ def reserve(
                     (uid, str(track[2]), int(track[1]), start, end),
                 )
                 if x.fetchone():
+                    return None
+
+                # This is the final same-day Radio guard.  It is independent
+                # of user_history.action, so a delivery error or another
+                # worker cannot make the same source message eligible again.
+                x.execute(
+                    """
+                    INSERT INTO radio_daily_deliveries(
+                        day,user_id,channel_id,message_id,reserved_at
+                    )
+                    VALUES(%s,%s,%s,%s,%s)
+                    ON CONFLICT(day,user_id,channel_id,message_id)
+                    DO NOTHING
+                    """,
+                    (
+                        today,
+                        uid,
+                        str(track[2]),
+                        int(track[1]),
+                        int(time.time()),
+                    ),
+                )
+                if x.rowcount != 1:
                     return None
 
             x.execute(
