@@ -40,6 +40,7 @@ The Flask service now serves:
 - `/mini-app`
 - `/api/me`
 - `/api/home`
+- `/api/discover`
 - `/api/liked`
 - `/api/track/<id>`
 - `/api/track/<id>/feedback`
@@ -51,6 +52,12 @@ automatically advances to the next track when a song ends, prefetches the next
 track in the background, and keeps an in-process server cache for recent audio.
 Like and “not for me” feedback are available directly on queue and liked-track
 rows through the existing feedback endpoint.
+
+The Mini App and bot use the same PostgreSQL tables. Mini App Likes and Not for
+Me actions are written through `track_feedback`, so they are immediately
+available to the bot. Mini App mood chips persist through `user_state`, so the
+bot and Mini App use the same selected mood. `/api/discover` reads the bot's
+existing Trending and Top 10 Liked calculations and returns them to Home.
 
 ## BotFather — Menu Button
 
