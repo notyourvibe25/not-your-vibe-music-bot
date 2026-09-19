@@ -6753,6 +6753,9 @@ def share_profile_page(profile_uid):
 # =========================================================
 
 MINI_APP_MAX_AGE = 86400
+MINI_AUDIO_CACHE_ITEMS = geti("MINI_AUDIO_CACHE_ITEMS", 4, 1, 12)
+_MINI_AUDIO_CACHE = {}
+_MINI_AUDIO_CACHE_LOCK = threading.Lock()
 
 
 def _mini_app_user():
@@ -6925,6 +6928,22 @@ def mini_track_audio(track_id):
         return jsonify({"error": "Telegram audio service is not ready"}), 503
 
     try:
+        with _MINI_AUDIO_CACHE_LOCK:
+            cached = _MINI_AUDIO_CACHE.get(track_id)
+        if cached:
+            data, mime = cached
+            return Response(
+                data,
+                mimetype=mime,
+                headers={
+                    "Content-Disposition": "inline",
+                    "Cache-Control": "private, max-age=300",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(data)),
+                    "X-Mini-Audio-Cache": "HIT",
+                },
+            )
+
         async def fetch_audio():
             message = await client.get_messages(
                 int(row["channel_id"]),
@@ -6952,6 +6971,11 @@ def mini_track_audio(track_id):
         if not data:
             return jsonify({"error": "Audio file unavailable"}), 404
 
+        with _MINI_AUDIO_CACHE_LOCK:
+            _MINI_AUDIO_CACHE[track_id] = (data, mime)
+            while len(_MINI_AUDIO_CACHE) > MINI_AUDIO_CACHE_ITEMS:
+                _MINI_AUDIO_CACHE.pop(next(iter(_MINI_AUDIO_CACHE)))
+
         return Response(
             data,
             mimetype=mime,
@@ -6959,6 +6983,8 @@ def mini_track_audio(track_id):
                 "Content-Disposition": "inline",
                 "Cache-Control": "private, max-age=300",
                 "Accept-Ranges": "bytes",
+                "Content-Length": str(len(data)),
+                "X-Mini-Audio-Cache": "MISS",
             },
         )
     except Exception:
