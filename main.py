@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import io
 import hashlib
+import hmac
+import json
+from pathlib import Path
 import logging
 import os
 import random
@@ -19,7 +22,7 @@ from contextlib import contextmanager
 from typing import Mapping
 
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify, render_template
 
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
@@ -33,7 +36,7 @@ from telethon.sessions import StringSession
 # APP / LOGGING
 # =========================================================
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder=str(Path(__file__).with_name("templates")))
 
 logging.basicConfig(
     level=(os.getenv("LOG_LEVEL") or "INFO").upper(),
@@ -6730,11 +6733,276 @@ def update(u):
 # FLASK
 # =========================================================
 
+# =========================================================
+# TELEGRAM MINI APP API
+# =========================================================
+
+MINI_APP_DEV_MODE = env("MINI_APP_DEV_MODE", "false").lower() in {"1", "true", "yes"}
+MINI_APP_DEV_USER_ID = env("MINI_APP_DEV_USER_ID")
+MINI_APP_MAX_AUTH_AGE = geti("MINI_APP_MAX_AUTH_AGE", 86400, 60, 604800)
+
+
+def _telegram_webapp_user(init_data):
+    """Validate Telegram Mini App initData and return the Telegram user object."""
+    if not init_data:
+        return None
+    if not BOT_TOKEN:
+        return None
+    try:
+        pairs = [x.split("=", 1) for x in init_data.split("&") if "=" in x]
+        data = dict(pairs)
+        received_hash = data.pop("hash", "")
+        if not received_hash:
+            return None
+        check_string = "\n".join(f"{k}={data[k]}" for k in sorted(data))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated, received_hash):
+            return None
+        auth_date = int(data.get("auth_date", "0"))
+        if auth_date <= 0 or time.time() - auth_date > MINI_APP_MAX_AUTH_AGE:
+            return None
+        user = json.loads(data.get("user", "{}"))
+        if not user.get("id"):
+            return None
+        return user
+    except Exception:
+        return None
+
+
+def _mini_user():
+    init_data = request.headers.get("X-Telegram-Init-Data", "") or request.args.get("initData", "")
+    user = _telegram_webapp_user(init_data)
+    if user:
+        return user
+    if MINI_APP_DEV_MODE and MINI_APP_DEV_USER_ID:
+        try:
+            uid = int(MINI_APP_DEV_USER_ID)
+            return {"id": uid, "username": "dev_user", "first_name": "Developer"}
+        except ValueError:
+            pass
+    return None
+
+
+def _mini_auth_required():
+    user = _mini_user()
+    if not user:
+        return None, (jsonify({"ok": False, "error": "Telegram authentication required"}), 401)
+    return user, None
+
+
+def _upsert_mini_user(user):
+    uid = int(user["id"])
+    now = int(time.time())
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                INSERT INTO users(user_id,username,first_name,last_name,first_seen,last_seen,total_requests)
+                VALUES(%s,%s,%s,%s,%s,%s,0)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=EXCLUDED.username,
+                    first_name=EXCLUDED.first_name,
+                    last_name=EXCLUDED.last_name,
+                    last_seen=EXCLUDED.last_seen
+            """, (uid, user.get("username"), user.get("first_name"), user.get("last_name"), now, now))
+    return uid
+
+
+def _track_by_source(channel_id, message_id):
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT id,mood,channel_id,message_id,title,bpm,musical_key,energy,danceability,loudness,
+                       genre,subgenre,analyzer_mood,analyzed
+                FROM tracks WHERE channel_id=%s AND message_id=%s LIMIT 1
+            """, (str(channel_id), int(message_id)))
+            return x.fetchone()
+
+
+def _track_json(row, uid=None):
+    if not row:
+        return None
+    feedback_value = None
+    if uid:
+        feedback_value = feedback(uid, row["channel_id"], row["message_id"])
+    tid = int(row["id"])
+    base = RENDER_EXTERNAL_URL.rstrip("/") if RENDER_EXTERNAL_URL else ""
+    return {
+        "id": tid,
+        "title": row.get("title") or f"Track #{row['message_id']}",
+        "mood": row.get("mood"),
+        "channel_id": str(row.get("channel_id")),
+        "message_id": int(row.get("message_id")),
+        "bpm": row.get("bpm"),
+        "key": row.get("musical_key"),
+        "energy": row.get("energy"),
+        "danceability": row.get("danceability"),
+        "loudness": row.get("loudness"),
+        "genre": row.get("genre"),
+        "subgenre": row.get("subgenre"),
+        "analyzer_mood": row.get("analyzer_mood"),
+        "analyzed": bool(row.get("analyzed")),
+        "feedback": feedback_value,
+        "cover_url": f"{base}/share/track/{tid}/cover" if base else f"/share/track/{tid}/cover",
+        "share_url": f"{base}/share/track/{tid}" if base else f"/share/track/{tid}",
+        "audio_url": f"{base}/api/track/{tid}/audio" if base else f"/api/track/{tid}/audio",
+    }
+
+
+def _tuple_to_track(value):
+    if not value:
+        return None
+    # recommendation tuples are (mood,message_id,channel_id,title)
+    return _track_by_source(value[2], value[1])
+
+
+def _liked_tracks(uid, limit=50):
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT t.id,t.mood,t.channel_id,t.message_id,t.title,t.bpm,t.musical_key,t.energy,
+                       t.danceability,t.loudness,t.genre,t.subgenre,t.analyzer_mood,t.analyzed
+                FROM track_feedback f
+                JOIN tracks t ON t.channel_id=f.channel_id AND t.message_id=f.message_id
+                WHERE f.user_id=%s AND f.feedback='like'
+                ORDER BY f.created_at DESC,t.id DESC LIMIT %s
+            """, (uid, limit))
+            return x.fetchall()
+
+
+def _served_today_count(uid):
+    now = datetime.now(ZoneInfo("Asia/Yangon"))
+    start = int(datetime.combine(now.date(), datetime.min.time(), tzinfo=now.tzinfo).timestamp())
+    with db() as c:
+        with cur(c) as x:
+            x.execute("SELECT COUNT(*) n FROM user_history WHERE user_id=%s AND action='served' AND sent_at >= %s", (uid, start))
+            return int(x.fetchone()["n"])
+
+
+@app.route("/mini-app")
+def mini_app():
+    return render_template("index.html", bot_username=BOT_USERNAME)
+
+
+@app.route("/api/me")
+def mini_me():
+    user, err = _mini_auth_required()
+    if err:
+        return err
+    uid = _upsert_mini_user(user)
+    with db() as c:
+        with cur(c) as x:
+            x.execute("SELECT COUNT(*) n FROM track_feedback WHERE user_id=%s AND feedback='like'", (uid,))
+            likes = int(x.fetchone()["n"])
+            x.execute("SELECT COUNT(*) n FROM user_history WHERE user_id=%s AND action='served'", (uid,))
+            listens = int(x.fetchone()["n"])
+            x.execute("SELECT mood,COUNT(*) n FROM user_history WHERE user_id=%s AND action='served' GROUP BY mood ORDER BY n DESC LIMIT 1", (uid,))
+            mood_row = x.fetchone()
+    return jsonify({"ok": True, "user": user, "stats": {"likes": likes, "listens": listens, "today": _served_today_count(uid), "top_mood": mood_row["mood"] if mood_row else None}})
+
+
+@app.route("/api/home")
+def mini_home():
+    user, err = _mini_auth_required()
+    if err:
+        return err
+    uid = _upsert_mini_user(user)
+    recommendations = {}
+    for name, fn in (("radio", radio_track), ("daily_vibe", daily_vibe_track), ("for_you", for_you_track), ("track_of_day", track_of_day)):
+        try:
+            recommendations[name] = _track_json(_tuple_to_track(fn(uid)), uid)
+        except Exception:
+            log.exception("mini recommendation failed mode=%s uid=%s", name, uid)
+            recommendations[name] = None
+    liked = [_track_json(r, uid) for r in _liked_tracks(uid, 20)]
+    return jsonify({"ok": True, "recommendations": recommendations, "liked": liked})
+
+
+@app.route("/api/liked")
+def mini_liked():
+    user, err = _mini_auth_required()
+    if err:
+        return err
+    uid = _upsert_mini_user(user)
+    limit = min(max(int(request.args.get("limit", 50)), 1), 100)
+    return jsonify({"ok": True, "tracks": [_track_json(r, uid) for r in _liked_tracks(uid, limit)]})
+
+
+@app.route("/api/track/<int:track_id>")
+def mini_track(track_id):
+    user, err = _mini_auth_required()
+    if err:
+        return err
+    uid = _upsert_mini_user(user)
+    row = get_track(track_id)
+    if not row:
+        return jsonify({"ok": False, "error": "Track not found"}), 404
+    return jsonify({"ok": True, "track": _track_json(row, uid)})
+
+
+@app.route("/api/track/<int:track_id>/feedback", methods=["POST"])
+def mini_feedback(track_id):
+    user, err = _mini_auth_required()
+    if err:
+        return err
+    uid = _upsert_mini_user(user)
+    row = get_track(track_id)
+    if not row:
+        return jsonify({"ok": False, "error": "Track not found"}), 404
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("feedback", "")).strip().lower()
+    if action == "remove_like":
+        with db() as c:
+            with cur(c) as x:
+                x.execute("DELETE FROM track_feedback WHERE user_id=%s AND channel_id=%s AND message_id=%s", (uid, str(row["channel_id"]), int(row["message_id"])))
+        return jsonify({"ok": True, "feedback": None})
+    if action not in {"like", "not_for_me"}:
+        return jsonify({"ok": False, "error": "feedback must be like, not_for_me, or remove_like"}), 400
+    if not save_feedback(uid, row["channel_id"], row["message_id"], row["mood"], action):
+        return jsonify({"ok": False, "error": "Could not save feedback"}), 400
+    return jsonify({"ok": True, "feedback": action})
+
+
+@app.route("/api/track/<int:track_id>/audio")
+def mini_audio(track_id):
+    """Small-library playback proxy. Downloads the Telegram audio into memory for the browser."""
+    user, err = _mini_auth_required()
+    if err:
+        return err
+    row = get_track(track_id)
+    if not row or client is None or tele_loop is None or not ready.is_set():
+        return jsonify({"ok": False, "error": "Audio is not currently available"}), 503
+    try:
+        async def fetch_audio():
+            message = await client.get_messages(str(row["channel_id"]), ids=int(row["message_id"]))
+            if not message or not message.media:
+                return None, None
+            buf = io.BytesIO()
+            await message.download_media(file=buf)
+            data = buf.getvalue()
+            name = getattr(getattr(message, "file", None), "name", None) or "track.mp3"
+            return data, name
+        future = asyncio.run_coroutine_threadsafe(fetch_audio(), tele_loop)
+        data, name = future.result(timeout=45)
+        if not data:
+            return jsonify({"ok": False, "error": "Audio file not found"}), 404
+        mimetype = "audio/mpeg"
+        lower = str(name).lower()
+        if lower.endswith(".flac"): mimetype = "audio/flac"
+        elif lower.endswith(".wav"): mimetype = "audio/wav"
+        elif lower.endswith(".m4a"): mimetype = "audio/mp4"
+        elif lower.endswith(".ogg") or lower.endswith(".opus"): mimetype = "audio/ogg"
+        return Response(data, mimetype=mimetype, headers={"Cache-Control": "private, max-age=300", "Content-Disposition": f'inline; filename="{escape(str(name))}"'})
+    except Exception:
+        log.exception("mini audio failed track=%s", track_id)
+        return jsonify({"ok": False, "error": "Audio playback failed"}), 500
+
+
+
 @app.route("/")
 def home():
-
     return (
-        "🎧 NOT YOUR VIBE MUSIC BOT ONLINE"
+        "🎧 NOT YOUR VIBE MUSIC BOT ONLINE — open /mini-app in Telegram"
     )
 
 
