@@ -6910,6 +6910,61 @@ def mini_track(track_id):
     return jsonify(_mini_track(row))
 
 
+@app.route("/api/track/<int:track_id>/audio")
+def mini_track_audio(track_id):
+    """Authenticate the Mini App request, fetch the Telegram audio, and stream it."""
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    row = get_track(track_id)
+    if not row:
+        return jsonify({"error": "Track not found"}), 404
+
+    if client is None or tele_loop is None or not ready.is_set():
+        return jsonify({"error": "Telegram audio service is not ready"}), 503
+
+    try:
+        async def fetch_audio():
+            message = await client.get_messages(
+                str(row["channel_id"]),
+                ids=int(row["message_id"]),
+            )
+            if not message or not message.media:
+                return None, None
+
+            buf = io.BytesIO()
+            result = await message.download_media(file=buf)
+            if not result:
+                return None, None
+
+            mime = "audio/mpeg"
+            obj = getattr(message, "audio", None) or getattr(message, "document", None)
+            mime_value = getattr(obj, "mime_type", None) if obj else None
+            if mime_value and str(mime_value).startswith("audio/"):
+                mime = str(mime_value)
+
+            return buf.getvalue(), mime
+
+        future = asyncio.run_coroutine_threadsafe(fetch_audio(), tele_loop)
+        data, mime = future.result(timeout=90)
+
+        if not data:
+            return jsonify({"error": "Audio file unavailable"}), 404
+
+        return Response(
+            data,
+            mimetype=mime,
+            headers={
+                "Content-Disposition": "inline",
+                "Cache-Control": "private, max-age=300",
+                "Accept-Ranges": "bytes",
+            },
+        )
+    except Exception:
+        log.exception("Mini App audio failed track=%s", track_id)
+        return jsonify({"error": "Playback unavailable"}), 500
+
 @app.route("/api/track/<int:track_id>/feedback", methods=["POST"])
 def mini_feedback(track_id):
     user, err = _mini_app_user()
