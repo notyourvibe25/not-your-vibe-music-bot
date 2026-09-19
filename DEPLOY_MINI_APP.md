@@ -71,6 +71,11 @@ The Mini App action controls also call the bot's own selection helpers through
 special-mode memory, feedback tables, and reservation logic rather than using
 an independent Mini App recommendation implementation.
 
+Cover thumbnails are best-effort. The cover route uses integer Telegram
+channel IDs, an in-process success cache, an unavailable-cover backoff, and an
+8-second timeout. A missing cover returns 404 without repeatedly hammering
+Telegram; audio playback and track data remain independent of cover loading.
+
 ## BotFather — Menu Button
 
 Open `@BotFather`:
