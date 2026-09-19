@@ -6927,7 +6927,7 @@ def mini_track_audio(track_id):
     try:
         async def fetch_audio():
             message = await client.get_messages(
-                str(row["channel_id"]),
+                int(row["channel_id"]),
                 ids=int(row["message_id"]),
             )
             if not message or not message.media:
