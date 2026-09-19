@@ -6860,6 +6860,10 @@ def mini_home():
     uid = int(user["id"])
     try:
         state = get_state(uid)
+        requested_mood = (request.args.get("mood") or "").strip().lower()
+        if requested_mood in MOODS:
+            set_mood(uid, requested_mood)
+            state = get_state(uid)
         mood = state.get("mood")
         liked_rows = []
         with db() as c:
@@ -6903,6 +6907,25 @@ def mini_home():
     except Exception as e:
         log.exception("Mini App home failed")
         return jsonify({"error": "Mini App data unavailable"}), 500
+
+
+@app.route("/api/discover")
+def mini_discover():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    try:
+        trending = trending_rows(10)
+        top_liked = top_liked_tracks(10)
+        surprise = _mini_pick_row(int(user["id"]))
+        return jsonify({
+            "trending": [_mini_track(row) for row in trending],
+            "top_liked": [_mini_track(row) for row in top_liked],
+            "surprise": _mini_track(surprise),
+        })
+    except Exception:
+        log.exception("Mini App discover failed")
+        return jsonify({"error": "Discover data unavailable"}), 500
 
 
 @app.route("/api/track/<int:track_id>")
