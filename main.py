@@ -6781,6 +6781,8 @@ MINI_APP_MAX_AGE = 86400
 MINI_AUDIO_CACHE_ITEMS = geti("MINI_AUDIO_CACHE_ITEMS", 4, 1, 12)
 _MINI_AUDIO_CACHE = {}
 _MINI_AUDIO_CACHE_LOCK = threading.Lock()
+_MINI_AUDIO_FILE_LOCKS = {}
+_MINI_AUDIO_FILE_LOCKS_GUARD = threading.Lock()
 
 
 def _mini_app_user():
@@ -7059,11 +7061,12 @@ def mini_track(track_id):
 
 @app.route("/api/track/<int:track_id>/audio")
 def mini_track_audio(track_id):
-    """Authenticate the Mini App request and stream Telegram audio progressively.
+    """Serve Telegram audio as a normal seekable file.
 
-    The previous implementation downloaded the entire file into memory before Flask
-    sent the first byte. This version streams Telegram chunks immediately and keeps
-    a small in-memory cache for repeat plays.
+    Some Telegram in-app WebViews are unreliable with chunked/live responses
+    that have no Content-Length or real Range handling. We cache the downloaded
+    Telegram file on Render's ephemeral /tmp disk and let Flask send_file handle
+    Content-Length, Range/206 and the correct MIME type.
     """
     user, err = _mini_app_user()
     if err:
@@ -7075,93 +7078,128 @@ def mini_track_audio(track_id):
     if client is None or tele_loop is None or not ready.is_set():
         return jsonify({"error": "Telegram audio service is not ready"}), 503
 
-    with _MINI_AUDIO_CACHE_LOCK:
-        cached = _MINI_AUDIO_CACHE.get(track_id)
-    if cached:
-        data, mime = cached
-        return Response(
-            data,
-            mimetype=mime,
-            headers={
-                "Content-Disposition": "inline",
-                "Cache-Control": "private, max-age=1800",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(len(data)),
-                "X-Mini-Audio-Cache": "HIT",
-            },
-        )
+    import os
+    from pathlib import Path
 
-    import queue as _queue
-    stream_q = _queue.Queue(maxsize=8)
-    sentinel = object()
+    cache_dir = Path(os.getenv("MINI_AUDIO_CACHE_DIR", "/tmp/nyv_mini_audio"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    final_path = cache_dir / f"{int(track_id)}.audio"
+    mime_path = cache_dir / f"{int(track_id)}.mime"
 
-    async def producer():
-        collected = bytearray()
+    # Reuse a completed cached file.
+    if final_path.is_file() and final_path.stat().st_size > 0:
         mime = "audio/mpeg"
         try:
+            saved = mime_path.read_text().strip()
+            if saved:
+                mime = saved
+        except Exception:
+            pass
+        log.info("Mini App audio cache HIT track=%s size=%s mime=%s", track_id, final_path.stat().st_size, mime)
+        return send_file(
+            final_path,
+            mimetype=mime,
+            as_attachment=False,
+            conditional=True,
+            etag=True,
+            max_age=1800,
+            download_name=f"track-{int(track_id)}.audio",
+        )
+
+    # Only one request should populate a given track cache at a time.
+    with _MINI_AUDIO_FILE_LOCKS_GUARD:
+        lock = _MINI_AUDIO_FILE_LOCKS.get(int(track_id))
+        if lock is None:
+            lock = threading.Lock()
+            _MINI_AUDIO_FILE_LOCKS[int(track_id)] = lock
+
+    with lock:
+        if final_path.is_file() and final_path.stat().st_size > 0:
+            mime = "audio/mpeg"
+            try:
+                saved = mime_path.read_text().strip()
+                if saved:
+                    mime = saved
+            except Exception:
+                pass
+            return send_file(
+                final_path,
+                mimetype=mime,
+                as_attachment=False,
+                conditional=True,
+                etag=True,
+                max_age=1800,
+                download_name=f"track-{int(track_id)}.audio",
+            )
+
+        partial = cache_dir / f"{int(track_id)}.part"
+        try:
+            if partial.exists():
+                partial.unlink()
+        except Exception:
+            pass
+
+        async def download_full():
             message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
             if not message or not message.media:
-                stream_q.put((sentinel, None, None))
-                return
+                raise RuntimeError("Telegram media not found")
+
             obj = getattr(message, "audio", None) or getattr(message, "document", None)
             mime_value = getattr(obj, "mime_type", None) if obj else None
-            if mime_value and str(mime_value).startswith("audio/"):
-                mime = str(mime_value)
+            mime = str(mime_value) if mime_value and str(mime_value).startswith("audio/") else "audio/mpeg"
 
-            async for chunk in client.iter_download(message.media, request_size=512 * 1024):
-                if chunk:
-                    collected.extend(chunk)
-                    await asyncio.to_thread(stream_q.put, (bytes(chunk), None, None))
+            with open(partial, "wb") as fh:
+                async for chunk in client.iter_download(message.media, request_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
 
-            data = bytes(collected)
-            with _MINI_AUDIO_CACHE_LOCK:
-                _MINI_AUDIO_CACHE[track_id] = (data, mime)
-                while len(_MINI_AUDIO_CACHE) > MINI_AUDIO_CACHE_ITEMS:
-                    _MINI_AUDIO_CACHE.pop(next(iter(_MINI_AUDIO_CACHE)))
-            await asyncio.to_thread(stream_q.put, (sentinel, mime, len(data)))
+            if not partial.is_file() or partial.stat().st_size <= 0:
+                raise RuntimeError("Telegram audio download returned no data")
+            os.replace(partial, final_path)
+            mime_path.write_text(mime)
+            return mime
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(download_full(), tele_loop)
+            mime = future.result(timeout=180)
         except Exception as exc:
-            log.exception("Mini App audio stream failed track=%s", track_id)
-            await asyncio.to_thread(stream_q.put, (sentinel, None, 0))
+            log.exception("Mini App audio download failed track=%s", track_id)
+            try:
+                if partial.exists():
+                    partial.unlink()
+            except Exception:
+                pass
+            return jsonify({"error": "Audio file unavailable", "detail": str(exc)[:180]}), 502
 
-    asyncio.run_coroutine_threadsafe(producer(), tele_loop)
+        # Keep the disk cache bounded. Remove the oldest completed files first.
+        try:
+            files = sorted(
+                [p for p in cache_dir.glob("*.audio") if p.is_file()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            limit = MINI_AUDIO_CACHE_ITEMS
+            for old in files[limit:]:
+                try:
+                    old.unlink()
+                    old_mime = old.with_suffix(".mime")
+                    if old_mime.exists():
+                        old_mime.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            log.debug("Mini App audio cache cleanup failed", exc_info=True)
 
-    def generate():
-        while True:
-            chunk, mime, total = stream_q.get()
-            if chunk is sentinel:
-                break
-            yield chunk
-        if not mime:
-            return
-
-    # Wait only for the first chunk, so the browser/audio element can begin
-    # receiving bytes instead of waiting for the complete Telegram download.
-    try:
-        first, mime, total = stream_q.get(timeout=12)
-    except Exception:
-        return jsonify({"error": "Audio file unavailable"}), 504
-    if first is sentinel:
-        return jsonify({"error": "Audio file unavailable"}), 404
-
-    def first_then_rest():
-        yield first
-        while True:
-            chunk, end_mime, total = stream_q.get()
-            if chunk is sentinel:
-                break
-            yield chunk
-
-    return Response(
-        first_then_rest(),
-        mimetype=mime or "audio/mpeg",
-        headers={
-            "Content-Disposition": "inline",
-            "Cache-Control": "private, max-age=1800",
-            "Accept-Ranges": "bytes",
-            "X-Mini-Audio-Cache": "STREAM",
-            "X-Mini-Audio-Chunk": str(len(first)),
-        },
-    )
+        log.info("Mini App audio cache MISS->SAVED track=%s size=%s mime=%s", track_id, final_path.stat().st_size, mime)
+        return send_file(
+            final_path,
+            mimetype=mime,
+            as_attachment=False,
+            conditional=True,
+            etag=True,
+            max_age=1800,
+            download_name=f"track-{int(track_id)}.audio",
+        )
 
 @app.route("/api/track/<int:track_id>/feedback", methods=["POST"])
 def mini_feedback(track_id):
