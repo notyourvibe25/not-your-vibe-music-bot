@@ -6928,7 +6928,10 @@ def mini_home():
 
         daily = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
         for_you = _mini_pick_row(uid, liked_only=True)
-        radio = _mini_radio_row(uid, baseline_mood=mood)
+        # Keep initial Home fast: exact bot Radio selection is done by /api/action
+        # when the user opens/plays Radio. A lightweight preview avoids blocking
+        # the first screen on the full continuity/scoring query.
+        radio = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
         # Keep Track of the Day deterministic per user/day.
         day = datetime.now(ZoneInfo("Asia/Yangon")).date().isoformat()
         with db() as c:
