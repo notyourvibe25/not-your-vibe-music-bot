@@ -41,6 +41,7 @@ The Flask service now serves:
 - `/api/me`
 - `/api/home`
 - `/api/discover`
+- `/api/action`
 - `/api/liked`
 - `/api/track/<id>`
 - `/api/track/<id>/feedback`
@@ -58,6 +59,17 @@ Me actions are written through `track_feedback`, so they are immediately
 available to the bot. Mini App mood chips persist through `user_state`, so the
 bot and Mini App use the same selected mood. `/api/discover` reads the bot's
 existing Trending and Top 10 Liked calculations and returns them to Home.
+
+Mini App Radio calls the bot's existing `radio_track()` engine directly. This
+keeps the same feedback-weighted mood ratios, 70/20/10 fresh/liked/special
+pool mix, listening-history guards, BPM continuity, harmonic-key continuity,
+time-of-day context, and Trending/Top-10-Liked inputs.
+
+The Mini App action controls also call the bot's own selection helpers through
+`/api/action`: `radio`, `next`, `daily_vibe`, `for_you`, `surprise_me`, and
+`track_of_day`. These actions share the bot's `user_state`, `user_history`,
+special-mode memory, feedback tables, and reservation logic rather than using
+an independent Mini App recommendation implementation.
 
 ## BotFather — Menu Button
 
