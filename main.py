@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from typing import Mapping
 
 import requests
-from flask import Flask, request, Response, render_template, jsonify, send_file
+from flask import Flask, request, Response, render_template, jsonify, send_file, make_response
 
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
@@ -6830,7 +6830,10 @@ def _mini_pick_row(uid, mood=None, liked_only=False):
 
 @app.route("/mini-app")
 def mini_app():
-    return render_template("index.html")
+    response = make_response(render_template("index.html"))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.route("/api/me")
