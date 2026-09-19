@@ -6698,14 +6698,33 @@ def share_page(title, description, bot_link, image_url=None):
     )
     return f"""<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{escape(title)}</title><meta property=\"og:title\" content=\"{escape(title)}\"><meta property=\"og:description\" content=\"{escape(description)}\">{image_meta}<meta name=\"twitter:card\" content=\"summary_large_image\"><meta name=\"twitter:title\" content=\"{escape(title)}\"><meta name=\"twitter:description\" content=\"{escape(description)}\"><style>body{{margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,-apple-system,sans-serif}}main{{max-width:560px;margin:8vh auto;padding:24px}}.card{{border:1px solid #292933;border-radius:24px;padding:30px;text-align:center;background:#121218}}h1{{font-size:28px;margin:8px 0 12px}}p{{color:#b7b7c2;line-height:1.5}}a{{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:999px;background:#fff;color:#111;text-decoration:none;font-weight:700}}</style></head><body><main><div class=\"card\"><div>🎧</div><h1>{escape(title)}</h1><p>{escape(description)}</p><a href=\"{escape(bot_link)}\">Open in Telegram</a></div></main></body></html>"""
 
+
+_SHARE_COVER_CACHE = {}
+_SHARE_COVER_LOCK = threading.Lock()
+SHARE_COVER_FAILURE_BACKOFF = 300
+
 @app.route("/share/track/<int:track_id>/cover")
 def share_track_cover(track_id):
     row = get_track(track_id)
     if not row or client is None or tele_loop is None or not ready.is_set():
         return ("", 404)
     try:
+        now = time.time()
+        with _SHARE_COVER_LOCK:
+            cached = _SHARE_COVER_CACHE.get(int(track_id))
+        if cached:
+            data, content_type, cached_at = cached
+            if data:
+                return Response(
+                    data,
+                    mimetype=content_type,
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
+            if now - cached_at < SHARE_COVER_FAILURE_BACKOFF:
+                return ("", 404)
+
         async def fetch_thumb():
-            message = await client.get_messages(str(row["channel_id"]), ids=int(row["message_id"]))
+            message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
             if not message or not message.media:
                 return None
             buf = io.BytesIO()
@@ -6715,8 +6734,10 @@ def share_track_cover(track_id):
             return buf.getvalue()
 
         future = asyncio.run_coroutine_threadsafe(fetch_thumb(), tele_loop)
-        data = future.result(timeout=12)
+        data = future.result(timeout=8)
         if not data:
+            with _SHARE_COVER_LOCK:
+                _SHARE_COVER_CACHE[int(track_id)] = (None, "image/jpeg", now)
             return ("", 404)
         if data.startswith(b"\x89PNG"):
             content_type = "image/png"
@@ -6724,9 +6745,13 @@ def share_track_cover(track_id):
             content_type = "image/webp"
         else:
             content_type = "image/jpeg"
+        with _SHARE_COVER_LOCK:
+            _SHARE_COVER_CACHE[int(track_id)] = (data, content_type, now)
         return Response(data, mimetype=content_type, headers={"Cache-Control": "public, max-age=86400"})
     except Exception:
-        log.exception("share cover failed track=%s", track_id)
+        with _SHARE_COVER_LOCK:
+            _SHARE_COVER_CACHE[int(track_id)] = (None, "image/jpeg", time.time())
+        log.warning("share cover unavailable track=%s; using cover backoff", track_id)
         return ("", 404)
 
 @app.route("/share/track/<int:track_id>")
@@ -6760,7 +6785,7 @@ _MINI_AUDIO_CACHE_LOCK = threading.Lock()
 
 def _mini_app_user():
     """Validate Telegram WebApp initData and return the Telegram user."""
-    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    init_data = request.headers.get("X-Telegram-Init-Data", "") or request.args.get("initData", "")
     if not init_data or not BOT_TOKEN:
         return None, ("Telegram authentication required", 401)
 
@@ -7034,7 +7059,12 @@ def mini_track(track_id):
 
 @app.route("/api/track/<int:track_id>/audio")
 def mini_track_audio(track_id):
-    """Authenticate the Mini App request, fetch the Telegram audio, and stream it."""
+    """Authenticate the Mini App request and stream Telegram audio progressively.
+
+    The previous implementation downloaded the entire file into memory before Flask
+    sent the first byte. This version streams Telegram chunks immediately and keeps
+    a small in-memory cache for repeat plays.
+    """
     user, err = _mini_app_user()
     if err:
         return jsonify({"error": err[0]}), err[1]
@@ -7042,73 +7072,96 @@ def mini_track_audio(track_id):
     row = get_track(track_id)
     if not row:
         return jsonify({"error": "Track not found"}), 404
-
     if client is None or tele_loop is None or not ready.is_set():
         return jsonify({"error": "Telegram audio service is not ready"}), 503
 
-    try:
-        with _MINI_AUDIO_CACHE_LOCK:
-            cached = _MINI_AUDIO_CACHE.get(track_id)
-        if cached:
-            data, mime = cached
-            return Response(
-                data,
-                mimetype=mime,
-                headers={
-                    "Content-Disposition": "inline",
-                    "Cache-Control": "private, max-age=300",
-                    "Accept-Ranges": "bytes",
-                    "Content-Length": str(len(data)),
-                    "X-Mini-Audio-Cache": "HIT",
-                },
-            )
-
-        async def fetch_audio():
-            message = await client.get_messages(
-                int(row["channel_id"]),
-                ids=int(row["message_id"]),
-            )
-            if not message or not message.media:
-                return None, None
-
-            buf = io.BytesIO()
-            result = await message.download_media(file=buf)
-            if not result:
-                return None, None
-
-            mime = "audio/mpeg"
-            obj = getattr(message, "audio", None) or getattr(message, "document", None)
-            mime_value = getattr(obj, "mime_type", None) if obj else None
-            if mime_value and str(mime_value).startswith("audio/"):
-                mime = str(mime_value)
-
-            return buf.getvalue(), mime
-
-        future = asyncio.run_coroutine_threadsafe(fetch_audio(), tele_loop)
-        data, mime = future.result(timeout=90)
-
-        if not data:
-            return jsonify({"error": "Audio file unavailable"}), 404
-
-        with _MINI_AUDIO_CACHE_LOCK:
-            _MINI_AUDIO_CACHE[track_id] = (data, mime)
-            while len(_MINI_AUDIO_CACHE) > MINI_AUDIO_CACHE_ITEMS:
-                _MINI_AUDIO_CACHE.pop(next(iter(_MINI_AUDIO_CACHE)))
-
+    with _MINI_AUDIO_CACHE_LOCK:
+        cached = _MINI_AUDIO_CACHE.get(track_id)
+    if cached:
+        data, mime = cached
         return Response(
             data,
             mimetype=mime,
             headers={
                 "Content-Disposition": "inline",
-                "Cache-Control": "private, max-age=300",
+                "Cache-Control": "private, max-age=1800",
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(len(data)),
-                "X-Mini-Audio-Cache": "MISS",
+                "X-Mini-Audio-Cache": "HIT",
             },
         )
+
+    import queue as _queue
+    stream_q = _queue.Queue(maxsize=8)
+    sentinel = object()
+
+    async def producer():
+        collected = bytearray()
+        mime = "audio/mpeg"
+        try:
+            message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
+            if not message or not message.media:
+                stream_q.put((sentinel, None, None))
+                return
+            obj = getattr(message, "audio", None) or getattr(message, "document", None)
+            mime_value = getattr(obj, "mime_type", None) if obj else None
+            if mime_value and str(mime_value).startswith("audio/"):
+                mime = str(mime_value)
+
+            async for chunk in client.iter_download(message.media, request_size=512 * 1024):
+                if chunk:
+                    collected.extend(chunk)
+                    await asyncio.to_thread(stream_q.put, (bytes(chunk), None, None))
+
+            data = bytes(collected)
+            with _MINI_AUDIO_CACHE_LOCK:
+                _MINI_AUDIO_CACHE[track_id] = (data, mime)
+                while len(_MINI_AUDIO_CACHE) > MINI_AUDIO_CACHE_ITEMS:
+                    _MINI_AUDIO_CACHE.pop(next(iter(_MINI_AUDIO_CACHE)))
+            await asyncio.to_thread(stream_q.put, (sentinel, mime, len(data)))
+        except Exception as exc:
+            log.exception("Mini App audio stream failed track=%s", track_id)
+            await asyncio.to_thread(stream_q.put, (sentinel, None, 0))
+
+    asyncio.run_coroutine_threadsafe(producer(), tele_loop)
+
+    def generate():
+        while True:
+            chunk, mime, total = stream_q.get()
+            if chunk is sentinel:
+                break
+            yield chunk
+        if not mime:
+            return
+
+    # Wait only for the first chunk, so the browser/audio element can begin
+    # receiving bytes instead of waiting for the complete Telegram download.
+    try:
+        first, mime, total = stream_q.get(timeout=12)
     except Exception:
-        log.exception("Mini App audio failed track=%s", track_id)
-        return jsonify({"error": "Playback unavailable"}), 500
+        return jsonify({"error": "Audio file unavailable"}), 504
+    if first is sentinel:
+        return jsonify({"error": "Audio file unavailable"}), 404
+
+    def first_then_rest():
+        yield first
+        while True:
+            chunk, end_mime, total = stream_q.get()
+            if chunk is sentinel:
+                break
+            yield chunk
+
+    return Response(
+        first_then_rest(),
+        mimetype=mime or "audio/mpeg",
+        headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": "private, max-age=1800",
+            "Accept-Ranges": "bytes",
+            "X-Mini-Audio-Cache": "STREAM",
+            "X-Mini-Audio-Chunk": str(len(first)),
+        },
+    )
 
 @app.route("/api/track/<int:track_id>/feedback", methods=["POST"])
 def mini_feedback(track_id):
