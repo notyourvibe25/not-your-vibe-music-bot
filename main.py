@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import hashlib
+import hmac
+import json
 import logging
 import os
 import random
@@ -10,7 +12,7 @@ import threading
 import math
 import time
 from html import escape
-from urllib.parse import quote
+from urllib.parse import quote, parse_qsl
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -19,7 +21,7 @@ from contextlib import contextmanager
 from typing import Mapping
 
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request, Response, render_template, jsonify, send_file
 
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
@@ -6745,6 +6747,184 @@ def share_profile_page(profile_uid):
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     name = lines[2] if len(lines) > 2 else "Vibe Listener"
     return share_page(f"{name} • NOT YOUR VIBE", "A personal EDM taste profile.", f"https://t.me/{BOT_USERNAME}?start=profile_{profile_uid}")
+
+# =========================================================
+# TELEGRAM MINI APP
+# =========================================================
+
+MINI_APP_MAX_AGE = 86400
+
+
+def _mini_app_user():
+    """Validate Telegram WebApp initData and return the Telegram user."""
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    if not init_data or not BOT_TOKEN:
+        return None, ("Telegram authentication required", 401)
+
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = pairs.pop("hash", "")
+        auth_date = int(pairs.get("auth_date", "0"))
+        if not received_hash or not auth_date:
+            return None, ("Invalid Telegram initData", 401)
+        if abs(int(time.time()) - auth_date) > MINI_APP_MAX_AGE:
+            return None, ("Telegram initData expired", 401)
+
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated, received_hash):
+            return None, ("Invalid Telegram initData", 401)
+
+        user = json.loads(pairs.get("user", "{}"))
+        uid = int(user.get("id"))
+        return user, None
+    except Exception:
+        return None, ("Invalid Telegram initData", 401)
+
+
+def _mini_track(row):
+    if not row:
+        return None
+    d = dict(row)
+    d["id"] = int(d["id"])
+    d["channel_id"] = str(d["channel_id"])
+    d["message_id"] = int(d["message_id"])
+    if "musical_key" in d:
+        d["key"] = d.pop("musical_key")
+    d["cover_url"] = f"/share/track/{d['id']}/cover"
+    return d
+
+
+def _mini_pick_row(uid, mood=None, liked_only=False):
+    with db() as c:
+        with cur(c) as x:
+            if liked_only:
+                x.execute("""
+                    SELECT t.id,t.mood,t.channel_id,t.message_id,t.title,
+                           t.bpm,t.musical_key,t.energy,t.danceability,t.loudness,
+                           t.genre,t.subgenre,t.analyzer_mood,t.analyzed
+                    FROM tracks t
+                    JOIN track_feedback f ON f.channel_id=t.channel_id AND f.message_id=t.message_id
+                    WHERE f.user_id=%s AND f.feedback='like'
+                    ORDER BY f.created_at DESC, t.id DESC
+                    LIMIT 1
+                """, (uid,))
+            elif mood:
+                x.execute("""
+                    SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
+                           energy,danceability,loudness,genre,subgenre,analyzer_mood,analyzed
+                    FROM tracks WHERE mood=%s ORDER BY RANDOM() LIMIT 1
+                """, (mood,))
+            else:
+                x.execute("""
+                    SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
+                           energy,danceability,loudness,genre,subgenre,analyzer_mood,analyzed
+                    FROM tracks ORDER BY RANDOM() LIMIT 1
+                """)
+            return x.fetchone()
+
+
+@app.route("/mini-app")
+def mini_app():
+    return render_template("index.html")
+
+
+@app.route("/api/me")
+def mini_me():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    return jsonify({
+        "user": {
+            "id": uid,
+            "first_name": user.get("first_name", ""),
+            "last_name": user.get("last_name", ""),
+            "username": user.get("username", ""),
+        }
+    })
+
+
+@app.route("/api/home")
+def mini_home():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    try:
+        state = get_state(uid)
+        mood = state.get("mood")
+        liked_rows = []
+        with db() as c:
+            with cur(c) as x:
+                x.execute("""
+                    SELECT t.id,t.mood,t.channel_id,t.message_id,t.title,
+                           t.bpm,t.musical_key,t.energy,t.danceability,t.loudness,
+                           t.genre,t.subgenre,t.analyzer_mood,t.analyzed
+                    FROM tracks t
+                    JOIN track_feedback f ON f.channel_id=t.channel_id AND f.message_id=t.message_id
+                    WHERE f.user_id=%s AND f.feedback='like'
+                    ORDER BY f.created_at DESC,t.id DESC LIMIT 30
+                """, (uid,))
+                liked_rows = x.fetchall()
+
+        daily = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
+        for_you = _mini_pick_row(uid, liked_only=True)
+        radio = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
+        # Keep Track of the Day deterministic per user/day.
+        day = datetime.now(ZoneInfo("Asia/Yangon")).date().isoformat()
+        with db() as c:
+            with cur(c) as x:
+                x.execute("""
+                    SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
+                           energy,danceability,loudness,genre,subgenre,analyzer_mood,analyzed
+                    FROM tracks ORDER BY md5(id::text || %s) LIMIT 1
+                """, (f"{uid}:{day}",))
+                totd = x.fetchone()
+
+        return jsonify({
+            "user": {"id": uid, "first_name": user.get("first_name", "")},
+            "state": state,
+            "liked": [_mini_track(r) for r in liked_rows],
+            "recommendations": {
+                "daily_vibe": _mini_track(daily),
+                "for_you": _mini_track(for_you),
+                "radio": _mini_track(radio),
+                "track_of_day": _mini_track(totd),
+            }
+        })
+    except Exception as e:
+        log.exception("Mini App home failed")
+        return jsonify({"error": "Mini App data unavailable"}), 500
+
+
+@app.route("/api/track/<int:track_id>")
+def mini_track(track_id):
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    row = get_track(track_id)
+    if not row:
+        return jsonify({"error": "Track not found"}), 404
+    return jsonify(_mini_track(row))
+
+
+@app.route("/api/track/<int:track_id>/feedback", methods=["POST"])
+def mini_feedback(track_id):
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    row = get_track(track_id)
+    if not row:
+        return jsonify({"error": "Track not found"}), 404
+    payload = request.get_json(silent=True) or {}
+    fb = payload.get("feedback")
+    ok = save_feedback(int(user["id"]), row["channel_id"], row["message_id"], row["mood"], fb)
+    if not ok:
+        return jsonify({"error": "Invalid feedback"}), 400
+    return jsonify({"ok": True, "feedback": fb})
+
 
 @app.route("/health")
 def health():
