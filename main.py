@@ -7146,7 +7146,10 @@ def mini_track_audio(track_id):
 
             obj = getattr(message, "audio", None) or getattr(message, "document", None)
             mime_value = getattr(obj, "mime_type", None) if obj else None
-            mime = str(mime_value) if mime_value and str(mime_value).startswith("audio/") else "audio/mpeg"
+            mime = str(mime_value).lower().strip() if mime_value and str(mime_value).lower().strip().startswith("audio/") else "audio/mpeg"
+            # Normalize common Android/WebView aliases to standards-based MIME types.
+            if mime in ("audio/m4a", "audio/x-m4a"):
+                mime = "audio/mp4"
 
             with open(partial, "wb") as fh:
                 async for chunk in client.iter_download(message.media, request_size=1024 * 1024):
