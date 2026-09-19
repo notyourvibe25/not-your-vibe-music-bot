@@ -6828,6 +6828,25 @@ def _mini_pick_row(uid, mood=None, liked_only=False):
             return x.fetchone()
 
 
+def _mini_radio_row(uid, baseline_mood=None):
+    """Return the exact track selected by the bot Radio engine."""
+    picked = radio_track(uid, baseline_mood=baseline_mood)
+    if not picked:
+        return None
+    _, message_id, channel_id, _ = picked
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
+                       energy,danceability,loudness,genre,subgenre,
+                       analyzer_mood,analyzed
+                FROM tracks
+                WHERE channel_id=%s AND message_id=%s
+                LIMIT 1
+            """, (str(channel_id), int(message_id)))
+            return x.fetchone()
+
+
 @app.route("/mini-app")
 def mini_app():
     response = make_response(render_template("index.html"))
@@ -6881,7 +6900,7 @@ def mini_home():
 
         daily = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
         for_you = _mini_pick_row(uid, liked_only=True)
-        radio = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
+        radio = _mini_radio_row(uid, baseline_mood=mood)
         # Keep Track of the Day deterministic per user/day.
         day = datetime.now(ZoneInfo("Asia/Yangon")).date().isoformat()
         with db() as c:
@@ -6907,6 +6926,80 @@ def mini_home():
     except Exception as e:
         log.exception("Mini App home failed")
         return jsonify({"error": "Mini App data unavailable"}), 500
+
+
+def _mini_row_from_pick(picked):
+    if not picked:
+        return None
+    _, message_id, channel_id = picked[:3]
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
+                       energy,danceability,loudness,genre,subgenre,
+                       analyzer_mood,analyzed
+                FROM tracks
+                WHERE channel_id=%s AND message_id=%s
+                LIMIT 1
+            """, (str(channel_id), int(message_id)))
+            return x.fetchone()
+
+
+@app.route("/api/action", methods=["POST"])
+def mini_action():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    payload = request.get_json(silent=True) or {}
+    action = str(payload.get("action") or "").strip().lower()
+    requested_mood = str(payload.get("mood") or "").strip().lower()
+    if requested_mood in MOODS:
+        set_mood(uid, requested_mood)
+    state = get_state(uid)
+    mood = state.get("mood") or "melodic"
+    if action == "mood":
+        if requested_mood not in MOODS:
+            return jsonify({"error": "Invalid mood"}), 400
+        return jsonify({"ok": True, "state": get_state(uid)})
+    if action == "radio":
+        set_radio(uid, True)
+        state = get_state(uid)
+        picked = radio_track(uid, baseline_mood=mood)
+    elif action == "next":
+        picked = radio_track(uid, baseline_mood=mood) if state.get("radio") else normal_track(uid, mood)
+    elif action == "daily_vibe":
+        set_special_mode(uid, "daily_vibe")
+        picked = daily_vibe_track(uid)
+    elif action == "for_you":
+        set_special_mode(uid, "for_you")
+        picked = for_you_track(uid)
+    elif action == "surprise_me":
+        set_special_mode(uid, "surprise_me")
+        picked = surprise_track(uid)
+    elif action == "track_of_day":
+        set_special_mode(uid, "track_of_day")
+        picked = track_of_day(uid)
+    else:
+        return jsonify({"error": "Unknown bot action"}), 400
+    if not picked:
+        return jsonify({"error": "No suitable track found", "state": get_state(uid)}), 404
+    selected = (picked[0], picked[1], picked[2])
+    radio_mode = action == "radio" or state.get("radio")
+    reserved = reserve(uid, selected, no_repeat_today=(action in ("radio", "next") and radio_mode))
+    if not reserved and action in ("radio", "next"):
+        for _ in range(3):
+            picked = radio_track(uid, baseline_mood=mood) if radio_mode else normal_track(uid, mood)
+            if not picked:
+                break
+            selected = (picked[0], picked[1], picked[2])
+            reserved = reserve(uid, selected, no_repeat_today=(action in ("radio", "next") and radio_mode))
+            if reserved:
+                break
+    row = _mini_row_from_pick(picked)
+    if not row:
+        return jsonify({"error": "Selected track is unavailable"}), 404
+    return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": _mini_track(row)})
 
 
 @app.route("/api/discover")
