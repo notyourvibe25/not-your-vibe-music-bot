@@ -6785,86 +6785,6 @@ _MINI_AUDIO_FILE_LOCKS = {}
 _MINI_AUDIO_FILE_LOCKS_GUARD = threading.Lock()
 
 
-def _mini_stream_audio(row, track_id):
-    """Start sending Telegram audio as soon as the first chunk arrives.
-
-    The previous implementation downloaded the complete Telegram file before
-    Flask sent the first byte.  That makes a large track feel stuck in the
-    Telegram WebView.  A bounded queue keeps Telethon and Flask decoupled so
-    playback can begin immediately without buffering the whole song in RAM.
-    """
-    import queue
-
-    chunks = queue.Queue(maxsize=8)
-    sentinel = object()
-
-    async def producer():
-        try:
-            message = await client.get_messages(
-                int(row["channel_id"]), ids=int(row["message_id"])
-            )
-            if not message or not message.media:
-                raise RuntimeError("Telegram media not found")
-
-            obj = getattr(message, "audio", None) or getattr(message, "document", None)
-            mime_value = getattr(obj, "mime_type", None) if obj else None
-            mime = (
-                str(mime_value).lower().strip()
-                if mime_value and str(mime_value).lower().strip().startswith("audio/")
-                else "audio/mpeg"
-            )
-            if mime in ("audio/m4a", "audio/x-m4a"):
-                mime = "audio/mp4"
-
-            await asyncio.to_thread(chunks.put, ("mime", mime))
-            async for chunk in client.iter_download(
-                message.media, request_size=512 * 1024
-            ):
-                if chunk:
-                    await asyncio.to_thread(chunks.put, ("data", chunk))
-            await asyncio.to_thread(chunks.put, ("done", sentinel))
-        except Exception as exc:
-            log.exception("Mini App audio stream failed track=%s", track_id)
-            await asyncio.to_thread(chunks.put, ("error", exc))
-
-    future = asyncio.run_coroutine_threadsafe(producer(), tele_loop)
-    try:
-        kind, value = chunks.get(timeout=15)
-    except queue.Empty:
-        future.cancel()
-        return jsonify({"error": "Audio stream timed out"}), 504
-    if kind == "error":
-        return jsonify({"error": "Audio file unavailable", "detail": str(value)[:180]}), 502
-    if kind != "mime":
-        future.cancel()
-        return jsonify({"error": "Audio stream unavailable"}), 502
-
-    def body():
-        try:
-            while True:
-                kind, value = chunks.get()
-                if kind == "data":
-                    yield value
-                elif kind == "done":
-                    return
-                elif kind == "error":
-                    return
-        finally:
-            if not future.done():
-                future.cancel()
-
-    return Response(
-        body(),
-        mimetype=value,
-        headers={
-            "Cache-Control": "no-store",
-            "Accept-Ranges": "none",
-            "X-Accel-Buffering": "no",
-        },
-        direct_passthrough=True,
-    )
-
-
 def _mini_app_user():
     """Validate Telegram WebApp initData and return the Telegram user."""
     init_data = request.headers.get("X-Telegram-Init-Data", "") or request.args.get("initData", "")
@@ -7157,16 +7077,6 @@ def mini_track_audio(track_id):
         return jsonify({"error": "Track not found"}), 404
     if client is None or tele_loop is None or not ready.is_set():
         return jsonify({"error": "Telegram audio service is not ready"}), 503
-
-    # Stream cache misses immediately.  Cached files below still use
-    # send_file, preserving fast repeat playback and normal HTTP range support.
-    import os
-    from pathlib import Path
-
-    cache_dir = Path(os.getenv("MINI_AUDIO_CACHE_DIR", "/tmp/nyv_mini_audio"))
-    final_path = cache_dir / f"{int(track_id)}.audio"
-    if not (final_path.is_file() and final_path.stat().st_size > 0):
-        return _mini_stream_audio(row, track_id)
 
     import os
     from pathlib import Path
