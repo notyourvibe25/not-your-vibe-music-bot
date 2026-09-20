@@ -5,7 +5,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>NOT YOUR VIBE</title>
-<script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+<script src="https://telegram.org/js/telegram-web-app.js?63">
+
+// UX polish: add non-invasive labels to icon-first controls.
+(function addAccessibleLabels(){
+  const label = (el) => {
+    if (!el || el.getAttribute('aria-label')) return;
+    const text = (el.textContent || '').replace(/\s+/g,' ').trim();
+    if (text) el.setAttribute('aria-label', text);
+    if (text && !el.getAttribute('title')) el.setAttribute('title', text);
+  };
+  const scan = () => document.querySelectorAll('button,[role="button"],a').forEach(label);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', scan, {once:true}); else scan();
+  new MutationObserver(scan).observe(document.documentElement, {subtree:true, childList:true});
+})();
+
+</script>
 <style>
 :root{--bg:#070a08;--panel:#111713;--panel2:#172019;--line:#27332b;--text:#f7fbf7;--muted:#9aa99e;--green:#b9ff45;--green2:#70dc43;--danger:#ff6b88;--shadow:0 18px 50px rgba(0,0,0,.28)}
 *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 18% -10%,#29412a 0,#101811 30%,var(--bg) 68%);color:var(--text);font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;padding-bottom:190px}button{font:inherit;color:inherit;cursor:pointer}.app{max-width:760px;margin:auto;padding:18px 16px 28px}.top{display:flex;align-items:center;justify-content:space-between;margin:4px 0 22px}.brand{font-size:11px;font-weight:900;letter-spacing:2.4px;color:var(--green)}.avatar{width:42px;height:42px;border:1px solid var(--line);border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#29452d,#121a14);font-weight:900}.eyebrow{color:var(--muted);font-size:12px;margin-bottom:8px}h1{font-size:32px;line-height:1.03;letter-spacing:-1.5px;margin:0}.sub{color:var(--muted);font-size:13px;margin-top:8px}.section{margin-top:28px}.sectionHead{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.sectionHead h2{font-size:19px;letter-spacing:-.4px;margin:0}.link{font-size:11px;letter-spacing:1px;color:var(--green);background:none;border:0;font-weight:800}.hero{border:1px solid #34523b;border-radius:26px;padding:20px;background:linear-gradient(135deg,#223b25,#111b14 66%);box-shadow:var(--shadow);overflow:hidden;position:relative}.hero:after{content:"";position:absolute;width:210px;height:210px;border-radius:50%;right:-78px;top:-90px;background:rgba(185,255,69,.14);filter:blur(18px)}.pill{display:inline-flex;padding:7px 10px;border:1px solid #486647;border-radius:999px;color:var(--green);font-size:10px;font-weight:900;letter-spacing:1.1px;position:relative;z-index:1}.heroTitle{font-size:26px;font-weight:900;margin-top:14px;letter-spacing:-.8px;max-width:78%;position:relative;z-index:1}.heroMeta{color:#c4d0c6;font-size:13px;margin-top:6px;position:relative;z-index:1}.heroBottom{display:flex;align-items:end;justify-content:space-between;margin-top:18px;position:relative;z-index:1}.play{border:0;background:var(--green);color:#10180d;width:52px;height:52px;border-radius:50%;font-size:20px;display:grid;place-items:center;box-shadow:0 10px 30px rgba(112,220,67,.25);transition:transform .16s ease}.play:active,.miniPlay:active,.feedback:active{transform:scale(.96)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:rgba(17,23,19,.88);border:1px solid var(--line);border-radius:19px;padding:15px;min-height:118px;transition:background .18s,transform .18s}.card:active{transform:translateY(1px);background:var(--panel2)}.card small{color:var(--green);font-size:10px;letter-spacing:1.2px;font-weight:900}.card h3{margin:8px 0 4px;font-size:17px}.card p{margin:0;color:var(--muted);font-size:12px;line-height:1.35}.track{display:flex;align-items:center;gap:11px;padding:11px 0;border-bottom:1px solid var(--line)}.track:last-child{border-bottom:0}.cover{width:54px;height:54px;border-radius:13px;object-fit:cover;background:#1b251d;border:1px solid var(--line);flex:none}.trackMain{min-width:0;flex:1}.trackTitle{font-size:14px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.trackMeta{font-size:11px;color:var(--muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.trackActions{display:flex;align-items:center;gap:5px}.miniPlay,.feedback{width:36px;height:36px;border-radius:50%;border:1px solid var(--line);background:var(--panel2);display:grid;place-items:center;font-size:14px}.feedback{font-size:17px;color:var(--muted)}.feedback.liked{color:var(--green);border-color:#507344}.feedback.dislike{font-size:14px}.shareBtn{width:36px;height:36px;border-radius:50%;border:1px solid var(--line);background:var(--panel2);display:grid;place-items:center;font-size:15px;color:var(--green)}.shareBtn:active{transform:scale(.96)}.featureCard{cursor:pointer}.featureCard:focus-visible{outline:2px solid var(--green);outline-offset:2px}.featureOverlay{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.68);backdrop-filter:blur(8px);display:none;align-items:flex-end;padding:12px}.featureOverlay.open{display:flex}.featurePanel{position:relative;width:100%;max-width:760px;margin:auto;background:#131b15;border:1px solid #3b5b3f;border-radius:24px 24px 16px 16px;padding:22px 18px 26px;box-shadow:0 24px 80px rgba(0,0,0,.45);max-height:78vh;overflow:auto}.featurePanel h2{font-size:25px;letter-spacing:-.8px;margin:14px 42px 7px 0}.featurePanel p{color:var(--muted);font-size:13px;line-height:1.45;margin:0 0 12px}.closePanel{position:absolute;right:14px;top:12px;border:0;background:var(--panel2);color:var(--green);border-radius:50%;width:36px;height:36px;font-size:25px;line-height:1}.featureCta{display:flex;gap:9px;align-items:center;margin:12px 0 5px}.featureCta button{border:1px solid #4d734a;background:var(--green);color:#10180d;border-radius:999px;padding:10px 15px;font-size:12px;font-weight:900}.featureCta button.secondary{background:transparent;color:var(--green)}.empty{border:1px dashed var(--line);border-radius:18px;padding:25px;text-align:center;color:var(--muted);font-size:13px}.queueLabel{color:var(--muted);font-size:12px;margin-top:5px}.bottom{position:fixed;z-index:20;bottom:0;left:0;right:0;padding:8px max(12px,env(safe-area-inset-left)) calc(8px + env(safe-area-inset-bottom));background:rgba(7,10,8,.91);backdrop-filter:blur(18px);border-top:1px solid var(--line)}.now{max-width:760px;margin:0 auto 8px;display:flex;align-items:center;gap:10px;background:#182319;border:1px solid #2d4630;border-radius:15px;padding:8px 10px}.now .cover{width:38px;height:38px;border-radius:9px}.nowInfo{min-width:0;flex:1}.nowTitle{font-size:12px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.nowStatus{font-size:10px;color:var(--muted);margin-top:2px}.now button{border:0;background:none;color:var(--green);font-size:17px;padding:5px}.nowControls{display:flex;align-items:center;gap:2px}.nowControls button{width:28px;height:30px;display:grid;place-items:center;border-radius:8px}.nowControls .shareNow{font-size:15px;color:var(--green)}.nowControls button:active{background:#29412b}.nowControls .primary{font-size:19px}.moodSection{display:flex;gap:8px;overflow:auto;padding:2px 1px 5px;scrollbar-width:none}.moodSection::-webkit-scrollbar{display:none}.moodChip{flex:none;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:9px 12px;font-size:11px;font-weight:800}.moodChip.active,.moodChip:active{border-color:#5d8c51;background:#233824;color:var(--green)}.nav{max-width:760px;margin:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:5px}.nav button{background:transparent;border:0;color:var(--muted);font-size:10px;padding:5px 0}.nav button.active{color:var(--green)}.navIcon{font-size:18px;display:block;margin-bottom:2px}.toast{position:fixed;left:50%;bottom:150px;transform:translateX(-50%) translateY(10px);opacity:0;background:var(--green);color:#10180d;padding:10px 14px;border-radius:999px;font-size:12px;font-weight:800;transition:.2s;z-index:30;pointer-events:none}.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}audio{display:none}@media(min-width:650px){.app{padding-top:28px}}
@@ -27,6 +42,47 @@ body:before{background:radial-gradient(600px 420px at 92% 12%,rgba(198,255,74,.0
 .featureOverlay{background:rgba(0,0,0,.78)}.featurePanel{max-width:900px;border-radius:28px 28px 18px 18px;background:linear-gradient(145deg,#17251a,#0c120d);border-color:rgba(198,255,74,.24)}
 @media(max-width:560px){.app{padding-left:14px;padding-right:14px}.hero{padding:22px;min-height:230px}.heroTitle{max-width:94%;font-size:34px}.grid{grid-template-columns:1fr 1fr;gap:10px}.card{min-height:138px;padding:15px}.card h3{font-size:17px}.homeNowCover{width:70px;height:70px}.trackActions{gap:3px}.trackActions button{width:32px;height:32px}.trackActions .shareBtn{display:none}}
 @media(min-width:760px){.app{padding-top:34px}.hero{padding:34px}.section{margin-top:44px}}
+
+
+/* UX polish: visual-only and accessibility-safe refinements */
+:root{--focus:rgba(198,255,74,.9);--surface:rgba(255,255,255,.045)}
+html{-webkit-text-size-adjust:100%;scroll-padding-bottom:190px}
+body{overflow-x:hidden;-webkit-tap-highlight-color:transparent}
+button,a{touch-action:manipulation}
+button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:3px}
+button:disabled{cursor:not-allowed;opacity:.52}
+::selection{background:rgba(198,255,74,.28);color:var(--text)}
+.app{padding-left:max(16px,env(safe-area-inset-left));padding-right:max(16px,env(safe-area-inset-right))}
+.hero,.card,.homeNow,.now,#queueList,#likedList,#sharedLists{contain:layout paint}
+.track{min-height:78px}
+.trackActions{flex:none}
+.miniPlay,.feedback,.shareBtn,.nowControls button,.homeNowControls button{min-width:42px;min-height:42px}
+.play,.hero .play{min-width:56px;min-height:56px}
+.link{padding:9px 4px;border-radius:10px}
+.link:hover,.link:focus-visible{background:rgba(198,255,74,.08)}
+.empty{display:grid;place-items:center;min-height:92px}
+.toast{max-width:min(92vw,520px);text-align:center;line-height:1.35;box-shadow:0 12px 34px rgba(0,0,0,.32)}
+.featurePanel{overscroll-behavior:contain}
+@media(max-width:560px){
+  .app{padding-top:16px;padding-bottom:30px}
+  .top{margin-bottom:18px}
+  h1{font-size:clamp(30px,10vw,42px)}
+  .hero{min-height:220px;padding:20px;border-radius:24px}
+  .heroTitle{font-size:clamp(28px,9vw,42px);max-width:92%}
+  .grid{grid-template-columns:1fr;gap:10px}
+  .card{min-height:unset;padding:16px}
+  .track{gap:10px;padding:12px 2px}
+  .cover{width:56px;height:56px}
+  .trackActions{gap:2px}
+  .trackActions button{min-width:40px;min-height:40px}
+  .bottom{padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right))}
+  .now{gap:8px;padding:8px}
+  .nowControls button{min-width:40px;min-height:40px}
+  .nav{gap:2px}
+  .nav button{min-height:44px}
+}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+
 </style>
 </head>
 <body>
