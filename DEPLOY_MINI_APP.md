@@ -76,6 +76,13 @@ channel IDs, an in-process success cache, an unavailable-cover backoff, and an
 8-second timeout. A missing cover returns 404 without repeatedly hammering
 Telegram; audio playback and track data remain independent of cover loading.
 
+Playback uses a single in-flight Next request. The track-ended event can reuse
+the preloaded bot-selected next track instead of returning early while a
+prefetch is active. Audio requests have bounded browser timeouts, retry/reload
+recovery, and a fallback blob path for WebViews that do not play streamed
+responses reliably. Community discovery loads after the primary Home payload
+so a slow Trending query cannot block the player.
+
 ## BotFather — Menu Button
 
 Open `@BotFather`:
