@@ -6186,8 +6186,7 @@ def message(m):
             "🎧 NOT YOUR VIBE\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "Your music. Your mood. Your radio.\n\n"
-            "Open the Mini App for the full experience, or choose a mood below to start listening.\n\n"
-            "What are you feeling today? 👇",
+            "Choose a mood or discover something new 👇",
             mood_menu(),
         )
 
