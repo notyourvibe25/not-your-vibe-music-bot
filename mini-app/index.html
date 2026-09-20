@@ -210,18 +210,22 @@ async function autoAdvance(){
   const token=++endedToken;
   clearTimeout(audioRecoveryTimer);
   const current=Number(state.playing);
-  if(!current || state.loading) return;
+  if(!current) return;
+  userPaused=false;
+  awaitingGesture=null;
   // Give a prefetched request a moment to resolve, but never leave the player stuck.
-  for(let i=0;i<8;i++){
+  for(let i=0;i<30;i++){
     if(token!==endedToken || Number(state.playing)!==current)return;
+    if(state.loading){await new Promise(r=>setTimeout(r,100));continue}
     if(!nextBusy && (nextRequest || nextForTrack===current)) break;
     await new Promise(r=>setTimeout(r,100));
   }
   if(token!==endedToken || Number(state.playing)!==current)return;
-  try{await nextTrack()}catch(e){
-    if(Number(state.playing)===current && !player.paused && !player.ended) return;
-    const fallback=state.queue[state.index+1];
-    if(fallback && Number(fallback.id)!==current) await playTrack(Number(fallback.id));
+  await nextTrack();
+  if(token!==endedToken || userPaused)return;
+  if(Number(state.playing)===current && player.paused){
+    await new Promise(r=>setTimeout(r,900));
+    if(token===endedToken && Number(state.playing)===current && !userPaused) await nextTrack();
   }
 }
 player.addEventListener('ended',autoAdvance);player.addEventListener('play',updateNow);player.addEventListener('pause',updateNow);player.addEventListener('waiting',()=>{$('#nowStatus').textContent='Buffering…';setBufferWidth('45%');scheduleAudioRecovery('waiting')});player.addEventListener('canplay',()=>{setBufferWidth('100%');setTimeout(()=>setBufferWidth('0'),350);updateNow()});player.addEventListener('timeupdate',()=>{if(player.duration&&isFinite(player.duration)){setBufferWidth(Math.min(100,player.currentTime/player.duration*100)+'%');const remaining=player.duration-player.currentTime;if(remaining<=20&&remaining>0.2)prepareNext()}});player.addEventListener('stalled',()=>scheduleAudioRecovery('stalled'));player.addEventListener('abort',()=>{if(Date.now()>=suppressRecoveryUntil)scheduleAudioRecovery('abort')});player.addEventListener('error',()=>{if(state.playing&&!player.ended){$('#nowStatus').textContent='Keeping your vibe…';scheduleAudioRecovery('error')}});document.addEventListener('visibilitychange',()=>{if(!state.playing)return;if(document.visibilityState==='hidden'){prepareNext();return}clearTimeout(audioRecoveryTimer);if(player.ended||(player.duration&&isFinite(player.duration)&&player.currentTime>=player.duration-0.35)){nextTrack();return}if(awaitingGesture===Number(state.playing)){playTrack(Number(state.playing));return}if(!userPaused&&player.paused&&player.currentTime>0){const p=player.play();if(p&&typeof p.catch==='function')p.catch(()=>scheduleAudioRecovery('resume'))}});window.addEventListener('online',()=>{if(state.playing&&!userPaused&&player.paused)scheduleAudioRecovery('online')});$('#nowToggle').onclick=()=>state.playing?playTrack(state.playing):playBotAction('next');$('#nowPrev').onclick=prevTrack;$('#nowNext').onclick=nextTrack;$('#homeNowToggle').onclick=()=>state.playing?playTrack(state.playing):playBotAction('next');$('#homeNowPrev').onclick=prevTrack;$('#homeNowNext').onclick=nextTrack;$('#homeNowLike').onclick=()=>state.playing&&feedback(state.playing,'like');$('#homeNowDislike').onclick=()=>state.playing&&feedback(state.playing,'not_for_me');$('#nowLike').onclick=()=>state.playing&&feedback(state.playing,'like');$('#nowDislike').onclick=()=>state.playing&&feedback(state.playing,'not_for_me');$('#nowShare').onclick=()=>state.playing&&shareTrack(state.playing);$('#nowQueue').onclick=()=>$('#queueList').scrollIntoView({behavior:'smooth'});$('#playQueue').onclick=()=>playTrack(state.queue[0]?.id);$('#heroFallbackPlay')?.addEventListener('click',()=>playTrack(state.queue[0]?.id));$('#refresh').onclick=()=>{toast('Refreshing your vibe…');load()};$('#retryLoad')?.addEventListener('click',load);$('#closeFeature').onclick=closeFeature;$('#featureOverlay').onclick=e=>{if(e.target.id==='featureOverlay')closeFeature()};document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');const tab=b.dataset.tab;if(tab==='liked')$('#likedSection').scrollIntoView({behavior:'smooth'});else if(tab==='queue')$('#queueList').scrollIntoView({behavior:'smooth'});else if(tab==='profile')openFeature('profile');else window.scrollTo({top:0,behavior:'smooth'})});load();
