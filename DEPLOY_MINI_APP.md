@@ -88,6 +88,18 @@ intentional track change does not cause an unnecessary reconnect or a brief
 pause. If the Bot next-track request fails after a song ends, the existing
 local queue is used as a fallback instead of stopping playback.
 
+When Telegram keeps the Mini App WebView alive in the background, the player
+resumes on visibility return and immediately advances if the previous track
+ended while the WebView was hidden. A browser/Telegram WebView cannot reliably
+continue JavaScript, network requests, or audio after the Mini App is fully
+closed; uninterrupted playback outside the Mini App requires the bot's own
+Telegram audio delivery/scheduler rather than a webpage player.
+
+The player uses `autoplay`/`playsinline`, asks the Bot for the next track when
+20 seconds remain, and prepares the next request when the WebView becomes
+hidden. This reduces the chance that background throttling leaves no ready
+track at the exact `ended` event.
+
 ## BotFather — Menu Button
 
 Open `@BotFather`:
