@@ -83,6 +83,11 @@ recovery, and a fallback blob path for WebViews that do not play streamed
 responses reliably. Community discovery loads after the primary Home payload
 so a slow Trending query cannot block the player.
 
+Transient `abort`, `stalled`, and `waiting` events are debounced so an
+intentional track change does not cause an unnecessary reconnect or a brief
+pause. If the Bot next-track request fails after a song ends, the existing
+local queue is used as a fallback instead of stopping playback.
+
 ## BotFather — Menu Button
 
 Open `@BotFather`:
