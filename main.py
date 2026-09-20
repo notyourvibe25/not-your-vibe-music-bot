@@ -12,6 +12,7 @@ import threading
 import math
 import time
 import contextlib
+from collections import OrderedDict
 from html import escape
 from urllib.parse import quote, parse_qsl
 
@@ -134,10 +135,13 @@ POOL_MAX = geti(
 
 SCAN_INTERVAL = geti(
     "AUTO_SCAN_INTERVAL",
-    300,
-    60,
-    3600,
+    0,
+    0,
+    86400,
 )
+
+DB_INIT_RETRIES = geti("DB_INIT_RETRIES", 6, 1, 20)
+DB_INIT_RETRY_DELAY = geti("DB_INIT_RETRY_DELAY", 10, 1, 120)
 
 RECONNECT = geti(
     "TELETHON_RECONNECT_DELAY",
@@ -6700,7 +6704,9 @@ def share_page(title, description, bot_link, image_url=None):
     return f"""<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{escape(title)}</title><meta property=\"og:title\" content=\"{escape(title)}\"><meta property=\"og:description\" content=\"{escape(description)}\">{image_meta}<meta name=\"twitter:card\" content=\"summary_large_image\"><meta name=\"twitter:title\" content=\"{escape(title)}\"><meta name=\"twitter:description\" content=\"{escape(description)}\"><style>body{{margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,-apple-system,sans-serif}}main{{max-width:560px;margin:8vh auto;padding:24px}}.card{{border:1px solid #292933;border-radius:24px;padding:30px;text-align:center;background:#121218}}h1{{font-size:28px;margin:8px 0 12px}}p{{color:#b7b7c2;line-height:1.5}}a{{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:999px;background:#fff;color:#111;text-decoration:none;font-weight:700}}</style></head><body><main><div class=\"card\"><div>🎧</div><h1>{escape(title)}</h1><p>{escape(description)}</p><a href=\"{escape(bot_link)}\">Open in Telegram</a></div></main></body></html>"""
 
 
-_SHARE_COVER_CACHE = {}
+SHARE_COVER_CACHE_ITEMS = geti("SHARE_COVER_CACHE_ITEMS", 64, 8, 512)
+SHARE_COVER_CACHE_TTL = geti("SHARE_COVER_CACHE_TTL", 86400, 60, 604800)
+_SHARE_COVER_CACHE = OrderedDict()
 _SHARE_COVER_LOCK = threading.Lock()
 SHARE_COVER_FAILURE_BACKOFF = 300
 
@@ -6713,16 +6719,22 @@ def share_track_cover(track_id):
         now = time.time()
         with _SHARE_COVER_LOCK:
             cached = _SHARE_COVER_CACHE.get(int(track_id))
+            if cached:
+                _SHARE_COVER_CACHE.move_to_end(int(track_id))
         if cached:
             data, content_type, cached_at = cached
-            if data:
-                return Response(
-                    data,
-                    mimetype=content_type,
-                    headers={"Cache-Control": "public, max-age=86400"},
-                )
-            if now - cached_at < SHARE_COVER_FAILURE_BACKOFF:
-                return ("", 404)
+            if now - cached_at < SHARE_COVER_CACHE_TTL:
+                if data:
+                    return Response(
+                        data,
+                        mimetype=content_type,
+                        headers={"Cache-Control": "public, max-age=86400"},
+                    )
+                if now - cached_at < SHARE_COVER_FAILURE_BACKOFF:
+                    return ("", 404)
+            else:
+                with _SHARE_COVER_LOCK:
+                    _SHARE_COVER_CACHE.pop(int(track_id), None)
 
         async def fetch_thumb():
             message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
@@ -6748,10 +6760,16 @@ def share_track_cover(track_id):
             content_type = "image/jpeg"
         with _SHARE_COVER_LOCK:
             _SHARE_COVER_CACHE[int(track_id)] = (data, content_type, now)
+            _SHARE_COVER_CACHE.move_to_end(int(track_id))
+            while len(_SHARE_COVER_CACHE) > SHARE_COVER_CACHE_ITEMS:
+                _SHARE_COVER_CACHE.popitem(last=False)
         return Response(data, mimetype=content_type, headers={"Cache-Control": "public, max-age=86400"})
     except Exception:
         with _SHARE_COVER_LOCK:
             _SHARE_COVER_CACHE[int(track_id)] = (None, "image/jpeg", time.time())
+            _SHARE_COVER_CACHE.move_to_end(int(track_id))
+            while len(_SHARE_COVER_CACHE) > SHARE_COVER_CACHE_ITEMS:
+                _SHARE_COVER_CACHE.popitem(last=False)
         log.warning("share cover unavailable track=%s; using cover backoff", track_id)
         return ("", 404)
 
@@ -7529,6 +7547,10 @@ async def scan_all():
 
 async def periodic_scan():
 
+    if SCAN_INTERVAL <= 0:
+        log.info("periodic channel rescan disabled; startup scan and watcher remain active")
+        return
+
     while True:
 
         await asyncio.sleep(SCAN_INTERVAL)
@@ -7872,17 +7894,19 @@ def startup():
 
         return False
 
-    try:
-
-        init_db()
-
-    except Exception:
-
-        log.exception(
-            "Database initialization failed"
-        )
-
-        return False
+    for attempt in range(1, DB_INIT_RETRIES + 1):
+        try:
+            init_db()
+            break
+        except Exception:
+            log.exception(
+                "Database initialization failed (attempt %s/%s)",
+                attempt,
+                DB_INIT_RETRIES,
+            )
+            if attempt >= DB_INIT_RETRIES:
+                return False
+            time.sleep(DB_INIT_RETRY_DELAY * attempt)
 
     webhook_setup()
     configure_mini_app()

@@ -135,6 +135,12 @@ def cover_proxy(path):
     return proxy_request(f"cover/{path}")
 
 
+@app.get("/share/<path:path>")
+def share_proxy(path):
+    """Proxy share pages and their Open Graph cover URLs to the Bot server."""
+    return proxy_request(f"share/{path}")
+
+
 @app.get("/<path:path>")
 def static_files(path):
     """
