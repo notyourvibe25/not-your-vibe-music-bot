@@ -1,13 +1,20 @@
 import os
-from flask import Flask, send_from_directory, request, Response, jsonify
+
 import requests
+from flask import Flask, Response, jsonify, request, send_from_directory
+
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 
-BOT_SERVER = os.getenv(
-    "BOT_SERVER",
-    "https://not-your-vibe-music-bot-5dkn.onrender.com"
+
+# Main Bot Server
+# Render မှာ BOT_SERVER environment variable ထည့်ထားရင်
+# အဲဒီ value ကို အသုံးပြုမယ်။
+BOT_SERVER = (
+    os.getenv("BOT_SERVER")
+    or "https://not-your-vibe-music-bot.onrender.com"
 ).rstrip("/")
+
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 180
@@ -20,23 +27,30 @@ def home():
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "service": "NOT YOUR VIBE Mini App"
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "service": "NOT YOUR VIBE Mini App Server",
+        }
+    )
 
 
 def proxy_request(path):
+    """
+    Forward Mini App requests to the Main Bot Server.
+
+    The Mini App Server does not access PostgreSQL or Telethon directly.
+    It only acts as a lightweight gateway/proxy.
+    """
     url = f"{BOT_SERVER}/{path.lstrip('/')}"
 
     headers = {}
 
-    # Telegram authentication
+    # Telegram WebApp authentication data.
     init_data = request.headers.get("X-Telegram-Init-Data")
     if init_data:
         headers["X-Telegram-Init-Data"] = init_data
 
-    # Forward content type
     content_type = request.headers.get("Content-Type")
     if content_type:
         headers["Content-Type"] = content_type
@@ -52,13 +66,19 @@ def proxy_request(path):
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
             allow_redirects=False,
         )
-
     except requests.RequestException as exc:
-        return jsonify({
-            "error": "Bot server unavailable",
-            "detail": str(exc)[:200]
-        }), 502
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Bot server unavailable",
+                    "detail": str(exc)[:200],
+                }
+            ),
+            502,
+        )
 
+    # Hop-by-hop headers should not be forwarded by the proxy.
     excluded_headers = {
         "content-encoding",
         "content-length",
@@ -73,17 +93,11 @@ def proxy_request(path):
     ]
 
     return Response(
-        upstream.iter_content(
-            chunk_size=64 * 1024
-        ),
+        upstream.iter_content(chunk_size=64 * 1024),
         status=upstream.status_code,
         headers=response_headers,
     )
 
-
-# -----------------------------
-# API
-# -----------------------------
 
 @app.route(
     "/api/<path:path>",
@@ -97,59 +111,51 @@ def proxy_request(path):
     ],
 )
 def api_proxy(path):
+    """
+    Proxy Mini App API requests to the Main Bot Server.
 
+    Example:
+        Mini App:
+            /api/me
+
+        becomes:
+            https://not-your-vibe-music-bot.onrender.com/api/me
+    """
     if request.method == "OPTIONS":
         return "", 204
 
     return proxy_request(f"api/{path}")
 
 
-# -----------------------------
-# Cover
-# -----------------------------
-
 @app.get("/cover/<path:path>")
 def cover_proxy(path):
+    """
+    Proxy cover-image requests to the Main Bot Server.
+    """
     return proxy_request(f"cover/{path}")
 
 
-# -----------------------------
-# Webhook
-# -----------------------------
-
-@app.route(
-    "/webhook",
-    methods=["GET", "POST"]
-)
-def webhook_proxy():
-    return proxy_request("webhook")
-
-
-# -----------------------------
-# Static files
-# -----------------------------
-
 @app.get("/<path:path>")
 def static_files(path):
+    """
+    Serve static Mini App files.
 
+    index.html is served by / above.
+    Other existing files are served directly.
+    """
     full_path = os.path.join(".", path)
 
     if os.path.isfile(full_path):
         return send_from_directory(".", path)
 
-    return jsonify({
-        "error": "Not found"
-    }), 404
+    return jsonify({"ok": False, "error": "Not found"}), 404
 
 
 if __name__ == "__main__":
-
-    port = int(
-        os.getenv("PORT", "10000")
-    )
+    port = int(os.getenv("PORT", "10000"))
 
     app.run(
         host="0.0.0.0",
         port=port,
         threaded=True,
-)
+                    )
