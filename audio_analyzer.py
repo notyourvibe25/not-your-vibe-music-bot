@@ -367,7 +367,7 @@ def get_pending_genre_tracks(limit: int):
         SELECT id, title, channel_id, message_id, mood
         FROM tracks
         WHERE genre_scanned_at IS NULL
-          AND (genre_scan_error IS NULL OR genre_scan_error NOT LIKE 'PERMANENT:%')
+          AND (genre_scan_error IS NULL OR genre_scan_error NOT LIKE 'PERMANENT:%%')
         ORDER BY id ASC
         LIMIT %s
     """
