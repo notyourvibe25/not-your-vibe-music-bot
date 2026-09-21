@@ -7279,23 +7279,27 @@ def mini_comments():
             rows = x.fetchall()
             has_more = len(rows) > limit
             rows = rows[:limit]
-            items=[]
-            for row in rows:
+            reply_map = {}
+            comment_ids = [int(row["id"]) for row in rows]
+            if comment_ids:
                 x.execute("""
                     SELECT r.id,r.comment_id,r.admin_id,r.reply,r.created_at,
                            u.username,u.first_name,u.last_name
                     FROM broadcast_comment_replies r
                     LEFT JOIN users u ON u.user_id=r.admin_id
-                    WHERE r.comment_id=%s ORDER BY r.created_at ASC,r.id ASC
-                """, (row["id"],))
-                replies=[]
+                    WHERE r.comment_id = ANY(%s)
+                    ORDER BY r.created_at ASC,r.id ASC
+                """, (comment_ids,))
                 for reply in x.fetchall():
-                    replies.append({
+                    reply_map.setdefault(int(reply["comment_id"]), []).append({
                         "id": int(reply["id"]), "comment_id": int(reply["comment_id"]),
                         "reply": reply["reply"], "created_at": int(reply["created_at"]),
                         "username": reply.get("username"),
                         "name": " ".join(v for v in (reply.get("first_name") or "", reply.get("last_name") or "") if v).strip(),
                     })
+            items=[]
+            for row in rows:
+                replies = reply_map.get(int(row["id"]), [])
                 items.append({
                     "id": int(row["id"]), "broadcast_id": int(row["broadcast_id"]),
                     "user_id": int(row["user_id"]), "comment": row["comment"],
