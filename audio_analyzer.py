@@ -60,7 +60,11 @@ TELETHON_API_HASH = (
     or ""
 ).strip()
 
-TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
+ANALYZER_TELETHON_SESSION = (
+    os.getenv("ANALYZER_TELETHON_SESSION")
+    or os.getenv("TELETHON_SESSION")
+    or ""
+).strip()
 
 ANALYZER_LIMIT = int(os.getenv("ANALYZER_LIMIT", "10"))
 WATCH_INTERVAL = int(os.getenv("ANALYZER_WATCH_INTERVAL", "60"))
@@ -484,8 +488,10 @@ def build_telegram_client():
         raise RuntimeError("TELETHON_API_ID/API_ID is missing")
     if not TELETHON_API_HASH:
         raise RuntimeError("TELETHON_API_HASH/API_HASH is missing")
-    if not TELETHON_SESSION:
-        raise RuntimeError("TELETHON_SESSION is missing")
+    if not ANALYZER_TELETHON_SESSION:
+        raise RuntimeError(
+            "ANALYZER_TELETHON_SESSION/TELETHON_SESSION is missing"
+        )
 
     try:
         api_id = int(TELETHON_API_ID)
@@ -493,7 +499,7 @@ def build_telegram_client():
         raise RuntimeError("TELETHON_API_ID/API_ID must be an integer")
 
     return TelegramClient(
-        StringSession(TELETHON_SESSION),
+        StringSession(ANALYZER_TELETHON_SESSION),
         api_id,
         TELETHON_API_HASH,
         connection_retries=10,
