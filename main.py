@@ -7372,31 +7372,46 @@ def mini_track_audio(track_id):
             pass
 
         async def download_full():
-            message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
-            if not message or not message.media:
-                raise RuntimeError("Telegram media not found")
+            last_error = None
+            for attempt in range(3):
+                try:
+                    message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
+                    if not message or not message.media:
+                        raise RuntimeError("Telegram media not found")
 
-            obj = getattr(message, "audio", None) or getattr(message, "document", None)
-            mime_value = getattr(obj, "mime_type", None) if obj else None
-            mime = str(mime_value).lower().strip() if mime_value and str(mime_value).lower().strip().startswith("audio/") else "audio/mpeg"
-            # Normalize common Android/WebView aliases to standards-based MIME types.
-            if mime in ("audio/m4a", "audio/x-m4a"):
-                mime = "audio/mp4"
+                    obj = getattr(message, "audio", None) or getattr(message, "document", None)
+                    mime_value = getattr(obj, "mime_type", None) if obj else None
+                    mime = str(mime_value).lower().strip() if mime_value and str(mime_value).lower().strip().startswith("audio/") else "audio/mpeg"
+                    # Normalize common Android/WebView aliases to standards-based MIME types.
+                    if mime in ("audio/m4a", "audio/x-m4a"):
+                        mime = "audio/mp4"
 
-            with open(partial, "wb") as fh:
-                async for chunk in client.iter_download(message.media, request_size=4 * 1024 * 1024):
-                    if chunk:
-                        fh.write(chunk)
+                    # Always restart a failed partial transfer cleanly. A smaller request
+                    # size is more reliable on Render/Telegram than one large 4 MB burst.
+                    with open(partial, "wb") as fh:
+                        async for chunk in client.iter_download(message.media, request_size=1 * 1024 * 1024):
+                            if chunk:
+                                fh.write(chunk)
 
-            if not partial.is_file() or partial.stat().st_size <= 0:
-                raise RuntimeError("Telegram audio download returned no data")
-            os.replace(partial, final_path)
-            mime_path.write_text(mime)
-            return mime
+                    if not partial.is_file() or partial.stat().st_size <= 0:
+                        raise RuntimeError("Telegram audio download returned no data")
+                    os.replace(partial, final_path)
+                    mime_path.write_text(mime)
+                    return mime
+                except Exception as exc:
+                    last_error = exc
+                    try:
+                        if partial.exists():
+                            partial.unlink()
+                    except Exception:
+                        pass
+                    if attempt < 2:
+                        await asyncio.sleep(0.6 * (attempt + 1))
+            raise last_error or RuntimeError("Telegram audio download failed")
 
         try:
             future = asyncio.run_coroutine_threadsafe(download_full(), tele_loop)
-            mime = future.result(timeout=180)
+            mime = future.result(timeout=300)
         except Exception as exc:
             log.exception("Mini App audio download failed track=%s", track_id)
             try:
