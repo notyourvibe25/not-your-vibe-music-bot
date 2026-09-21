@@ -1,0 +1,19 @@
+name: Render keepalive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Warm main bot and mini app
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 25 https://not-your-vibe-music-bot.onrender.com/health > /dev/null
+          curl --fail --silent --show-error --max-time 25 https://not-your-vibe-mini-app-server-jo8h.onrender.com/health > /dev/null
+          echo "Render services are reachable"
