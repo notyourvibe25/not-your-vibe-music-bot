@@ -6710,6 +6710,23 @@ _SHARE_COVER_CACHE = OrderedDict()
 _SHARE_COVER_LOCK = threading.Lock()
 SHARE_COVER_FAILURE_BACKOFF = 300
 
+def _share_cover_placeholder(row, track_id):
+    """Return a deterministic SVG placeholder when a Telegram thumbnail is absent."""
+    import html as _html
+    title = str((row or {}).get("title") or f"Track #{track_id}").strip()
+    label = title[:28] + ("…" if len(title) > 28 else "")
+    safe = _html.escape(label)
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" viewBox="0 0 800 800">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#151c17"/><stop offset="1" stop-color="#070a08"/></linearGradient></defs>
+      <rect width="800" height="800" fill="url(#g)"/><circle cx="650" cy="130" r="210" fill="#c6ff4a" opacity=".10"/>
+      <circle cx="400" cy="350" r="142" fill="none" stroke="#c6ff4a" stroke-width="10" opacity=".8"/>
+      <path d="M400 210v280a62 62 0 1 1-28-52V292l180-42v198a62 62 0 1 1-28-52V190z" fill="#c6ff4a"/>
+      <text x="56" y="710" fill="#f4f7f3" font-family="Arial,sans-serif" font-size="34" font-weight="700">{safe}</text>
+      <text x="58" y="754" fill="#aeb8ad" font-family="Arial,sans-serif" font-size="20" letter-spacing="4">NOT YOUR VIBE</text>
+    </svg>"""
+    return svg.encode("utf-8")
+
+
 @app.route("/share/track/<int:track_id>/cover")
 def share_track_cover(track_id):
     # Telegram may retry preview images repeatedly. A stale track or a
@@ -6756,13 +6773,14 @@ def share_track_cover(track_id):
         future = asyncio.run_coroutine_threadsafe(fetch_thumb(), tele_loop)
         data = future.result(timeout=8)
         if not data:
-            with _SHARE_COVER_LOCK:
-                _SHARE_COVER_CACHE[int(track_id)] = (None, "image/jpeg", now)
-            return ("", 404)
-        if data.startswith(b"\x89PNG"):
+            data = _share_cover_placeholder(row, track_id)
+            content_type = "image/svg+xml"
+        elif data.startswith(b"\x89PNG"):
             content_type = "image/png"
         elif data.startswith(b"RIFF") and b"WEBP" in data[:16]:
             content_type = "image/webp"
+        elif data.lstrip().startswith(b"<svg"):
+            content_type = "image/svg+xml"
         else:
             content_type = "image/jpeg"
         with _SHARE_COVER_LOCK:
@@ -6772,13 +6790,14 @@ def share_track_cover(track_id):
                 _SHARE_COVER_CACHE.popitem(last=False)
         return Response(data, mimetype=content_type, headers={"Cache-Control": "public, max-age=86400"})
     except Exception:
+        data = _share_cover_placeholder(row, track_id)
         with _SHARE_COVER_LOCK:
-            _SHARE_COVER_CACHE[int(track_id)] = (None, "image/jpeg", time.time())
+            _SHARE_COVER_CACHE[int(track_id)] = (data, "image/svg+xml", time.time())
             _SHARE_COVER_CACHE.move_to_end(int(track_id))
             while len(_SHARE_COVER_CACHE) > SHARE_COVER_CACHE_ITEMS:
                 _SHARE_COVER_CACHE.popitem(last=False)
-        log.warning("share cover unavailable track=%s; using cover backoff", track_id)
-        return ("", 404)
+        log.warning("share cover unavailable track=%s; serving placeholder", track_id)
+        return Response(data, mimetype="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
 
 @app.route("/share/track/<int:track_id>")
 def share_track_page(track_id):
