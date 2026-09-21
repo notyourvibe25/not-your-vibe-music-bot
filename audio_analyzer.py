@@ -344,7 +344,7 @@ def get_pending_tracks(limit: int):
             COALESCE(analyzed,FALSE)=FALSE
             AND (
                 ai_error IS NULL
-                OR ai_error NOT LIKE 'PERMANENT:%'
+                OR ai_error NOT LIKE 'PERMANENT:%%'
             )
             AND (analyzer_retry_after IS NULL OR analyzer_retry_after <= NOW())
         ORDER BY id ASC
@@ -367,7 +367,7 @@ def get_pending_genre_tracks(limit: int):
         SELECT id, title, channel_id, message_id, mood
         FROM tracks
         WHERE genre_scanned_at IS NULL
-          AND (genre_scan_error IS NULL OR genre_scan_error NOT LIKE 'PERMANENT:%')
+          AND (genre_scan_error IS NULL OR genre_scan_error NOT LIKE 'PERMANENT:%%')
         ORDER BY id ASC
         LIMIT %s
     """
