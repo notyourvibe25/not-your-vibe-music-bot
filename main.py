@@ -6804,7 +6804,7 @@ def share_profile_page(profile_uid):
 # =========================================================
 
 MINI_APP_MAX_AGE = 86400
-MINI_AUDIO_CACHE_ITEMS = geti("MINI_AUDIO_CACHE_ITEMS", 4, 1, 12)
+MINI_AUDIO_CACHE_ITEMS = geti("MINI_AUDIO_CACHE_ITEMS", 8, 1, 12)
 _MINI_AUDIO_CACHE = {}
 _MINI_AUDIO_CACHE_LOCK = threading.Lock()
 _MINI_AUDIO_FILE_LOCKS = {}
@@ -7181,7 +7181,7 @@ def mini_track_audio(track_id):
                 mime = "audio/mp4"
 
             with open(partial, "wb") as fh:
-                async for chunk in client.iter_download(message.media, request_size=1024 * 1024):
+                async for chunk in client.iter_download(message.media, request_size=4 * 1024 * 1024):
                     if chunk:
                         fh.write(chunk)
 
