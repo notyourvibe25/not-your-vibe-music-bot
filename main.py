@@ -7106,11 +7106,16 @@ def mini_home():
                 liked_rows = x.fetchall()
 
         daily = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
+        if mood and not daily:
+            # A stale/legacy mood must never make the Mini App look empty.
+            daily = _mini_pick_row(uid)
         for_you = _mini_pick_row(uid, liked_only=True)
         # Keep initial Home fast: exact bot Radio selection is done by /api/action
         # when the user opens/plays Radio. A lightweight preview avoids blocking
         # the first screen on the full continuity/scoring query.
         radio = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
+        if mood and not radio:
+            radio = _mini_pick_row(uid)
         # Keep Track of the Day deterministic per user/day.
         day = datetime.now(ZoneInfo("Asia/Yangon")).date().isoformat()
         with db() as c:
@@ -7122,6 +7127,15 @@ def mini_home():
                 """, (f"{uid}:{day}",))
                 totd = x.fetchone()
 
+        log.info(
+            "Mini App home uid=%s mood=%s daily=%s radio=%s for_you=%s track_of_day=%s",
+            uid,
+            mood,
+            daily.get("id") if daily else None,
+            radio.get("id") if radio else None,
+            for_you.get("id") if for_you else None,
+            totd.get("id") if totd else None,
+        )
         return jsonify({
             "user": {"id": uid, "first_name": user.get("first_name", "")},
             "state": state,
