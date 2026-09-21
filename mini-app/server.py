@@ -2,6 +2,7 @@ import os
 
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
+from requests.adapters import HTTPAdapter
 
 
 app = Flask(__name__, static_folder=".", static_url_path="")
@@ -18,6 +19,10 @@ BOT_SERVER = (
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 180
+
+_UPSTREAM = requests.Session()
+_UPSTREAM.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=0))
+_UPSTREAM.mount("http://", HTTPAdapter(pool_connections=2, pool_maxsize=8, max_retries=0))
 
 
 @app.get("/")
@@ -77,7 +82,7 @@ def proxy_request(path):
     headers["Accept-Encoding"] = "identity"
 
     try:
-        upstream = requests.request(
+        upstream = _UPSTREAM.request(
             method=request.method,
             url=url,
             params=request.args,
