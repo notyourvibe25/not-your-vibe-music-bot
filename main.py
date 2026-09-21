@@ -6712,7 +6712,14 @@ SHARE_COVER_FAILURE_BACKOFF = 300
 
 @app.route("/share/track/<int:track_id>/cover")
 def share_track_cover(track_id):
-    row = get_track(track_id)
+    # Telegram may retry preview images repeatedly. A stale track or a
+    # transient database failure should fall back to the text-only preview,
+    # not become an unhandled Flask exception.
+    try:
+        row = get_track(track_id)
+    except Exception:
+        log.warning("share cover track lookup failed track=%s", track_id, exc_info=True)
+        return ("", 404)
     if not row or client is None or tele_loop is None or not ready.is_set():
         return ("", 404)
     try:
