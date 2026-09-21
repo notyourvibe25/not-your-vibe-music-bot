@@ -7518,6 +7518,9 @@ def mini_track_audio_stream(track_id):
             with open(partial, "wb") as fh:
                 async for chunk in client.iter_download(message.media, request_size=1 * 1024 * 1024):
                     if chunk:
+                        # Telethon may return memoryview/bytearray buffers. WSGI
+                        # requires an actual bytes object for every yielded chunk.
+                        chunk = bytes(chunk)
                         fh.write(chunk)
                         await asyncio.to_thread(chunks.put, chunk)
             if not partial.is_file() or partial.stat().st_size <= 0:
@@ -7548,7 +7551,8 @@ def mini_track_audio_stream(track_id):
                     break
                 if isinstance(item, Exception):
                     break
-                yield item
+                # Final WSGI boundary: never yield a memoryview/bytearray/object.
+                yield item if isinstance(item, bytes) else bytes(item)
         finally:
             lock.release()
 
