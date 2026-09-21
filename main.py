@@ -1444,6 +1444,54 @@ def _radio_history(uid):
     return recent
 
 
+def _radio_history_affinity(uid, limit=96):
+    """Build a soft implicit taste profile from tracks the user actually received.
+
+    Explicit Like/Not-for-me feedback remains stronger. Served history is used as
+    a gentle signal so Radio learns even when a listener does not press Like.
+    Recent listens decay quickly and do not override explicit dislikes.
+    """
+    profile = {"moods": {}, "genres": {}, "subgenres": {}, "analyzer_moods": {}}
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT t.mood,t.genre,t.subgenre,t.analyzer_mood,h.sent_at
+                FROM user_history h
+                JOIN tracks t ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                WHERE h.user_id=%s AND h.action='served'
+                ORDER BY h.sent_at DESC,h.id DESC
+                LIMIT %s
+            """, (uid, int(limit)))
+            rows = x.fetchall()
+    for index, row in enumerate(rows):
+        # Sequence decay makes the last few listening choices most important.
+        weight = math.exp(-index / max(10.0, RADIO_FEEDBACK_DECAY_SCALE * 0.9))
+        for field, key in (("mood", "moods"), ("genre", "genres"),
+                           ("subgenre", "subgenres"), ("analyzer_mood", "analyzer_moods")):
+            value = row.get(field)
+            if value is None or not str(value).strip():
+                continue
+            value = str(value).strip().casefold()
+            profile[key][value] = profile[key].get(value, 0.0) + weight
+    for key, values in profile.items():
+        total = sum(values.values())
+        if total:
+            profile[key] = {name: score / total for name, score in values.items()}
+    return profile
+
+
+def _radio_history_affinity_score(row, affinity):
+    """Return a bounded match score against implicit listening preferences."""
+    if not affinity:
+        return 0.0
+    score = 0.0
+    score += 0.48 * affinity.get("moods", {}).get(str(row.get("mood") or "").casefold(), 0.0)
+    score += 0.28 * affinity.get("genres", {}).get(str(row.get("genre") or "").casefold(), 0.0)
+    score += 0.16 * affinity.get("subgenres", {}).get(str(row.get("subgenre") or "").casefold(), 0.0)
+    score += 0.08 * affinity.get("analyzer_moods", {}).get(str(row.get("analyzer_mood") or "").casefold(), 0.0)
+    return min(1.0, score * 4.0)
+
+
 def _radio_song_key(title):
     """Return a conservative normalized song identity for Radio daily dedupe.
 
@@ -2014,15 +2062,20 @@ def adjust_mood_ratios(
     return {m: value / total_result for m, value in result.items()}
 
 
-def radio_weights(uid, baseline_mood=None):
-    """Return temperature-scaled, capped mood ratios for Radio."""
+def radio_weights(uid, baseline_mood=None, implicit_affinity=None):
+    """Return explicit-feedback + implicit-history mood ratios for Radio."""
     stats = ratios(uid)
+    implicit = implicit_affinity if implicit_affinity is not None else _radio_history_affinity(uid)
     raw_scores = {}
     for mood in MOODS:
         liked = float(stats[mood]["like"])
         disliked = float(stats[mood]["not"])
-        # Bayesian-smoothed preference: neutral users still hear every mood.
-        raw_scores[mood] = (liked + 1.0) / (liked + disliked + 2.0)
+        implicit_mood = float(implicit.get("moods", {}).get(mood, 0.0))
+        # Explicit feedback is dominant; received-listen history supplies a
+        # bounded prior when the user has not rated many tracks yet.
+        raw_scores[mood] = (liked + 1.0 + 2.2 * implicit_mood) / (
+            liked + disliked + 2.0 + 2.2 * implicit_mood
+        )
 
     if baseline_mood in raw_scores:
         raw_scores[baseline_mood] += RADIO_BASELINE_MOOD_MULTIPLIER
@@ -2046,7 +2099,12 @@ def radio_track(uid, baseline_mood=None):
     recent = _radio_history(uid)
     today_served = _radio_today_served(uid)
     today_song_keys = _radio_today_song_keys(uid)
-    mood_weights = radio_weights(uid, baseline_mood=baseline_mood)
+    implicit_affinity = _radio_history_affinity(uid)
+    mood_weights = radio_weights(
+        uid,
+        baseline_mood=baseline_mood,
+        implicit_affinity=implicit_affinity,
+    )
     profile = _radio_profile(uid)
     liked_seeds = profile.get("likes", [])
     disliked_seeds = profile.get("dislikes", [])
@@ -2156,6 +2214,10 @@ def radio_track(uid, baseline_mood=None):
     for row, key in pool:
         mood = row["mood"]
         score = 48.0 * float(mood_weights.get(mood, 0.5))
+
+        # Implicit listening history improves cold/no-feedback personalization.
+        # It is intentionally softer than explicit Likes and seed similarity.
+        score += 12.0 * _radio_history_affinity_score(row, implicit_affinity)
 
         # Weighted nearest-neighbor taste matching.  This is deliberately
         # rule-based: recent Likes receive larger decay weights and the best
