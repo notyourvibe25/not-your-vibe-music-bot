@@ -7249,6 +7249,113 @@ def mini_action():
     return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": payload})
 
 
+@app.route("/api/comments")
+def mini_comments():
+    """Cursor-paginated public comments with lightweight threaded replies."""
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 50))
+    except (TypeError, ValueError):
+        limit = 20
+    before = request.args.get("before")
+    try:
+        before_id = int(before) if before else None
+    except (TypeError, ValueError):
+        before_id = None
+    with db() as c:
+        with cur(c) as x:
+            where = "WHERE c.id < %s" if before_id else ""
+            params = (before_id, limit + 1) if before_id else (limit + 1,)
+            x.execute(f"""
+                SELECT c.id,c.broadcast_id,c.user_id,c.comment,c.created_at,
+                       u.username,u.first_name,u.last_name
+                FROM broadcast_comments c
+                LEFT JOIN users u ON u.user_id=c.user_id
+                {where}
+                ORDER BY c.id DESC LIMIT %s
+            """, params)
+            rows = x.fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            items=[]
+            for row in rows:
+                x.execute("""
+                    SELECT r.id,r.comment_id,r.admin_id,r.reply,r.created_at,
+                           u.username,u.first_name,u.last_name
+                    FROM broadcast_comment_replies r
+                    LEFT JOIN users u ON u.user_id=r.admin_id
+                    WHERE r.comment_id=%s ORDER BY r.created_at ASC,r.id ASC
+                """, (row["id"],))
+                replies=[]
+                for reply in x.fetchall():
+                    replies.append({
+                        "id": int(reply["id"]), "comment_id": int(reply["comment_id"]),
+                        "reply": reply["reply"], "created_at": int(reply["created_at"]),
+                        "username": reply.get("username"),
+                        "name": " ".join(v for v in (reply.get("first_name") or "", reply.get("last_name") or "") if v).strip(),
+                    })
+                items.append({
+                    "id": int(row["id"]), "broadcast_id": int(row["broadcast_id"]),
+                    "user_id": int(row["user_id"]), "comment": row["comment"],
+                    "created_at": int(row["created_at"]),
+                    "username": row.get("username"),
+                    "name": " ".join(v for v in (row.get("first_name") or "", row.get("last_name") or "") if v).strip(),
+                    "replies": replies,
+                })
+    return jsonify({"items": items, "has_more": has_more,
+                    "next_before": items[-1]["id"] if has_more and items else None})
+
+
+@app.route("/api/profile")
+def mini_profile():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    profile = _radio_profile(uid)
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT t.id,t.title,t.mood,t.genre,h.sent_at
+                FROM user_history h JOIN tracks t
+                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                WHERE h.user_id=%s AND h.action='served'
+                ORDER BY h.sent_at DESC,h.id DESC LIMIT 10
+            """, (uid,))
+            recent = [dict(r) for r in x.fetchall()]
+    def top(values, n=3):
+        return [{"name": k, "score": round(float(v), 3)} for k,v in sorted(values.items(), key=lambda item: item[1], reverse=True)[:n]]
+    return jsonify({"top_moods": top(profile.get("analyzer_moods") or profile.get("genres") or {}),
+                    "genres": top(profile.get("genres", {})),
+                    "subgenres": top(profile.get("subgenres", {})),
+                    "recent": recent})
+
+
+@app.route("/api/leaderboard")
+def mini_leaderboard():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    cutoff = int(time.time()) - 7 * 86400
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT h.user_id, COUNT(*) AS plays,
+                       u.username,u.first_name,u.last_name
+                FROM user_history h LEFT JOIN users u ON u.user_id=h.user_id
+                WHERE h.action='served' AND h.sent_at >= %s
+                GROUP BY h.user_id,u.username,u.first_name,u.last_name
+                ORDER BY plays DESC,h.user_id ASC LIMIT 5
+            """, (cutoff,))
+            items=[]
+            for r in x.fetchall():
+                name=" ".join(v for v in (r.get("first_name") or "", r.get("last_name") or "") if v).strip() or r.get("username") or "Listener"
+                items.append({"user_id": int(r["user_id"]), "name": name[:80], "username": r.get("username"), "plays": int(r["plays"])})
+    return jsonify({"items": items, "window": "7d"})
+
+
 @app.route("/api/stats")
 def mini_stats():
     """Return the authenticated listener's personal dashboard data."""
