@@ -7187,6 +7187,69 @@ def mini_action():
     return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": payload})
 
 
+@app.route("/api/stats")
+def mini_stats():
+    """Return the authenticated listener's personal dashboard data."""
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute("""
+                    SELECT COUNT(*) AS plays,
+                           COUNT(DISTINCT DATE(to_timestamp(sent_at))) AS active_days,
+                           COUNT(DISTINCT channel_id || ':' || message_id) AS unique_tracks
+                    FROM user_history
+                    WHERE user_id=%s AND action='served'
+                """, (uid,))
+                totals = x.fetchone() or {}
+                x.execute("""
+                    SELECT t.mood, COUNT(*) AS plays
+                    FROM user_history h JOIN tracks t
+                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                    WHERE h.user_id=%s AND h.action='served'
+                    GROUP BY t.mood ORDER BY plays DESC, t.mood ASC LIMIT 8
+                """, (uid,))
+                moods = [{"name": str(r["mood"] or "unknown"), "plays": int(r["plays"])} for r in x.fetchall()]
+                x.execute("""
+                    SELECT COALESCE(NULLIF(t.genre,''), NULLIF(t.subgenre,''), 'Uncategorized') AS name,
+                           COUNT(*) AS plays
+                    FROM user_history h JOIN tracks t
+                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                    WHERE h.user_id=%s AND h.action='served'
+                    GROUP BY name ORDER BY plays DESC, name ASC LIMIT 6
+                """, (uid,))
+                genres = [{"name": str(r["name"]), "plays": int(r["plays"])} for r in x.fetchall()]
+                x.execute("""
+                    SELECT COUNT(*) AS count FROM track_feedback
+                    WHERE user_id=%s AND feedback='like'
+                """, (uid,))
+                likes = int((x.fetchone() or {}).get("count") or 0)
+                x.execute("""
+                    SELECT COUNT(*) AS count FROM track_feedback
+                    WHERE user_id=%s AND feedback='not_for_me'
+                """, (uid,))
+                dislikes = int((x.fetchone() or {}).get("count") or 0)
+        state = get_state(uid)
+        top_mood = moods[0]["name"] if moods else (state.get("mood") or "Discovering")
+        return jsonify({
+            "plays": int(totals.get("plays") or 0),
+            "unique_tracks": int(totals.get("unique_tracks") or 0),
+            "active_days": int(totals.get("active_days") or 0),
+            "likes": likes,
+            "dislikes": dislikes,
+            "top_mood": top_mood,
+            "radio": bool(state.get("radio")),
+            "moods": moods,
+            "genres": genres,
+        })
+    except Exception:
+        log.exception("Mini App stats failed")
+        return jsonify({"error": "Listening stats unavailable"}), 500
+
+
 @app.route("/api/discover")
 def mini_discover():
     user, err = _mini_app_user()
