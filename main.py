@@ -7105,9 +7105,24 @@ def mini_action():
             if reserved:
                 break
     row = _mini_row_from_pick(picked)
+    # Telegram/database rows can disappear between selection and delivery.
+    # Retry the radio/next selector instead of breaking continuous playback.
+    if not row and action in ("radio", "next"):
+        for _ in range(5):
+            picked = radio_track(uid, baseline_mood=mood) if radio_mode else normal_track(uid, mood)
+            if not picked:
+                break
+            selected = (picked[0], picked[1], picked[2])
+            if not reserve(uid, selected, no_repeat_today=radio_mode):
+                continue
+            row = _mini_row_from_pick(picked)
+            if row:
+                break
     if not row:
-        return jsonify({"error": "Selected track is unavailable"}), 404
-    return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": _mini_track(row)})
+        return jsonify({"error": "No playable track available", "state": get_state(uid)}), 404
+    payload = _mini_track(row)
+    payload["radio"] = bool(get_state(uid).get("radio"))
+    return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": payload})
 
 
 @app.route("/api/discover")
