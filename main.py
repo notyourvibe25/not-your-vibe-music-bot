@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import threading
+import queue
 import math
 import time
 import contextlib
@@ -7450,6 +7451,112 @@ def mini_track_audio(track_id):
             max_age=1800,
             download_name=f"track-{int(track_id)}.audio",
         )
+
+
+@app.route("/api/track/<int:track_id>/audio-stream")
+def mini_track_audio_stream(track_id):
+    """Low-latency sequential audio stream with background disk caching.
+
+    Unlike the legacy endpoint, the first bytes are sent as Telegram delivers
+    them; the browser no longer waits for the complete file before playback.
+    """
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    row = get_track(track_id)
+    if not row:
+        fallback = get_fallback_track(track_id)
+        if fallback:
+            return redirect(url_for("mini_track_audio_stream", track_id=int(fallback["id"])), code=302)
+        return jsonify({"error": "No playable track available"}), 404
+    if client is None or tele_loop is None or not ready.is_set():
+        return jsonify({"error": "Telegram audio service is not ready"}), 503
+
+    from pathlib import Path
+    cache_dir = Path(os.getenv("MINI_AUDIO_CACHE_DIR", "/tmp/nyv_mini_audio"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    final_path = cache_dir / f"{int(track_id)}.audio"
+    mime_path = cache_dir / f"{int(track_id)}.mime"
+    if final_path.is_file() and final_path.stat().st_size > 0:
+        mime = mime_path.read_text().strip() if mime_path.exists() else "audio/mpeg"
+        return send_file(final_path, mimetype=mime or "audio/mpeg", conditional=True,
+                         etag=True, max_age=1800, download_name=f"track-{int(track_id)}.audio")
+
+    with _MINI_AUDIO_FILE_LOCKS_GUARD:
+        lock = _MINI_AUDIO_FILE_LOCKS.setdefault(int(track_id), threading.Lock())
+    lock.acquire()
+    if final_path.is_file() and final_path.stat().st_size > 0:
+        lock.release()
+        mime = mime_path.read_text().strip() if mime_path.exists() else "audio/mpeg"
+        return send_file(final_path, mimetype=mime or "audio/mpeg", conditional=True,
+                         etag=True, max_age=1800, download_name=f"track-{int(track_id)}.audio")
+
+    # Resolve metadata before headers so the browser gets the correct MIME type.
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            client.get_messages(int(row["channel_id"]), ids=int(row["message_id"])), tele_loop
+        )
+        message = future.result(timeout=35)
+        if not message or not message.media:
+            raise RuntimeError("Telegram media not found")
+        obj = getattr(message, "audio", None) or getattr(message, "document", None)
+        mime_value = getattr(obj, "mime_type", None) if obj else None
+        mime = str(mime_value).lower().strip() if mime_value and str(mime_value).lower().strip().startswith("audio/") else "audio/mpeg"
+        if mime in ("audio/m4a", "audio/x-m4a"):
+            mime = "audio/mp4"
+    except Exception as exc:
+        lock.release()
+        log.exception("Mini App audio stream metadata failed track=%s", track_id)
+        return jsonify({"error": "Audio file unavailable", "detail": str(exc)[:180]}), 502
+
+    chunks = queue.Queue(maxsize=8)
+    partial = cache_dir / f"{int(track_id)}.part"
+    sentinel = object()
+
+    async def pump():
+        try:
+            with open(partial, "wb") as fh:
+                async for chunk in client.iter_download(message.media, request_size=1 * 1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+                        await asyncio.to_thread(chunks.put, chunk)
+            if not partial.is_file() or partial.stat().st_size <= 0:
+                raise RuntimeError("Telegram audio stream returned no data")
+            os.replace(partial, final_path)
+            mime_path.write_text(mime)
+        except Exception as exc:
+            log.exception("Mini App audio stream failed track=%s", track_id)
+            try:
+                if partial.exists():
+                    partial.unlink()
+            except Exception:
+                pass
+            await asyncio.to_thread(chunks.put, exc)
+        finally:
+            await asyncio.to_thread(chunks.put, sentinel)
+
+    asyncio.run_coroutine_threadsafe(pump(), tele_loop)
+
+    def generate():
+        try:
+            while True:
+                try:
+                    item = chunks.get(timeout=75)
+                except queue.Empty:
+                    break
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    break
+                yield item
+        finally:
+            lock.release()
+
+    response = Response(generate(), mimetype=mime, direct_passthrough=True)
+    response.headers["Cache-Control"] = "public, max-age=1800"
+    response.headers["Accept-Ranges"] = "bytes"
+    response.headers["X-Audio-Delivery"] = "telegram-stream-cache"
+    return response
 
 @app.route("/api/track/<int:track_id>/feedback", methods=["POST"])
 def mini_feedback(track_id):
