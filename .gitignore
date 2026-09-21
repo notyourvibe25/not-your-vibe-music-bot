@@ -1,0 +1,30 @@
+
+# Local secrets / temporary Telegram session files
+.env
+.bot_string_session
+create_bot_session.py
+
+# Telegram session / secret files
+*.session
+.analyzer_string_session
+.bot_string_session
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local logs
+*.log
+
+# Local backups
+*.backup
+*.backup*
+*.before_*
+*.local_safe_backup
+*.github
+
+# Local helper scripts
+run_analyzer_loop.sh
+
+# Local secret config
+.eXY
