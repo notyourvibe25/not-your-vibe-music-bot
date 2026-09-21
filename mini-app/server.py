@@ -55,6 +55,22 @@ def proxy_request(path):
     if content_type:
         headers["Content-Type"] = content_type
 
+    # Media elements commonly send range and conditional requests. Forward
+    # them so cached audio can resume/seek without restarting a full Telegram
+    # download, which also prevents an avoidable pause between tracks.
+    for header_name in (
+        "Accept",
+        "Accept-Encoding",
+        "Range",
+        "If-Range",
+        "If-None-Match",
+        "If-Modified-Since",
+        "User-Agent",
+    ):
+        value = request.headers.get(header_name)
+        if value:
+            headers[header_name] = value
+
     try:
         upstream = requests.request(
             method=request.method,
