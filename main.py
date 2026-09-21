@@ -562,6 +562,11 @@ def init_db():
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS loudness DOUBLE PRECISION;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre TEXT;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS subgenre TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scanned_at TIMESTAMPTZ;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_source TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_tags TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS artist_name TEXT;
+    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scan_error TEXT;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_mood TEXT;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ;
 
@@ -588,6 +593,7 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_tracks_analyzed ON tracks(analyzed);
     CREATE INDEX IF NOT EXISTS idx_tracks_analyzer_mood ON tracks(analyzer_mood);
+    CREATE INDEX IF NOT EXISTS idx_tracks_genre_scanned_at ON tracks(genre_scanned_at);
 
     ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
     ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
@@ -1293,6 +1299,19 @@ def _radio_key_parts(value):
     return root, mode
 
 
+def _radio_tag_values(value):
+    """Decode scanner JSON tags without making metadata mandatory."""
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip().casefold() for item in parsed if str(item).strip()]
+
+
 def _numeric_similarity(value, target, scale):
     if value is None or target is None:
         return None
@@ -1329,6 +1348,7 @@ def _radio_profile(uid):
         "analyzer_moods": {},
         "genres": {},
         "subgenres": {},
+        "genre_tags": {},
     }
 
     with db() as c:
@@ -1345,6 +1365,7 @@ def _radio_profile(uid):
                     t.loudness,
                     t.genre,
                     t.subgenre,
+                    t.genre_tags,
                     t.analyzer_mood,
                     t.mood,
                     t.channel_id,
@@ -1411,6 +1432,9 @@ def _radio_profile(uid):
                     profile[target].get(value, 0.0) + weight
                 )
 
+        for tag in _radio_tag_values(row.get("genre_tags")):
+            profile["genre_tags"][tag] = profile["genre_tags"].get(tag, 0.0) + weight
+
     return profile
 
 
@@ -1452,11 +1476,11 @@ def _radio_history_affinity(uid, limit=96):
     a gentle signal so Radio learns even when a listener does not press Like.
     Recent listens decay quickly and do not override explicit dislikes.
     """
-    profile = {"moods": {}, "genres": {}, "subgenres": {}, "analyzer_moods": {}}
+    profile = {"moods": {}, "genres": {}, "subgenres": {}, "genre_tags": {}, "analyzer_moods": {}}
     with db() as c:
         with cur(c) as x:
             x.execute("""
-                SELECT t.mood,t.genre,t.subgenre,t.analyzer_mood,h.sent_at
+                SELECT t.mood,t.genre,t.subgenre,t.genre_tags,t.analyzer_mood,h.sent_at
                 FROM user_history h
                 JOIN tracks t ON t.channel_id=h.channel_id AND t.message_id=h.message_id
                 WHERE h.user_id=%s AND h.action='served'
@@ -1474,6 +1498,8 @@ def _radio_history_affinity(uid, limit=96):
                 continue
             value = str(value).strip().casefold()
             profile[key][value] = profile[key].get(value, 0.0) + weight
+        for tag in _radio_tag_values(row.get("genre_tags")):
+            profile["genre_tags"][tag] = profile["genre_tags"].get(tag, 0.0) + weight
     for key, values in profile.items():
         total = sum(values.values())
         if total:
@@ -1489,6 +1515,7 @@ def _radio_history_affinity_score(row, affinity):
     score += 0.48 * affinity.get("moods", {}).get(str(row.get("mood") or "").casefold(), 0.0)
     score += 0.28 * affinity.get("genres", {}).get(str(row.get("genre") or "").casefold(), 0.0)
     score += 0.16 * affinity.get("subgenres", {}).get(str(row.get("subgenre") or "").casefold(), 0.0)
+    score += 0.08 * sum(affinity.get("genre_tags", {}).get(tag, 0.0) for tag in _radio_tag_values(row.get("genre_tags")))
     score += 0.08 * affinity.get("analyzer_moods", {}).get(str(row.get("analyzer_mood") or "").casefold(), 0.0)
     return min(1.0, score * 4.0)
 
@@ -1602,6 +1629,7 @@ def _radio_last_seed(uid):
                     t.loudness,
                     t.genre,
                     t.subgenre,
+                    t.genre_tags,
                     t.analyzer_mood
                 FROM user_history h
                 JOIN tracks t
@@ -1636,6 +1664,7 @@ def _radio_candidates(uid):
                     t.loudness,
                     t.genre,
                     t.subgenre,
+                    t.genre_tags,
                     t.analyzer_mood,
                     COALESCE(gl.global_likes,0) AS global_likes,
                     COALESCE(gs.global_served,0) AS global_served
@@ -2230,6 +2259,16 @@ def radio_track(uid, baseline_mood=None):
         negative_similarity = _radio_negative_similarity(row, disliked_seeds)
         if negative_similarity:
             score -= 12.0 * negative_similarity
+
+        # Embedded genre metadata is an additional taste signal. It is kept
+        # deliberately below mood/audio similarity so it cannot lock Radio to
+        # one genre or prevent exploration when metadata is missing.
+        genre = str(row.get("genre") or "").strip().casefold()
+        subgenre = str(row.get("subgenre") or "").strip().casefold()
+        score += min(4.0, 2.0 * profile["genres"].get(genre, 0.0))
+        score += min(5.0, 2.5 * profile["subgenres"].get(subgenre, 0.0))
+        tag_score = sum(profile["genre_tags"].get(tag, 0.0) for tag in _radio_tag_values(row.get("genre_tags")))
+        score += min(3.5, 1.75 * tag_score)
 
         # Time-of-day is a soft context signal: it steers recommendations
         # toward the appropriate mood/BPM without overriding user feedback,

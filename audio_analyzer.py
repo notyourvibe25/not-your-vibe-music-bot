@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
@@ -18,6 +19,7 @@ from typing import Optional
 
 import numpy as np
 import psycopg
+from mutagen import File as MutagenFile
 from psycopg.rows import dict_row
 from telethon import TelegramClient
 from telethon.errors import (
@@ -256,12 +258,18 @@ def db():
 
 
 def ensure_analyzer_schema():
-    """Add retry metadata columns without changing existing track data."""
+    """Add analyzer and independent genre-scan metadata columns."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_retry_count INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_retry_after TIMESTAMPTZ")
+            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scanned_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_source TEXT")
+            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_tags TEXT")
+            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS artist_name TEXT")
+            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scan_error TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tracks_analyzer_retry_after ON tracks(analyzer_retry_after)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tracks_genre_scanned_at ON tracks(genre_scanned_at)")
 
 
 
@@ -349,6 +357,26 @@ def get_pending_tracks(limit: int):
             return cur.fetchall()
 
 
+def get_pending_genre_tracks(limit: int):
+    """Return tracks needing only embedded metadata scanning.
+
+    This queue intentionally does not require analyzed=FALSE: already analyzed
+    tracks must still be eligible for a later genre-only pass.
+    """
+    query = """
+        SELECT id, title, channel_id, message_id, mood
+        FROM tracks
+        WHERE genre_scanned_at IS NULL
+          AND (genre_scan_error IS NULL OR genre_scan_error NOT LIKE 'PERMANENT:%')
+        ORDER BY id ASC
+        LIMIT %s
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (limit,))
+            return cur.fetchall()
+
+
 def mark_error(track_id: int, error: Exception | str, permanent=False):
     message = str(error).strip()
 
@@ -401,8 +429,6 @@ def save_analysis(track_id: int, result: dict):
                     energy=%s,
                     danceability=%s,
                     loudness=%s,
-                    genre=%s,
-                    subgenre=%s,
                     analyzer_mood=%s,
                     analyzed=TRUE,
                     analyzed_at=NOW(),
@@ -415,9 +441,35 @@ def save_analysis(track_id: int, result: dict):
                     result.get("energy"),
                     result.get("danceability"),
                     result.get("loudness"),
-                    result.get("genre"),
-                    result.get("subgenre"),
                     result.get("mood"),
+                    track_id,
+                ),
+            )
+
+
+def save_genre_metadata(track_id: int, metadata: dict, error=None):
+    """Persist only embedded metadata; never changes audio analysis status."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tracks
+                SET genre=%s,
+                    subgenre=%s,
+                    genre_tags=%s,
+                    artist_name=%s,
+                    genre_source=%s,
+                    genre_scan_error=%s,
+                    genre_scanned_at=NOW()
+                WHERE id=%s
+                """,
+                (
+                    metadata.get("genre"),
+                    metadata.get("subgenre"),
+                    metadata.get("genre_tags"),
+                    metadata.get("artist_name"),
+                    "embedded" if metadata.get("found") else None,
+                    str(error)[:2000] if error else None,
                     track_id,
                 ),
             )
@@ -995,6 +1047,61 @@ def estimate_mood(audio, sr):
     return "dark"
 
 
+def _metadata_values(tags, keys):
+    values = []
+    for key in keys:
+        try:
+            value = tags.get(key)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        raw = getattr(value, "text", value)
+        if isinstance(raw, (list, tuple)):
+            values.extend(str(item).strip() for item in raw if str(item).strip())
+        elif str(raw).strip():
+            values.append(str(raw).strip())
+    return values
+
+
+def extract_embedded_metadata(audio_path):
+    """Read only metadata physically embedded in the audio file.
+
+    Missing values remain None; this function never infers a genre from audio
+    features or filenames.
+    """
+    result = {
+        "artist_name": None,
+        "genre": None,
+        "subgenre": None,
+        "genre_tags": None,
+        "found": False,
+    }
+    media = MutagenFile(audio_path, easy=False)
+    if media is None or not getattr(media, "tags", None):
+        return result
+    tags = media.tags
+    artists = _metadata_values(tags, ("TPE1", "TPE2", "©ART", "artist", "ARTIST"))
+    genres = _metadata_values(tags, ("TCON", "©gen", "genre", "GENRE"))
+    subgenres = _metadata_values(tags, (
+        "TXXX:SUBGENRE", "SUBGENRE", "subgenre", "TXXX:STYLE", "STYLE", "style",
+    ))
+    tags_all = []
+    for value in genres + subgenres:
+        for item in str(value).replace(";", ",").split(","):
+            item = item.strip()
+            if item and item.casefold() not in {x.casefold() for x in tags_all}:
+                tags_all.append(item)
+    result.update({
+        "artist_name": artists[0] if artists else None,
+        "genre": genres[0] if genres else None,
+        "subgenre": subgenres[0] if subgenres else None,
+        "genre_tags": json.dumps(tags_all, ensure_ascii=False) if tags_all else None,
+        "found": bool(artists or genres or subgenres),
+    })
+    return result
+
+
 def analyze_file(wav_path):
     audio, sr = read_wav(wav_path)
 
@@ -1007,8 +1114,6 @@ def analyze_file(wav_path):
         "energy": round(rms_energy(audio), 2),
         "danceability": estimate_danceability(audio, sr),
         "loudness": round(loudness_db(audio), 2),
-        "genre": None,
-        "subgenre": None,
         "mood": estimate_mood(audio, sr),
     }
 
@@ -1064,6 +1169,13 @@ async def process_track(client, track):
         print("2/4 Running FFmpeg...")
         await convert_to_wav(downloaded, temp_wav)
 
+        print("3/4 Reading embedded metadata...")
+        try:
+            save_genre_metadata(track_id, extract_embedded_metadata(downloaded))
+        except Exception as metadata_error:
+            # Metadata is optional. Audio analysis and playback must continue.
+            log.warning("Genre metadata scan failed for track=%s: %s", track_id, metadata_error)
+
         print("3/4 Analyzing audio...")
         result = analyze_file(temp_wav)
 
@@ -1096,6 +1208,37 @@ async def process_track(client, track):
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
+async def process_genre_track(client, track):
+    """Scan embedded metadata for an analyzed or unanalyzed track only."""
+    track_id = int(track["id"])
+    work_dir = tempfile.mkdtemp(prefix=f"nyv_genre_{track_id}_", dir=TEMP_DIR)
+    temp_audio = os.path.join(work_dir, f"genre_{track_id}.part")
+    try:
+        downloaded = await download_track(
+            client, str(track["channel_id"]), int(track["message_id"]), temp_audio
+        )
+        try:
+            metadata = extract_embedded_metadata(downloaded)
+            save_genre_metadata(track_id, metadata)
+            log.info("Genre scan complete track=%s genre=%s subgenre=%s", track_id, metadata.get("genre"), metadata.get("subgenre"))
+            return True
+        except Exception as exc:
+            # Mark the scan complete even when the container has no readable
+            # tags; NULL means unknown, not unavailable, and avoids hot-looping.
+            save_genre_metadata(track_id, {}, error=exc)
+            log.warning("Genre scan failed track=%s: %s", track_id, exc)
+            return False
+    except PermanentTelegramMessageError as exc:
+        save_genre_metadata(track_id, {}, error=f"PERMANENT: {exc}")
+        return False
+    except Exception as exc:
+        log.warning("Genre track download failed track=%s: %s", track_id, exc)
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
 # ============================================================
 # MAIN LOOP
 # ============================================================
@@ -1121,8 +1264,10 @@ async def run_analyzer(limit):
             print_progress("CURRENT SCAN")
 
             tracks = get_pending_tracks(limit)
+            genre_tracks = get_pending_genre_tracks(limit)
+            audio_track_ids = {int(track["id"]) for track in tracks}
 
-            if not tracks:
+            if not tracks and not genre_tracks:
                 print()
                 print("✅ CURRENT QUEUE FINISHED")
                 print("No analyzable pending tracks right now.")
@@ -1143,13 +1288,16 @@ async def run_analyzer(limit):
                     print_progress("AUTO WATCH")
 
                     new_tracks = get_pending_tracks(limit)
+                    new_genre_tracks = get_pending_genre_tracks(limit)
 
-                    if new_tracks:
+                    if new_tracks or new_genre_tracks:
                         print(
-                            f"🆕 FOUND {len(new_tracks)} "
-                            f"PENDING TRACK(S)"
+                            f"🆕 FOUND {len(new_tracks)} AUDIO + "
+                            f"{len(new_genre_tracks)} GENRE PENDING TRACK(S)"
                         )
                         tracks = new_tracks
+                        genre_tracks = new_genre_tracks
+                        audio_track_ids = {int(track["id"]) for track in tracks}
                         break
 
                     print("No new tracks yet.")
@@ -1178,6 +1326,17 @@ async def run_analyzer(limit):
 
                 if index < len(tracks):
                     await asyncio.sleep(TRACK_DELAY)
+
+            for index, track in enumerate(genre_tracks, start=1):
+                if int(track["id"]) in audio_track_ids:
+                    continue
+                await ensure_telegram_connected(client)
+                print()
+                print(f"GENRE QUEUE {index}/{len(genre_tracks)} | TRACK={track['id']}")
+                if await process_genre_track(client, track):
+                    print("✅ GENRE SCANNED")
+                else:
+                    print("⚠️ GENRE SCAN FAILED; AUDIO PLAYBACK UNAFFECTED")
 
             print()
             print("=" * 60)

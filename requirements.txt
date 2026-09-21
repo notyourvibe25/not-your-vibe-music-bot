@@ -6,3 +6,4 @@ gunicorn>=22,<24
 
 psycopg[binary]==3.3.5
 numpy==2.4.4
+mutagen>=1.47,<2
