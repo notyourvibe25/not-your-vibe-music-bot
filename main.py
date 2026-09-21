@@ -7535,6 +7535,13 @@ def mini_track_audio_stream(track_id):
         return send_file(final_path, mimetype=mime or "audio/mpeg", conditional=True,
                          etag=True, max_age=1800, download_name=f"track-{int(track_id)}.audio")
 
+    # A cold byte-range request cannot be satisfied safely by the progressive
+    # Telegram generator: WebViews expect a real Content-Range/Content-Length
+    # response and may otherwise receive a tiny or incomplete 206 response.
+    # Populate the seekable file cache first, then let send_file handle ranges.
+    if request.headers.get("Range"):
+        return mini_track_audio(track_id)
+
     with _MINI_AUDIO_FILE_LOCKS_GUARD:
         lock = _MINI_AUDIO_FILE_LOCKS.setdefault(int(track_id), threading.Lock())
     lock.acquire()

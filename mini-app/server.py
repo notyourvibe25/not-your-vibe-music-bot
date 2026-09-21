@@ -102,7 +102,6 @@ def proxy_request(path):
     # Hop-by-hop headers should not be forwarded by the proxy.
     excluded_headers = {
         "content-encoding",
-        "content-length",
         "transfer-encoding",
         "connection",
     }
