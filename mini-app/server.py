@@ -60,7 +60,6 @@ def proxy_request(path):
     # download, which also prevents an avoidable pause between tracks.
     for header_name in (
         "Accept",
-        "Accept-Encoding",
         "Range",
         "If-Range",
         "If-None-Match",
@@ -70,6 +69,12 @@ def proxy_request(path):
         value = request.headers.get(header_name)
         if value:
             headers[header_name] = value
+
+    # requests does not reliably decode Brotli responses, while this proxy
+    # intentionally strips hop-by-hop/content-encoding headers. Force the bot
+    # server to return plain bytes so API JSON is never delivered as opaque
+    # compressed data to the browser. Audio range responses are not compressed.
+    headers["Accept-Encoding"] = "identity"
 
     try:
         upstream = requests.request(
