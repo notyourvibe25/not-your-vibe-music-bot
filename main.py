@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from typing import Mapping
 
 import requests
-from flask import Flask, request, Response, render_template, jsonify, send_file, make_response
+from flask import Flask, request, Response, render_template, jsonify, send_file, make_response, redirect, url_for
 
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
@@ -924,6 +924,31 @@ def get_track(track_id):
                 (track_id,),
             )
 
+            return x.fetchone()
+
+
+def get_fallback_track(exclude_id=None):
+    """Return a playable replacement track when a stale ID is requested."""
+    try:
+        excluded = int(exclude_id) if exclude_id is not None else None
+    except Exception:
+        excluded = None
+    with db() as c:
+        with cur(c) as x:
+            if excluded is None:
+                x.execute("""
+                    SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
+                           energy,danceability,loudness,genre,subgenre,
+                           analyzer_mood,analyzed
+                    FROM tracks ORDER BY RANDOM() LIMIT 1
+                """)
+            else:
+                x.execute("""
+                    SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
+                           energy,danceability,loudness,genre,subgenre,
+                           analyzer_mood,analyzed
+                    FROM tracks WHERE id<>%s ORDER BY RANDOM() LIMIT 1
+                """, (excluded,))
             return x.fetchone()
 
 
@@ -6737,7 +6762,12 @@ def share_track_cover(track_id):
     except Exception:
         log.warning("share cover track lookup failed track=%s", track_id, exc_info=True)
         return ("", 404)
-    if not row or client is None or tele_loop is None or not ready.is_set():
+    if not row:
+        fallback = get_fallback_track(track_id)
+        if fallback:
+            return redirect(url_for("share_track_cover", track_id=int(fallback["id"])), code=302)
+        return ("", 404)
+    if client is None or tele_loop is None or not ready.is_set():
         return ("", 404)
     try:
         now = time.time()
@@ -6803,7 +6833,10 @@ def share_track_cover(track_id):
 def share_track_page(track_id):
     row = get_track(track_id)
     if not row:
-        return share_page("NOT YOUR VIBE", "This track is no longer available.", f"https://t.me/{BOT_USERNAME}")
+        fallback = get_fallback_track(track_id)
+        if fallback:
+            return redirect(url_for("share_track_page", track_id=int(fallback["id"])), code=302)
+        return share_page("NOT YOUR VIBE", "No track is available right now.", f"https://t.me/{BOT_USERNAME}")
     title = str(row.get("title") or f"Track #{row['message_id']}")[:160]
     base = RENDER_EXTERNAL_URL.rstrip("/")
     image_url = f"{base}/share/track/{track_id}/cover" if base else None
@@ -7103,7 +7136,12 @@ def mini_track(track_id):
         return jsonify({"error": err[0]}), err[1]
     row = get_track(track_id)
     if not row:
-        return jsonify({"error": "Track not found"}), 404
+        row = get_fallback_track(track_id)
+        if not row:
+            return jsonify({"error": "No playable track available"}), 404
+        payload = _mini_track(row)
+        payload["fallback_for"] = int(track_id)
+        return jsonify(payload)
     return jsonify(_mini_track(row))
 
 
@@ -7122,7 +7160,13 @@ def mini_track_audio(track_id):
 
     row = get_track(track_id)
     if not row:
-        return jsonify({"error": "Track not found"}), 404
+        fallback = get_fallback_track(track_id)
+        if fallback:
+            target = url_for("mini_track_audio", track_id=int(fallback["id"]))
+            if request.query_string:
+                target = f"{target}?{request.query_string.decode('utf-8', 'ignore')}"
+            return redirect(target, code=302)
+        return jsonify({"error": "No playable track available"}), 404
     if client is None or tele_loop is None or not ready.is_set():
         return jsonify({"error": "Telegram audio service is not ready"}), 503
 
