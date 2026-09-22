@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import json
 import logging
 import math
 import os
@@ -19,9 +18,7 @@ from typing import Optional
 
 import numpy as np
 import psycopg
-from mutagen import File as MutagenFile
 from psycopg.rows import dict_row
-from telethon import TelegramClient
 from telethon.errors import (
     RPCError,
     FloodWaitError,
@@ -30,7 +27,6 @@ from telethon.errors import (
     ChannelPrivateError,
     FileReferenceExpiredError,
 )
-from telethon.sessions import StringSession
 
 
 # ============================================================
@@ -47,24 +43,6 @@ from telethon.sessions import StringSession
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-TELETHON_API_ID = (
-    os.getenv("TELETHON_API_ID")
-    or os.getenv("API_ID")
-    or ""
-).strip()
-
-TELETHON_API_HASH = (
-    os.getenv("TELETHON_API_HASH")
-    or os.getenv("API_HASH")
-    or ""
-).strip()
-
-ANALYZER_TELETHON_SESSION = (
-    os.getenv("ANALYZER_TELETHON_SESSION")
-    or os.getenv("TELETHON_SESSION")
-    or ""
-).strip()
 
 ANALYZER_LIMIT = int(os.getenv("ANALYZER_LIMIT", "10"))
 WATCH_INTERVAL = int(os.getenv("ANALYZER_WATCH_INTERVAL", "60"))
@@ -262,18 +240,12 @@ def db():
 
 
 def ensure_analyzer_schema():
-    """Add analyzer and independent genre-scan metadata columns."""
+    """Add retry metadata columns without changing existing track data."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_retry_count INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_retry_after TIMESTAMPTZ")
-            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scanned_at TIMESTAMPTZ")
-            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_source TEXT")
-            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_tags TEXT")
-            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS artist_name TEXT")
-            cur.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scan_error TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tracks_analyzer_retry_after ON tracks(analyzer_retry_after)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_tracks_genre_scanned_at ON tracks(genre_scanned_at)")
 
 
 
@@ -348,33 +320,13 @@ def get_pending_tracks(limit: int):
             COALESCE(analyzed,FALSE)=FALSE
             AND (
                 ai_error IS NULL
-                OR ai_error NOT LIKE 'PERMANENT:%%'
+                OR ai_error NOT LIKE 'PERMANENT:%'
             )
             AND (analyzer_retry_after IS NULL OR analyzer_retry_after <= NOW())
         ORDER BY id ASC
         LIMIT %s
     """
 
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, (limit,))
-            return cur.fetchall()
-
-
-def get_pending_genre_tracks(limit: int):
-    """Return tracks needing only embedded metadata scanning.
-
-    This queue intentionally does not require analyzed=FALSE: already analyzed
-    tracks must still be eligible for a later genre-only pass.
-    """
-    query = """
-        SELECT id, title, channel_id, message_id, mood
-        FROM tracks
-        WHERE genre_scanned_at IS NULL
-          AND (genre_scan_error IS NULL OR genre_scan_error NOT LIKE 'PERMANENT:%%')
-        ORDER BY id ASC
-        LIMIT %s
-    """
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(query, (limit,))
@@ -433,6 +385,8 @@ def save_analysis(track_id: int, result: dict):
                     energy=%s,
                     danceability=%s,
                     loudness=%s,
+                    genre=%s,
+                    subgenre=%s,
                     analyzer_mood=%s,
                     analyzed=TRUE,
                     analyzed_at=NOW(),
@@ -445,35 +399,9 @@ def save_analysis(track_id: int, result: dict):
                     result.get("energy"),
                     result.get("danceability"),
                     result.get("loudness"),
+                    result.get("genre"),
+                    result.get("subgenre"),
                     result.get("mood"),
-                    track_id,
-                ),
-            )
-
-
-def save_genre_metadata(track_id: int, metadata: dict, error=None):
-    """Persist only embedded metadata; never changes audio analysis status."""
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE tracks
-                SET genre=%s,
-                    subgenre=%s,
-                    genre_tags=%s,
-                    artist_name=%s,
-                    genre_source=%s,
-                    genre_scan_error=%s,
-                    genre_scanned_at=NOW()
-                WHERE id=%s
-                """,
-                (
-                    metadata.get("genre"),
-                    metadata.get("subgenre"),
-                    metadata.get("genre_tags"),
-                    metadata.get("artist_name"),
-                    "embedded" if metadata.get("found") else None,
-                    str(error)[:2000] if error else None,
                     track_id,
                 ),
             )
@@ -482,32 +410,6 @@ def save_genre_metadata(track_id: int, metadata: dict, error=None):
 # ============================================================
 # TELEGRAM
 # ============================================================
-
-def build_telegram_client():
-    if not TELETHON_API_ID:
-        raise RuntimeError("TELETHON_API_ID/API_ID is missing")
-    if not TELETHON_API_HASH:
-        raise RuntimeError("TELETHON_API_HASH/API_HASH is missing")
-    if not ANALYZER_TELETHON_SESSION:
-        raise RuntimeError(
-            "ANALYZER_TELETHON_SESSION/TELETHON_SESSION is missing"
-        )
-
-    try:
-        api_id = int(TELETHON_API_ID)
-    except ValueError:
-        raise RuntimeError("TELETHON_API_ID/API_ID must be an integer")
-
-    return TelegramClient(
-        StringSession(ANALYZER_TELETHON_SESSION),
-        api_id,
-        TELETHON_API_HASH,
-        connection_retries=10,
-        retry_delay=5,
-        timeout=TELEGRAM_TIMEOUT,
-        auto_reconnect=True,
-    )
-
 
 async def ensure_telegram_connected(client):
     if client.is_connected():
@@ -571,7 +473,7 @@ async def get_telegram_message(client, channel_id, message_id):
     return message
 
 
-async def download_track(client, channel_id, message_id, output_path):
+async def download_track(client, channel_id, message_id, output_path, disconnect_on_retry=True):
     last_error = None
 
     for attempt in range(1, TELEGRAM_RETRIES_PER_TRACK + 1):
@@ -639,8 +541,9 @@ async def download_track(client, channel_id, message_id, output_path):
                 "Temporary Telegram error attempt %s/%s: %s",
                 attempt, TELEGRAM_RETRIES_PER_TRACK, exc
             )
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+            if disconnect_on_retry:
+                with contextlib.suppress(Exception):
+                    await client.disconnect()
             await asyncio.sleep(
                 backoff(
                     attempt,
@@ -657,8 +560,9 @@ async def download_track(client, channel_id, message_id, output_path):
                 "Telegram RPC error attempt %s/%s: %s",
                 attempt, TELEGRAM_RETRIES_PER_TRACK, exc
             )
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+            if disconnect_on_retry:
+                with contextlib.suppress(Exception):
+                    await client.disconnect()
             await asyncio.sleep(
                 backoff(
                     attempt,
@@ -1053,61 +957,6 @@ def estimate_mood(audio, sr):
     return "dark"
 
 
-def _metadata_values(tags, keys):
-    values = []
-    for key in keys:
-        try:
-            value = tags.get(key)
-        except Exception:
-            value = None
-        if value is None:
-            continue
-        raw = getattr(value, "text", value)
-        if isinstance(raw, (list, tuple)):
-            values.extend(str(item).strip() for item in raw if str(item).strip())
-        elif str(raw).strip():
-            values.append(str(raw).strip())
-    return values
-
-
-def extract_embedded_metadata(audio_path):
-    """Read only metadata physically embedded in the audio file.
-
-    Missing values remain None; this function never infers a genre from audio
-    features or filenames.
-    """
-    result = {
-        "artist_name": None,
-        "genre": None,
-        "subgenre": None,
-        "genre_tags": None,
-        "found": False,
-    }
-    media = MutagenFile(audio_path, easy=False)
-    if media is None or not getattr(media, "tags", None):
-        return result
-    tags = media.tags
-    artists = _metadata_values(tags, ("TPE1", "TPE2", "©ART", "artist", "ARTIST"))
-    genres = _metadata_values(tags, ("TCON", "©gen", "genre", "GENRE"))
-    subgenres = _metadata_values(tags, (
-        "TXXX:SUBGENRE", "SUBGENRE", "subgenre", "TXXX:STYLE", "STYLE", "style",
-    ))
-    tags_all = []
-    for value in genres + subgenres:
-        for item in str(value).replace(";", ",").split(","):
-            item = item.strip()
-            if item and item.casefold() not in {x.casefold() for x in tags_all}:
-                tags_all.append(item)
-    result.update({
-        "artist_name": artists[0] if artists else None,
-        "genre": genres[0] if genres else None,
-        "subgenre": subgenres[0] if subgenres else None,
-        "genre_tags": json.dumps(tags_all, ensure_ascii=False) if tags_all else None,
-        "found": bool(artists or genres or subgenres),
-    })
-    return result
-
-
 def analyze_file(wav_path):
     audio, sr = read_wav(wav_path)
 
@@ -1120,6 +969,8 @@ def analyze_file(wav_path):
         "energy": round(rms_energy(audio), 2),
         "danceability": estimate_danceability(audio, sr),
         "loudness": round(loudness_db(audio), 2),
+        "genre": None,
+        "subgenre": None,
         "mood": estimate_mood(audio, sr),
     }
 
@@ -1175,13 +1026,6 @@ async def process_track(client, track):
         print("2/4 Running FFmpeg...")
         await convert_to_wav(downloaded, temp_wav)
 
-        print("3/4 Reading embedded metadata...")
-        try:
-            save_genre_metadata(track_id, extract_embedded_metadata(downloaded))
-        except Exception as metadata_error:
-            # Metadata is optional. Audio analysis and playback must continue.
-            log.warning("Genre metadata scan failed for track=%s: %s", track_id, metadata_error)
-
         print("3/4 Analyzing audio...")
         result = analyze_file(temp_wav)
 
@@ -1214,35 +1058,75 @@ async def process_track(client, track):
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
-async def process_genre_track(client, track):
-    """Scan embedded metadata for an analyzed or unanalyzed track only."""
+# ============================================================
+# INTEGRATED MAIN-BOT WORKER
+# ============================================================
+
+def _download_on_shared_loop(shared_client, shared_loop, channel_id, message_id, output_path):
+    """Download media on Main Bot's Telethon loop without blocking it."""
+    future = asyncio.run_coroutine_threadsafe(
+        download_track(
+            shared_client,
+            channel_id,
+            message_id,
+            output_path,
+            disconnect_on_retry=False,
+        ),
+        shared_loop,
+    )
+    return future.result()
+
+
+def process_track_shared(shared_client, shared_loop, track):
+    """Analyze one track in the analyzer thread using Main Bot's client for media only."""
     track_id = int(track["id"])
-    work_dir = tempfile.mkdtemp(prefix=f"nyv_genre_{track_id}_", dir=TEMP_DIR)
-    temp_audio = os.path.join(work_dir, f"genre_{track_id}.part")
+    channel_id = str(track["channel_id"])
+    message_id = int(track["message_id"])
+    title = track.get("title") or "Unknown"
+    work_dir = tempfile.mkdtemp(prefix=f"nyv_analyzer_{track_id}_", dir=TEMP_DIR)
+    temp_audio = os.path.join(work_dir, f"{safe_filename(title, track_id)}_{track_id}_{message_id}.part")
+    temp_wav = os.path.join(work_dir, f"nyv_analyzer_{track_id}.wav")
+    log.info("Analyzer processing track=%s title=%s", track_id, title)
     try:
-        downloaded = await download_track(
-            client, str(track["channel_id"]), int(track["message_id"]), temp_audio
-        )
-        try:
-            metadata = extract_embedded_metadata(downloaded)
-            save_genre_metadata(track_id, metadata)
-            log.info("Genre scan complete track=%s genre=%s subgenre=%s", track_id, metadata.get("genre"), metadata.get("subgenre"))
-            return True
-        except Exception as exc:
-            # Mark the scan complete even when the container has no readable
-            # tags; NULL means unknown, not unavailable, and avoids hot-looping.
-            save_genre_metadata(track_id, {}, error=exc)
-            log.warning("Genre scan failed track=%s: %s", track_id, exc)
-            return False
+        downloaded = _download_on_shared_loop(shared_client, shared_loop, channel_id, message_id, temp_audio)
+        asyncio.run(convert_to_wav(downloaded, temp_wav))
+        result = analyze_file(temp_wav)
+        save_analysis(track_id, result)
+        log.info("Analyzer completed track=%s mood=%s bpm=%s", track_id, result.get("mood"), result.get("bpm"))
+        return True
     except PermanentTelegramMessageError as exc:
-        save_genre_metadata(track_id, {}, error=f"PERMANENT: {exc}")
+        log.warning("Analyzer permanent track=%s: %s", track_id, exc)
+        mark_error(track_id, exc, permanent=True)
         return False
     except Exception as exc:
-        log.warning("Genre track download failed track=%s: %s", track_id, exc)
+        log.warning("Analyzer temporary track=%s: %s", track_id, exc, exc_info=True)
+        try:
+            mark_error(track_id, exc, permanent=False)
+        except Exception:
+            log.exception("Analyzer could not persist error track=%s", track_id)
         return False
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def run_integrated_worker(shared_client, shared_loop, limit, watch_interval, stop_event):
+    """Single-track background loop used by Main Bot; never creates a Telegram client."""
+    ensure_analyzer_schema()
+    cleanup_old_temp_files()
+    log.info("Integrated analyzer started limit=%s interval=%ss", limit, watch_interval)
+    while not stop_event.is_set():
+        if not shared_client.is_connected():
+            stop_event.wait(min(10, watch_interval))
+            continue
+        tracks = get_pending_tracks(limit=1 if limit <= 0 else 1)
+        if not tracks:
+            cleanup_old_temp_files()
+            stop_event.wait(watch_interval)
+            continue
+        process_track_shared(shared_client, shared_loop, tracks[0])
+        stop_event.wait(TRACK_DELAY)
+    log.info("Integrated analyzer stopped")
 
 
 # ============================================================
@@ -1250,122 +1134,9 @@ async def process_genre_track(client, track):
 # ============================================================
 
 async def run_analyzer(limit):
-    print()
-    print("NOT YOUR VIBE AUDIO ANALYZER")
-    print("AI: OFF")
-    print("AUTO WATCH: ON")
-    print("=" * 60)
-
-    ensure_analyzer_schema()
-    cleanup_old_temp_files()
-    client = build_telegram_client()
-
-    success_total = 0
-    failed_total = 0
-
-    try:
-        await ensure_telegram_connected(client)
-
-        while True:
-            print_progress("CURRENT SCAN")
-
-            tracks = get_pending_tracks(limit)
-            genre_tracks = get_pending_genre_tracks(limit)
-            audio_track_ids = {int(track["id"]) for track in tracks}
-
-            if not tracks and not genre_tracks:
-                print()
-                print("✅ CURRENT QUEUE FINISHED")
-                print("No analyzable pending tracks right now.")
-                print(
-                    f"New tracks will be checked every "
-                    f"{WATCH_INTERVAL} seconds."
-                )
-
-                # Keep running forever.
-                # If new tracks are inserted into tracks,
-                # they will automatically be picked up.
-                while True:
-                    await asyncio.sleep(WATCH_INTERVAL)
-
-                    print()
-                    print("🔎 CHECKING FOR NEW TRACKS...")
-                    cleanup_old_temp_files()
-                    print_progress("AUTO WATCH")
-
-                    new_tracks = get_pending_tracks(limit)
-                    new_genre_tracks = get_pending_genre_tracks(limit)
-
-                    if new_tracks or new_genre_tracks:
-                        print(
-                            f"🆕 FOUND {len(new_tracks)} AUDIO + "
-                            f"{len(new_genre_tracks)} GENRE PENDING TRACK(S)"
-                        )
-                        tracks = new_tracks
-                        genre_tracks = new_genre_tracks
-                        audio_track_ids = {int(track["id"]) for track in tracks}
-                        break
-
-                    print("No new tracks yet.")
-
-            for index, track in enumerate(tracks, start=1):
-                await ensure_telegram_connected(client)
-
-                p = get_progress()
-
-                print()
-                print(
-                    f"QUEUE {index}/{len(tracks)} | "
-                    f"TOTAL={p['total']} | "
-                    f"ANALYZED={p['analyzed']} | "
-                    f"REMAINING={p['remaining']}"
-                )
-
-                ok = await process_track(client, track)
-
-                if ok:
-                    success_total += 1
-                else:
-                    failed_total += 1
-
-                print_progress("AFTER TRACK")
-
-                if index < len(tracks):
-                    await asyncio.sleep(TRACK_DELAY)
-
-            for index, track in enumerate(genre_tracks, start=1):
-                if int(track["id"]) in audio_track_ids:
-                    continue
-                await ensure_telegram_connected(client)
-                print()
-                print(f"GENRE QUEUE {index}/{len(genre_tracks)} | TRACK={track['id']}")
-                if await process_genre_track(client, track):
-                    print("✅ GENRE SCANNED")
-                else:
-                    print("⚠️ GENRE SCAN FAILED; AUDIO PLAYBACK UNAFFECTED")
-
-            print()
-            print("=" * 60)
-            print("BATCH FINISHED")
-            print(
-                f"RUN SUCCESS={success_total} | "
-                f"RUN FAILED={failed_total}"
-            )
-            print_progress("BATCH RESULT")
-            print("=" * 60)
-
-            # IMPORTANT:
-            # Immediately ask DB for pending tracks again.
-            # Temporary failures remain pending.
-            # Permanent missing/deleted Telegram messages are excluded.
-            await asyncio.sleep(1)
-
-    finally:
-        with contextlib.suppress(Exception):
-            if client.is_connected():
-                await client.disconnect()
-
-        print("Telethon: DISCONNECTED")
+    raise RuntimeError(
+        "Standalone analyzer disabled: run_integrated_worker() from Main Bot"
+    )
 
 
 def parse_args():
