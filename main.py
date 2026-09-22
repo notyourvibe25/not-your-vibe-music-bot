@@ -6896,13 +6896,18 @@ def _mini_pick_row(uid, mood=None, liked_only=False):
                 x.execute("""
                     SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
                            energy,danceability,loudness,genre,subgenre,analyzer_mood,analyzed
-                    FROM tracks WHERE mood=%s ORDER BY RANDOM() LIMIT 1
-                """, (mood,))
+                    FROM tracks
+                    WHERE mood=%s
+                      AND id >= (SELECT floor(random() * COALESCE(MAX(id), 1)) FROM tracks WHERE mood=%s)
+                    ORDER BY id LIMIT 1
+                """, (mood, mood))
             else:
                 x.execute("""
                     SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
                            energy,danceability,loudness,genre,subgenre,analyzer_mood,analyzed
-                    FROM tracks ORDER BY RANDOM() LIMIT 1
+                    FROM tracks
+                    WHERE id >= (SELECT floor(random() * COALESCE(MAX(id), 1)) FROM tracks)
+                    ORDER BY id LIMIT 1
                 """)
             return x.fetchone()
 
