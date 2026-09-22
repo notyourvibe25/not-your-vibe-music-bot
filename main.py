@@ -7600,6 +7600,19 @@ def start_analyzer():
         log.info("integrated audio analyzer started")
 
 
+def stop_analyzer():
+    """Stop the single analyzer worker and wait for it to exit cleanly."""
+    global analyzer_thread
+    analyzer_stop_event.set()
+    with analyzer_lock:
+        thread = analyzer_thread
+    if thread and thread is not threading.current_thread():
+        thread.join()
+    with analyzer_lock:
+        if analyzer_thread is thread and (not thread or not thread.is_alive()):
+            analyzer_thread = None
+
+
 # =========================================================
 # TELETHON WORKER
 # =========================================================
@@ -7782,7 +7795,7 @@ def tele_worker():
             with contextlib.suppress(asyncio.CancelledError):
                 await rescan_task
 
-            analyzer_stop_event.set()
+            stop_analyzer()
 
     asyncio.run(
         run()

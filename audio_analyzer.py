@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -1174,7 +1175,21 @@ def _download_on_shared_loop(shared_client, shared_loop, channel_id, message_id,
         ),
         shared_loop,
     )
-    return future.result()
+    # Bound the cross-thread wait by the complete per-track retry budget.  A
+    # stuck Telethon coroutine must not leave the analyzer thread blocked
+    # forever; cancelling the proxy also requests cancellation on the shared
+    # event loop.
+    wait_timeout = (
+        TELEGRAM_RETRIES_PER_TRACK * (TELEGRAM_TIMEOUT + TELEGRAM_MAX_RETRY_DELAY)
+        + 5
+    )
+    try:
+        return future.result(timeout=wait_timeout)
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise TemporaryTelegramError(
+            f"Shared Telegram download timed out after {wait_timeout}s"
+        ) from exc
 
 
 def process_track_shared(shared_client, shared_loop, track):
