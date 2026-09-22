@@ -7571,11 +7571,20 @@ async def periodic_scan():
 # =========================================================
 
 def _run_analyzer_worker(shared_client, shared_loop):
-    try:
-        from audio_analyzer import run_integrated_worker
-        run_integrated_worker(shared_client, shared_loop, ANALYZER_LIMIT, ANALYZER_WATCH_INTERVAL, analyzer_stop_event)
-    except Exception:
-        log.exception("integrated analyzer stopped unexpectedly")
+    from audio_analyzer import run_integrated_worker
+    while not analyzer_stop_event.is_set():
+        try:
+            run_integrated_worker(
+                shared_client,
+                shared_loop,
+                ANALYZER_LIMIT,
+                ANALYZER_WATCH_INTERVAL,
+                analyzer_stop_event,
+            )
+            return
+        except Exception:
+            log.exception("integrated analyzer stopped unexpectedly; retrying")
+            analyzer_stop_event.wait(min(30, ANALYZER_WATCH_INTERVAL))
 
 
 def start_analyzer():
