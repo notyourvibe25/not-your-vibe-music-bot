@@ -18,7 +18,6 @@
   };
   const scan = () => document.querySelectorAll('button,[role="button"],a').forEach(label);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', scan, {once:true}); else scan();
-  new MutationObserver(scan).observe(document.documentElement, {subtree:true, childList:true});
 })();
 </script>
 <style>
