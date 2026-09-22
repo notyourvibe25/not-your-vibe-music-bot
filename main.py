@@ -111,7 +111,11 @@ WEBHOOK_SECRET = env("TELEGRAM_WEBHOOK_SECRET")
 
 API_ID = env("TELETHON_API_ID") or env("API_ID")
 API_HASH = env("TELETHON_API_HASH") or env("API_HASH")
-SESSION = env("TELETHON_BOT_SESSION")
+SESSION = (
+    env("TELETHON_BOT_SESSION")
+    or env("TELETHON_SESSION")
+    or env("TELETHON_SESSION_FILE")
+)
 
 HTTP_TIMEOUT = geti(
     "TELEGRAM_HTTP_TIMEOUT",
@@ -8104,6 +8108,14 @@ def tele_worker():
 
     global client
     global tele_loop
+
+    log.info(
+        "Telethon config presence API_ID=%s API_HASH=%s SESSION=%s SESSION_LEN=%d",
+        bool(API_ID),
+        bool(API_HASH),
+        bool(SESSION),
+        len(SESSION),
+    )
 
     if not (
         API_ID
