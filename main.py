@@ -9,11 +9,9 @@ import logging
 import os
 import random
 import threading
-import queue
 import math
 import time
 import contextlib
-from collections import OrderedDict
 from html import escape
 from urllib.parse import quote, parse_qsl
 
@@ -24,7 +22,7 @@ from contextlib import contextmanager
 from typing import Mapping
 
 import requests
-from flask import Flask, request, Response, render_template, jsonify, send_file, make_response, redirect, url_for
+from flask import Flask, request, Response, render_template, jsonify, send_file, make_response
 
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
@@ -111,11 +109,7 @@ WEBHOOK_SECRET = env("TELEGRAM_WEBHOOK_SECRET")
 
 API_ID = env("TELETHON_API_ID") or env("API_ID")
 API_HASH = env("TELETHON_API_HASH") or env("API_HASH")
-SESSION = (
-    env("TELETHON_BOT_SESSION")
-    or env("TELETHON_SESSION")
-    or env("TELETHON_SESSION_FILE")
-)
+SESSION = env("TELETHON_SESSION")
 
 HTTP_TIMEOUT = geti(
     "TELEGRAM_HTTP_TIMEOUT",
@@ -140,13 +134,10 @@ POOL_MAX = geti(
 
 SCAN_INTERVAL = geti(
     "AUTO_SCAN_INTERVAL",
-    0,
-    0,
-    86400,
+    300,
+    60,
+    3600,
 )
-
-DB_INIT_RETRIES = geti("DB_INIT_RETRIES", 6, 1, 20)
-DB_INIT_RETRY_DELAY = geti("DB_INIT_RETRY_DELAY", 10, 1, 120)
 
 RECONNECT = geti(
     "TELETHON_RECONNECT_DELAY",
@@ -171,8 +162,6 @@ TRENDING_DAYS = geti(
 
 # Radio mood balancing.  These are environment-configurable so the live
 # recommendation mix can be tuned without changing application code.
-RADIO_CANDIDATE_LIMIT = geti("RADIO_CANDIDATE_LIMIT", 2500, 200, 10000)
-
 RADIO_MOOD_TEMPERATURE = getf("RADIO_MOOD_TEMPERATURE", 1.5, 0.1, 10.0)
 RADIO_MOOD_MAX_RATIO = getf("RADIO_MOOD_MAX_RATIO", 0.40, 0.05, 1.0)
 RADIO_BASELINE_MOOD_MULTIPLIER = getf(
@@ -323,6 +312,13 @@ music_generation = {}
 
 channel_map = {}
 last_scan = 0
+
+ANALYZER_ENABLED = env("ANALYZER_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+ANALYZER_LIMIT = geti("ANALYZER_LIMIT", 10, 1, 100)
+ANALYZER_WATCH_INTERVAL = geti("ANALYZER_WATCH_INTERVAL", 60, 10, 3600)
+analyzer_thread = None
+analyzer_stop_event = threading.Event()
+analyzer_lock = threading.Lock()
 
 http_local = threading.local()
 
@@ -549,17 +545,12 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_user ON user_history(user_id,sent_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_track ON user_history(user_id,channel_id,message_id,sent_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_hist_track_action ON user_history(channel_id,message_id,action);
-    CREATE INDEX IF NOT EXISTS idx_hist_user_action_sent ON user_history(user_id,action,sent_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_recent ON user_history(sent_at DESC,channel_id,message_id);
     CREATE INDEX IF NOT EXISTS idx_fb_user ON track_feedback(user_id);
-    CREATE INDEX IF NOT EXISTS idx_fb_user_feedback_created ON track_feedback(user_id,feedback,created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_fb_track_feedback ON track_feedback(channel_id,message_id,feedback);
     CREATE INDEX IF NOT EXISTS idx_fb_recent ON track_feedback(created_at DESC,feedback);
     CREATE INDEX IF NOT EXISTS idx_daily_day ON daily_activity(day);
     CREATE INDEX IF NOT EXISTS idx_bc_broadcast ON broadcast_comments(broadcast_id);
-    CREATE INDEX IF NOT EXISTS idx_bc_broadcast_recent ON broadcast_comments(broadcast_id,id DESC);
-    CREATE INDEX IF NOT EXISTS idx_bcr_comment_recent ON broadcast_comment_replies(comment_id,created_at DESC);
 
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS title TEXT;
 
@@ -573,11 +564,6 @@ def init_db():
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS loudness DOUBLE PRECISION;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre TEXT;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS subgenre TEXT;
-    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scanned_at TIMESTAMPTZ;
-    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_source TEXT;
-    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_tags TEXT;
-    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS artist_name TEXT;
-    ALTER TABLE tracks ADD COLUMN IF NOT EXISTS genre_scan_error TEXT;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzer_mood TEXT;
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ;
 
@@ -604,7 +590,6 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_tracks_analyzed ON tracks(analyzed);
     CREATE INDEX IF NOT EXISTS idx_tracks_analyzer_mood ON tracks(analyzer_mood);
-    CREATE INDEX IF NOT EXISTS idx_tracks_genre_scanned_at ON tracks(genre_scanned_at);
 
     ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
     ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
@@ -942,31 +927,6 @@ def get_track(track_id):
                 (track_id,),
             )
 
-            return x.fetchone()
-
-
-def get_fallback_track(exclude_id=None):
-    """Return a playable replacement track when a stale ID is requested."""
-    try:
-        excluded = int(exclude_id) if exclude_id is not None else None
-    except Exception:
-        excluded = None
-    with db() as c:
-        with cur(c) as x:
-            if excluded is None:
-                x.execute("""
-                    SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
-                           energy,danceability,loudness,genre,subgenre,
-                           analyzer_mood,analyzed
-                    FROM tracks ORDER BY RANDOM() LIMIT 1
-                """)
-            else:
-                x.execute("""
-                    SELECT id,mood,channel_id,message_id,title,bpm,musical_key,
-                           energy,danceability,loudness,genre,subgenre,
-                           analyzer_mood,analyzed
-                    FROM tracks WHERE id<>%s ORDER BY RANDOM() LIMIT 1
-                """, (excluded,))
             return x.fetchone()
 
 
@@ -1310,19 +1270,6 @@ def _radio_key_parts(value):
     return root, mode
 
 
-def _radio_tag_values(value):
-    """Decode scanner JSON tags without making metadata mandatory."""
-    if not value:
-        return []
-    try:
-        parsed = json.loads(value) if isinstance(value, str) else value
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return []
-    if not isinstance(parsed, list):
-        return []
-    return [str(item).strip().casefold() for item in parsed if str(item).strip()]
-
-
 def _numeric_similarity(value, target, scale):
     if value is None or target is None:
         return None
@@ -1359,7 +1306,6 @@ def _radio_profile(uid):
         "analyzer_moods": {},
         "genres": {},
         "subgenres": {},
-        "genre_tags": {},
     }
 
     with db() as c:
@@ -1376,7 +1322,6 @@ def _radio_profile(uid):
                     t.loudness,
                     t.genre,
                     t.subgenre,
-                    t.genre_tags,
                     t.analyzer_mood,
                     t.mood,
                     t.channel_id,
@@ -1443,9 +1388,6 @@ def _radio_profile(uid):
                     profile[target].get(value, 0.0) + weight
                 )
 
-        for tag in _radio_tag_values(row.get("genre_tags")):
-            profile["genre_tags"][tag] = profile["genre_tags"].get(tag, 0.0) + weight
-
     return profile
 
 
@@ -1478,57 +1420,6 @@ def _radio_history(uid):
                 }
 
     return recent
-
-
-def _radio_history_affinity(uid, limit=96):
-    """Build a soft implicit taste profile from tracks the user actually received.
-
-    Explicit Like/Not-for-me feedback remains stronger. Served history is used as
-    a gentle signal so Radio learns even when a listener does not press Like.
-    Recent listens decay quickly and do not override explicit dislikes.
-    """
-    profile = {"moods": {}, "genres": {}, "subgenres": {}, "genre_tags": {}, "analyzer_moods": {}}
-    with db() as c:
-        with cur(c) as x:
-            x.execute("""
-                SELECT t.mood,t.genre,t.subgenre,t.genre_tags,t.analyzer_mood,h.sent_at
-                FROM user_history h
-                JOIN tracks t ON t.channel_id=h.channel_id AND t.message_id=h.message_id
-                WHERE h.user_id=%s AND h.action='served'
-                ORDER BY h.sent_at DESC,h.id DESC
-                LIMIT %s
-            """, (uid, int(limit)))
-            rows = x.fetchall()
-    for index, row in enumerate(rows):
-        # Sequence decay makes the last few listening choices most important.
-        weight = math.exp(-index / max(10.0, RADIO_FEEDBACK_DECAY_SCALE * 0.9))
-        for field, key in (("mood", "moods"), ("genre", "genres"),
-                           ("subgenre", "subgenres"), ("analyzer_mood", "analyzer_moods")):
-            value = row.get(field)
-            if value is None or not str(value).strip():
-                continue
-            value = str(value).strip().casefold()
-            profile[key][value] = profile[key].get(value, 0.0) + weight
-        for tag in _radio_tag_values(row.get("genre_tags")):
-            profile["genre_tags"][tag] = profile["genre_tags"].get(tag, 0.0) + weight
-    for key, values in profile.items():
-        total = sum(values.values())
-        if total:
-            profile[key] = {name: score / total for name, score in values.items()}
-    return profile
-
-
-def _radio_history_affinity_score(row, affinity):
-    """Return a bounded match score against implicit listening preferences."""
-    if not affinity:
-        return 0.0
-    score = 0.0
-    score += 0.48 * affinity.get("moods", {}).get(str(row.get("mood") or "").casefold(), 0.0)
-    score += 0.28 * affinity.get("genres", {}).get(str(row.get("genre") or "").casefold(), 0.0)
-    score += 0.16 * affinity.get("subgenres", {}).get(str(row.get("subgenre") or "").casefold(), 0.0)
-    score += 0.08 * sum(affinity.get("genre_tags", {}).get(tag, 0.0) for tag in _radio_tag_values(row.get("genre_tags")))
-    score += 0.08 * affinity.get("analyzer_moods", {}).get(str(row.get("analyzer_mood") or "").casefold(), 0.0)
-    return min(1.0, score * 4.0)
 
 
 def _radio_song_key(title):
@@ -1640,7 +1531,6 @@ def _radio_last_seed(uid):
                     t.loudness,
                     t.genre,
                     t.subgenre,
-                    t.genre_tags,
                     t.analyzer_mood
                 FROM user_history h
                 JOIN tracks t
@@ -1657,74 +1547,72 @@ def _radio_last_seed(uid):
 
 
 def _radio_candidates(uid):
-    """Fetch a bounded, index-friendly candidate pool for Python scoring.
-
-    Detailed rule-based scoring remains in Python.  The database only returns
-    a reasonable pool and per-track global counters, avoiding full-table
-    global aggregation on every Radio request as the library grows.
-    """
     with db() as c:
         with cur(c) as x:
             x.execute(
                 """
-                WITH candidate_pool AS (
-                    SELECT
-                        t.id,
-                        t.mood,
-                        t.message_id,
-                        t.channel_id,
-                        t.title,
-                        t.created_at,
-                        t.bpm,
-                        t.musical_key,
-                        t.energy,
-                        t.danceability,
-                        t.loudness,
-                        t.genre,
-                        t.subgenre,
-                        t.genre_tags,
-                        t.analyzer_mood
-                    FROM tracks t
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM track_feedback f
-                        WHERE f.user_id=%s
-                          AND f.channel_id=t.channel_id
-                          AND f.message_id=t.message_id
-                          AND f.feedback='not_for_me'
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM user_history failed
-                        WHERE failed.user_id=%s
-                          AND failed.channel_id=t.channel_id
-                          AND failed.message_id=t.message_id
-                          AND failed.action='delivery_failed'
-                    )
-                    ORDER BY t.id ASC
-                    LIMIT %s
-                )
                 SELECT
-                    p.*,
-                    COALESCE((
-                        SELECT COUNT(*)
-                        FROM track_feedback gl
-                        WHERE gl.channel_id=p.channel_id
-                          AND gl.message_id=p.message_id
-                          AND gl.feedback='like'
-                    ),0) AS global_likes,
-                    COALESCE((
-                        SELECT COUNT(*)
-                        FROM user_history gs
-                        WHERE gs.channel_id=p.channel_id
-                          AND gs.message_id=p.message_id
-                          AND gs.action='served'
-                    ),0) AS global_served
-                FROM candidate_pool p
+                    t.id,
+                    t.mood,
+                    t.message_id,
+                    t.channel_id,
+                    t.title,
+                    t.created_at,
+                    t.bpm,
+                    t.musical_key,
+                    t.energy,
+                    t.danceability,
+                    t.loudness,
+                    t.genre,
+                    t.subgenre,
+                    t.analyzer_mood,
+                    COALESCE(gl.global_likes,0) AS global_likes,
+                    COALESCE(gs.global_served,0) AS global_served
+                FROM tracks t
+                LEFT JOIN (
+                    SELECT
+                        channel_id,
+                        message_id,
+                        COUNT(*) AS global_likes
+                    FROM track_feedback
+                    WHERE feedback='like'
+                    GROUP BY channel_id,message_id
+                ) gl
+                  ON gl.channel_id=t.channel_id
+                 AND gl.message_id=t.message_id
+                LEFT JOIN (
+                    SELECT
+                        channel_id,
+                        message_id,
+                        COUNT(*) AS global_served
+                    FROM user_history
+                    WHERE action='served'
+                    GROUP BY channel_id,message_id
+                ) gs
+                  ON gs.channel_id=t.channel_id
+                 AND gs.message_id=t.message_id
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM track_feedback f
+                    WHERE f.user_id=%s
+                      AND f.channel_id=t.channel_id
+                      AND f.message_id=t.message_id
+                      AND f.feedback='not_for_me'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM user_history failed
+                    WHERE failed.user_id=%s
+                      AND failed.channel_id=t.channel_id
+                      AND failed.message_id=t.message_id
+                      AND failed.action='delivery_failed'
+                )
+                ORDER BY t.id ASC
                 """,
-                (uid, uid, RADIO_CANDIDATE_LIMIT),
+                (uid, uid),
             )
             return x.fetchall()
+
 
 def _radio_harmonic_transition_score(candidate_key, last_key):
     """Prefer Camelot-compatible keys and avoid large harmonic jumps."""
@@ -2104,20 +1992,15 @@ def adjust_mood_ratios(
     return {m: value / total_result for m, value in result.items()}
 
 
-def radio_weights(uid, baseline_mood=None, implicit_affinity=None):
-    """Return explicit-feedback + implicit-history mood ratios for Radio."""
+def radio_weights(uid, baseline_mood=None):
+    """Return temperature-scaled, capped mood ratios for Radio."""
     stats = ratios(uid)
-    implicit = implicit_affinity if implicit_affinity is not None else _radio_history_affinity(uid)
     raw_scores = {}
     for mood in MOODS:
         liked = float(stats[mood]["like"])
         disliked = float(stats[mood]["not"])
-        implicit_mood = float(implicit.get("moods", {}).get(mood, 0.0))
-        # Explicit feedback is dominant; received-listen history supplies a
-        # bounded prior when the user has not rated many tracks yet.
-        raw_scores[mood] = (liked + 1.0 + 2.2 * implicit_mood) / (
-            liked + disliked + 2.0 + 2.2 * implicit_mood
-        )
+        # Bayesian-smoothed preference: neutral users still hear every mood.
+        raw_scores[mood] = (liked + 1.0) / (liked + disliked + 2.0)
 
     if baseline_mood in raw_scores:
         raw_scores[baseline_mood] += RADIO_BASELINE_MOOD_MULTIPLIER
@@ -2141,12 +2024,7 @@ def radio_track(uid, baseline_mood=None):
     recent = _radio_history(uid)
     today_served = _radio_today_served(uid)
     today_song_keys = _radio_today_song_keys(uid)
-    implicit_affinity = _radio_history_affinity(uid)
-    mood_weights = radio_weights(
-        uid,
-        baseline_mood=baseline_mood,
-        implicit_affinity=implicit_affinity,
-    )
+    mood_weights = radio_weights(uid, baseline_mood=baseline_mood)
     profile = _radio_profile(uid)
     liked_seeds = profile.get("likes", [])
     disliked_seeds = profile.get("dislikes", [])
@@ -2257,10 +2135,6 @@ def radio_track(uid, baseline_mood=None):
         mood = row["mood"]
         score = 48.0 * float(mood_weights.get(mood, 0.5))
 
-        # Implicit listening history improves cold/no-feedback personalization.
-        # It is intentionally softer than explicit Likes and seed similarity.
-        score += 12.0 * _radio_history_affinity_score(row, implicit_affinity)
-
         # Weighted nearest-neighbor taste matching.  This is deliberately
         # rule-based: recent Likes receive larger decay weights and the best
         # matching seed is retained so a strong local match is not diluted.
@@ -2271,16 +2145,6 @@ def radio_track(uid, baseline_mood=None):
         negative_similarity = _radio_negative_similarity(row, disliked_seeds)
         if negative_similarity:
             score -= 12.0 * negative_similarity
-
-        # Embedded genre metadata is an additional taste signal. It is kept
-        # deliberately below mood/audio similarity so it cannot lock Radio to
-        # one genre or prevent exploration when metadata is missing.
-        genre = str(row.get("genre") or "").strip().casefold()
-        subgenre = str(row.get("subgenre") or "").strip().casefold()
-        score += min(4.0, 2.0 * profile["genres"].get(genre, 0.0))
-        score += min(5.0, 2.5 * profile["subgenres"].get(subgenre, 0.0))
-        tag_score = sum(profile["genre_tags"].get(tag, 0.0) for tag in _radio_tag_values(row.get("genre_tags")))
-        score += min(3.5, 1.75 * tag_score)
 
         # Time-of-day is a soft context signal: it steers recommendations
         # toward the appropriate mood/BPM without overriding user feedback,
@@ -6843,66 +6707,29 @@ def share_page(title, description, bot_link, image_url=None):
     return f"""<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{escape(title)}</title><meta property=\"og:title\" content=\"{escape(title)}\"><meta property=\"og:description\" content=\"{escape(description)}\">{image_meta}<meta name=\"twitter:card\" content=\"summary_large_image\"><meta name=\"twitter:title\" content=\"{escape(title)}\"><meta name=\"twitter:description\" content=\"{escape(description)}\"><style>body{{margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,-apple-system,sans-serif}}main{{max-width:560px;margin:8vh auto;padding:24px}}.card{{border:1px solid #292933;border-radius:24px;padding:30px;text-align:center;background:#121218}}h1{{font-size:28px;margin:8px 0 12px}}p{{color:#b7b7c2;line-height:1.5}}a{{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:999px;background:#fff;color:#111;text-decoration:none;font-weight:700}}</style></head><body><main><div class=\"card\"><div>🎧</div><h1>{escape(title)}</h1><p>{escape(description)}</p><a href=\"{escape(bot_link)}\">Open in Telegram</a></div></main></body></html>"""
 
 
-SHARE_COVER_CACHE_ITEMS = geti("SHARE_COVER_CACHE_ITEMS", 64, 8, 512)
-SHARE_COVER_CACHE_TTL = geti("SHARE_COVER_CACHE_TTL", 86400, 60, 604800)
-_SHARE_COVER_CACHE = OrderedDict()
+_SHARE_COVER_CACHE = {}
 _SHARE_COVER_LOCK = threading.Lock()
 SHARE_COVER_FAILURE_BACKOFF = 300
 
-def _share_cover_placeholder(row, track_id):
-    """Return a deterministic SVG placeholder when a Telegram thumbnail is absent."""
-    import html as _html
-    title = str((row or {}).get("title") or f"Track #{track_id}").strip()
-    label = title[:28] + ("…" if len(title) > 28 else "")
-    safe = _html.escape(label)
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" viewBox="0 0 800 800">
-      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#151c17"/><stop offset="1" stop-color="#070a08"/></linearGradient></defs>
-      <rect width="800" height="800" fill="url(#g)"/><circle cx="650" cy="130" r="210" fill="#c6ff4a" opacity=".10"/>
-      <circle cx="400" cy="350" r="142" fill="none" stroke="#c6ff4a" stroke-width="10" opacity=".8"/>
-      <path d="M400 210v280a62 62 0 1 1-28-52V292l180-42v198a62 62 0 1 1-28-52V190z" fill="#c6ff4a"/>
-      <text x="56" y="710" fill="#f4f7f3" font-family="Arial,sans-serif" font-size="34" font-weight="700">{safe}</text>
-      <text x="58" y="754" fill="#aeb8ad" font-family="Arial,sans-serif" font-size="20" letter-spacing="4">NOT YOUR VIBE</text>
-    </svg>"""
-    return svg.encode("utf-8")
-
-
 @app.route("/share/track/<int:track_id>/cover")
 def share_track_cover(track_id):
-    # Telegram may retry preview images repeatedly. A stale track or a
-    # transient database failure should fall back to the text-only preview,
-    # not become an unhandled Flask exception.
-    try:
-        row = get_track(track_id)
-    except Exception:
-        log.warning("share cover track lookup failed track=%s", track_id, exc_info=True)
-        return ("", 404)
-    if not row:
-        fallback = get_fallback_track(track_id)
-        if fallback:
-            return redirect(url_for("share_track_cover", track_id=int(fallback["id"])), code=302)
-        return ("", 404)
-    if client is None or tele_loop is None or not ready.is_set():
+    row = get_track(track_id)
+    if not row or client is None or tele_loop is None or not ready.is_set():
         return ("", 404)
     try:
         now = time.time()
         with _SHARE_COVER_LOCK:
             cached = _SHARE_COVER_CACHE.get(int(track_id))
-            if cached:
-                _SHARE_COVER_CACHE.move_to_end(int(track_id))
         if cached:
             data, content_type, cached_at = cached
-            if now - cached_at < SHARE_COVER_CACHE_TTL:
-                if data:
-                    return Response(
-                        data,
-                        mimetype=content_type,
-                        headers={"Cache-Control": "public, max-age=86400"},
-                    )
-                if now - cached_at < SHARE_COVER_FAILURE_BACKOFF:
-                    return ("", 404)
-            else:
-                with _SHARE_COVER_LOCK:
-                    _SHARE_COVER_CACHE.pop(int(track_id), None)
+            if data:
+                return Response(
+                    data,
+                    mimetype=content_type,
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
+            if now - cached_at < SHARE_COVER_FAILURE_BACKOFF:
+                return ("", 404)
 
         async def fetch_thumb():
             message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
@@ -6917,40 +6744,29 @@ def share_track_cover(track_id):
         future = asyncio.run_coroutine_threadsafe(fetch_thumb(), tele_loop)
         data = future.result(timeout=8)
         if not data:
-            data = _share_cover_placeholder(row, track_id)
-            content_type = "image/svg+xml"
-        elif data.startswith(b"\x89PNG"):
+            with _SHARE_COVER_LOCK:
+                _SHARE_COVER_CACHE[int(track_id)] = (None, "image/jpeg", now)
+            return ("", 404)
+        if data.startswith(b"\x89PNG"):
             content_type = "image/png"
         elif data.startswith(b"RIFF") and b"WEBP" in data[:16]:
             content_type = "image/webp"
-        elif data.lstrip().startswith(b"<svg"):
-            content_type = "image/svg+xml"
         else:
             content_type = "image/jpeg"
         with _SHARE_COVER_LOCK:
             _SHARE_COVER_CACHE[int(track_id)] = (data, content_type, now)
-            _SHARE_COVER_CACHE.move_to_end(int(track_id))
-            while len(_SHARE_COVER_CACHE) > SHARE_COVER_CACHE_ITEMS:
-                _SHARE_COVER_CACHE.popitem(last=False)
         return Response(data, mimetype=content_type, headers={"Cache-Control": "public, max-age=86400"})
     except Exception:
-        data = _share_cover_placeholder(row, track_id)
         with _SHARE_COVER_LOCK:
-            _SHARE_COVER_CACHE[int(track_id)] = (data, "image/svg+xml", time.time())
-            _SHARE_COVER_CACHE.move_to_end(int(track_id))
-            while len(_SHARE_COVER_CACHE) > SHARE_COVER_CACHE_ITEMS:
-                _SHARE_COVER_CACHE.popitem(last=False)
-        log.warning("share cover unavailable track=%s; serving placeholder", track_id)
-        return Response(data, mimetype="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+            _SHARE_COVER_CACHE[int(track_id)] = (None, "image/jpeg", time.time())
+        log.warning("share cover unavailable track=%s; using cover backoff", track_id)
+        return ("", 404)
 
 @app.route("/share/track/<int:track_id>")
 def share_track_page(track_id):
     row = get_track(track_id)
     if not row:
-        fallback = get_fallback_track(track_id)
-        if fallback:
-            return redirect(url_for("share_track_page", track_id=int(fallback["id"])), code=302)
-        return share_page("NOT YOUR VIBE", "No track is available right now.", f"https://t.me/{BOT_USERNAME}")
+        return share_page("NOT YOUR VIBE", "This track is no longer available.", f"https://t.me/{BOT_USERNAME}")
     title = str(row.get("title") or f"Track #{row['message_id']}")[:160]
     base = RENDER_EXTERNAL_URL.rstrip("/")
     image_url = f"{base}/share/track/{track_id}/cover" if base else None
@@ -6970,7 +6786,7 @@ def share_profile_page(profile_uid):
 # =========================================================
 
 MINI_APP_MAX_AGE = 86400
-MINI_AUDIO_CACHE_ITEMS = geti("MINI_AUDIO_CACHE_ITEMS", 8, 1, 12)
+MINI_AUDIO_CACHE_ITEMS = geti("MINI_AUDIO_CACHE_ITEMS", 4, 1, 12)
 _MINI_AUDIO_CACHE = {}
 _MINI_AUDIO_CACHE_LOCK = threading.Lock()
 _MINI_AUDIO_FILE_LOCKS = {}
@@ -7118,16 +6934,11 @@ def mini_home():
                 liked_rows = x.fetchall()
 
         daily = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
-        if mood and not daily:
-            # A stale/legacy mood must never make the Mini App look empty.
-            daily = _mini_pick_row(uid)
         for_you = _mini_pick_row(uid, liked_only=True)
         # Keep initial Home fast: exact bot Radio selection is done by /api/action
         # when the user opens/plays Radio. A lightweight preview avoids blocking
         # the first screen on the full continuity/scoring query.
         radio = _mini_pick_row(uid, mood=mood) if mood else _mini_pick_row(uid)
-        if mood and not radio:
-            radio = _mini_pick_row(uid)
         # Keep Track of the Day deterministic per user/day.
         day = datetime.now(ZoneInfo("Asia/Yangon")).date().isoformat()
         with db() as c:
@@ -7139,15 +6950,6 @@ def mini_home():
                 """, (f"{uid}:{day}",))
                 totd = x.fetchone()
 
-        log.info(
-            "Mini App home uid=%s mood=%s daily=%s radio=%s for_you=%s track_of_day=%s",
-            uid,
-            mood,
-            daily.get("id") if daily else None,
-            radio.get("id") if radio else None,
-            for_you.get("id") if for_you else None,
-            totd.get("id") if totd else None,
-        )
         return jsonify({
             "user": {"id": uid, "first_name": user.get("first_name", "")},
             "state": state,
@@ -7233,198 +7035,9 @@ def mini_action():
             if reserved:
                 break
     row = _mini_row_from_pick(picked)
-    # Telegram/database rows can disappear between selection and delivery.
-    # Retry the radio/next selector instead of breaking continuous playback.
-    if not row and action in ("radio", "next"):
-        for _ in range(5):
-            picked = radio_track(uid, baseline_mood=mood) if radio_mode else normal_track(uid, mood)
-            if not picked:
-                break
-            selected = (picked[0], picked[1], picked[2])
-            if not reserve(uid, selected, no_repeat_today=radio_mode):
-                continue
-            row = _mini_row_from_pick(picked)
-            if row:
-                break
     if not row:
-        return jsonify({"error": "No playable track available", "state": get_state(uid)}), 404
-    payload = _mini_track(row)
-    payload["radio"] = bool(get_state(uid).get("radio"))
-    return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": payload})
-
-
-@app.route("/api/comments")
-def mini_comments():
-    """Cursor-paginated public comments with lightweight threaded replies."""
-    user, err = _mini_app_user()
-    if err:
-        return jsonify({"error": err[0]}), err[1]
-    try:
-        limit = max(1, min(int(request.args.get("limit", 20)), 50))
-    except (TypeError, ValueError):
-        limit = 20
-    before = request.args.get("before")
-    try:
-        before_id = int(before) if before else None
-    except (TypeError, ValueError):
-        before_id = None
-    with db() as c:
-        with cur(c) as x:
-            where = "WHERE c.id < %s" if before_id else ""
-            params = (before_id, limit + 1) if before_id else (limit + 1,)
-            x.execute(f"""
-                SELECT c.id,c.broadcast_id,c.user_id,c.comment,c.created_at,
-                       u.username,u.first_name,u.last_name
-                FROM broadcast_comments c
-                LEFT JOIN users u ON u.user_id=c.user_id
-                {where}
-                ORDER BY c.id DESC LIMIT %s
-            """, params)
-            rows = x.fetchall()
-            has_more = len(rows) > limit
-            rows = rows[:limit]
-            reply_map = {}
-            comment_ids = [int(row["id"]) for row in rows]
-            if comment_ids:
-                x.execute("""
-                    SELECT r.id,r.comment_id,r.admin_id,r.reply,r.created_at,
-                           u.username,u.first_name,u.last_name
-                    FROM broadcast_comment_replies r
-                    LEFT JOIN users u ON u.user_id=r.admin_id
-                    WHERE r.comment_id = ANY(%s)
-                    ORDER BY r.created_at ASC,r.id ASC
-                """, (comment_ids,))
-                for reply in x.fetchall():
-                    reply_map.setdefault(int(reply["comment_id"]), []).append({
-                        "id": int(reply["id"]), "comment_id": int(reply["comment_id"]),
-                        "reply": reply["reply"], "created_at": int(reply["created_at"]),
-                        "username": reply.get("username"),
-                        "name": " ".join(v for v in (reply.get("first_name") or "", reply.get("last_name") or "") if v).strip(),
-                    })
-            items=[]
-            for row in rows:
-                replies = reply_map.get(int(row["id"]), [])
-                items.append({
-                    "id": int(row["id"]), "broadcast_id": int(row["broadcast_id"]),
-                    "user_id": int(row["user_id"]), "comment": row["comment"],
-                    "created_at": int(row["created_at"]),
-                    "username": row.get("username"),
-                    "name": " ".join(v for v in (row.get("first_name") or "", row.get("last_name") or "") if v).strip(),
-                    "replies": replies,
-                })
-    return jsonify({"items": items, "has_more": has_more,
-                    "next_before": items[-1]["id"] if has_more and items else None})
-
-
-@app.route("/api/profile")
-def mini_profile():
-    user, err = _mini_app_user()
-    if err:
-        return jsonify({"error": err[0]}), err[1]
-    uid = int(user["id"])
-    profile = _radio_profile(uid)
-    with db() as c:
-        with cur(c) as x:
-            x.execute("""
-                SELECT t.id,t.title,t.mood,t.genre,h.sent_at
-                FROM user_history h JOIN tracks t
-                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
-                WHERE h.user_id=%s AND h.action='served'
-                ORDER BY h.sent_at DESC,h.id DESC LIMIT 10
-            """, (uid,))
-            recent = [dict(r) for r in x.fetchall()]
-    def top(values, n=3):
-        return [{"name": k, "score": round(float(v), 3)} for k,v in sorted(values.items(), key=lambda item: item[1], reverse=True)[:n]]
-    return jsonify({"top_moods": top(profile.get("analyzer_moods") or profile.get("genres") or {}),
-                    "genres": top(profile.get("genres", {})),
-                    "subgenres": top(profile.get("subgenres", {})),
-                    "recent": recent})
-
-
-@app.route("/api/leaderboard")
-def mini_leaderboard():
-    user, err = _mini_app_user()
-    if err:
-        return jsonify({"error": err[0]}), err[1]
-    cutoff = int(time.time()) - 7 * 86400
-    with db() as c:
-        with cur(c) as x:
-            x.execute("""
-                SELECT h.user_id, COUNT(*) AS plays,
-                       u.username,u.first_name,u.last_name
-                FROM user_history h LEFT JOIN users u ON u.user_id=h.user_id
-                WHERE h.action='served' AND h.sent_at >= %s
-                GROUP BY h.user_id,u.username,u.first_name,u.last_name
-                ORDER BY plays DESC,h.user_id ASC LIMIT 5
-            """, (cutoff,))
-            items=[]
-            for r in x.fetchall():
-                name=" ".join(v for v in (r.get("first_name") or "", r.get("last_name") or "") if v).strip() or r.get("username") or "Listener"
-                items.append({"user_id": int(r["user_id"]), "name": name[:80], "username": r.get("username"), "plays": int(r["plays"])})
-    return jsonify({"items": items, "window": "7d"})
-
-
-@app.route("/api/stats")
-def mini_stats():
-    """Return the authenticated listener's personal dashboard data."""
-    user, err = _mini_app_user()
-    if err:
-        return jsonify({"error": err[0]}), err[1]
-    uid = int(user["id"])
-    try:
-        with db() as c:
-            with cur(c) as x:
-                x.execute("""
-                    SELECT COUNT(*) AS plays,
-                           COUNT(DISTINCT DATE(to_timestamp(sent_at))) AS active_days,
-                           COUNT(DISTINCT channel_id || ':' || message_id) AS unique_tracks
-                    FROM user_history
-                    WHERE user_id=%s AND action='served'
-                """, (uid,))
-                totals = x.fetchone() or {}
-                x.execute("""
-                    SELECT t.mood, COUNT(*) AS plays
-                    FROM user_history h JOIN tracks t
-                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
-                    WHERE h.user_id=%s AND h.action='served'
-                    GROUP BY t.mood ORDER BY plays DESC, t.mood ASC LIMIT 8
-                """, (uid,))
-                moods = [{"name": str(r["mood"] or "unknown"), "plays": int(r["plays"])} for r in x.fetchall()]
-                x.execute("""
-                    SELECT COALESCE(NULLIF(t.genre,''), NULLIF(t.subgenre,''), 'Uncategorized') AS name,
-                           COUNT(*) AS plays
-                    FROM user_history h JOIN tracks t
-                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
-                    WHERE h.user_id=%s AND h.action='served'
-                    GROUP BY name ORDER BY plays DESC, name ASC LIMIT 6
-                """, (uid,))
-                genres = [{"name": str(r["name"]), "plays": int(r["plays"])} for r in x.fetchall()]
-                x.execute("""
-                    SELECT COUNT(*) AS count FROM track_feedback
-                    WHERE user_id=%s AND feedback='like'
-                """, (uid,))
-                likes = int((x.fetchone() or {}).get("count") or 0)
-                x.execute("""
-                    SELECT COUNT(*) AS count FROM track_feedback
-                    WHERE user_id=%s AND feedback='not_for_me'
-                """, (uid,))
-                dislikes = int((x.fetchone() or {}).get("count") or 0)
-        state = get_state(uid)
-        top_mood = moods[0]["name"] if moods else (state.get("mood") or "Discovering")
-        return jsonify({
-            "plays": int(totals.get("plays") or 0),
-            "unique_tracks": int(totals.get("unique_tracks") or 0),
-            "active_days": int(totals.get("active_days") or 0),
-            "likes": likes,
-            "dislikes": dislikes,
-            "top_mood": top_mood,
-            "radio": bool(state.get("radio")),
-            "moods": moods,
-            "genres": genres,
-        })
-    except Exception:
-        log.exception("Mini App stats failed")
-        return jsonify({"error": "Listening stats unavailable"}), 500
+        return jsonify({"error": "Selected track is unavailable"}), 404
+    return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": _mini_track(row)})
 
 
 @app.route("/api/discover")
@@ -7453,12 +7066,7 @@ def mini_track(track_id):
         return jsonify({"error": err[0]}), err[1]
     row = get_track(track_id)
     if not row:
-        row = get_fallback_track(track_id)
-        if not row:
-            return jsonify({"error": "No playable track available"}), 404
-        payload = _mini_track(row)
-        payload["fallback_for"] = int(track_id)
-        return jsonify(payload)
+        return jsonify({"error": "Track not found"}), 404
     return jsonify(_mini_track(row))
 
 
@@ -7477,13 +7085,7 @@ def mini_track_audio(track_id):
 
     row = get_track(track_id)
     if not row:
-        fallback = get_fallback_track(track_id)
-        if fallback:
-            target = url_for("mini_track_audio", track_id=int(fallback["id"]))
-            if request.query_string:
-                target = f"{target}?{request.query_string.decode('utf-8', 'ignore')}"
-            return redirect(target, code=302)
-        return jsonify({"error": "No playable track available"}), 404
+        return jsonify({"error": "Track not found"}), 404
     if client is None or tele_loop is None or not ready.is_set():
         return jsonify({"error": "Telegram audio service is not ready"}), 503
 
@@ -7549,46 +7151,31 @@ def mini_track_audio(track_id):
             pass
 
         async def download_full():
-            last_error = None
-            for attempt in range(3):
-                try:
-                    message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
-                    if not message or not message.media:
-                        raise RuntimeError("Telegram media not found")
+            message = await client.get_messages(int(row["channel_id"]), ids=int(row["message_id"]))
+            if not message or not message.media:
+                raise RuntimeError("Telegram media not found")
 
-                    obj = getattr(message, "audio", None) or getattr(message, "document", None)
-                    mime_value = getattr(obj, "mime_type", None) if obj else None
-                    mime = str(mime_value).lower().strip() if mime_value and str(mime_value).lower().strip().startswith("audio/") else "audio/mpeg"
-                    # Normalize common Android/WebView aliases to standards-based MIME types.
-                    if mime in ("audio/m4a", "audio/x-m4a"):
-                        mime = "audio/mp4"
+            obj = getattr(message, "audio", None) or getattr(message, "document", None)
+            mime_value = getattr(obj, "mime_type", None) if obj else None
+            mime = str(mime_value).lower().strip() if mime_value and str(mime_value).lower().strip().startswith("audio/") else "audio/mpeg"
+            # Normalize common Android/WebView aliases to standards-based MIME types.
+            if mime in ("audio/m4a", "audio/x-m4a"):
+                mime = "audio/mp4"
 
-                    # Always restart a failed partial transfer cleanly. A smaller request
-                    # size is more reliable on Render/Telegram than one large 4 MB burst.
-                    with open(partial, "wb") as fh:
-                        async for chunk in client.iter_download(message.media, request_size=1 * 1024 * 1024):
-                            if chunk:
-                                fh.write(chunk)
+            with open(partial, "wb") as fh:
+                async for chunk in client.iter_download(message.media, request_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
 
-                    if not partial.is_file() or partial.stat().st_size <= 0:
-                        raise RuntimeError("Telegram audio download returned no data")
-                    os.replace(partial, final_path)
-                    mime_path.write_text(mime)
-                    return mime
-                except Exception as exc:
-                    last_error = exc
-                    try:
-                        if partial.exists():
-                            partial.unlink()
-                    except Exception:
-                        pass
-                    if attempt < 2:
-                        await asyncio.sleep(0.6 * (attempt + 1))
-            raise last_error or RuntimeError("Telegram audio download failed")
+            if not partial.is_file() or partial.stat().st_size <= 0:
+                raise RuntimeError("Telegram audio download returned no data")
+            os.replace(partial, final_path)
+            mime_path.write_text(mime)
+            return mime
 
         try:
             future = asyncio.run_coroutine_threadsafe(download_full(), tele_loop)
-            mime = future.result(timeout=300)
+            mime = future.result(timeout=180)
         except Exception as exc:
             log.exception("Mini App audio download failed track=%s", track_id)
             try:
@@ -7627,123 +7214,6 @@ def mini_track_audio(track_id):
             max_age=1800,
             download_name=f"track-{int(track_id)}.audio",
         )
-
-
-@app.route("/api/track/<int:track_id>/audio-stream")
-def mini_track_audio_stream(track_id):
-    """Low-latency sequential audio stream with background disk caching.
-
-    Unlike the legacy endpoint, the first bytes are sent as Telegram delivers
-    them; the browser no longer waits for the complete file before playback.
-    """
-    user, err = _mini_app_user()
-    if err:
-        return jsonify({"error": err[0]}), err[1]
-    row = get_track(track_id)
-    if not row:
-        fallback = get_fallback_track(track_id)
-        if fallback:
-            return redirect(url_for("mini_track_audio_stream", track_id=int(fallback["id"])), code=302)
-        return jsonify({"error": "No playable track available"}), 404
-    if client is None or tele_loop is None or not ready.is_set():
-        return jsonify({"error": "Telegram audio service is not ready"}), 503
-
-    from pathlib import Path
-    cache_dir = Path(os.getenv("MINI_AUDIO_CACHE_DIR", "/tmp/nyv_mini_audio"))
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    final_path = cache_dir / f"{int(track_id)}.audio"
-    mime_path = cache_dir / f"{int(track_id)}.mime"
-    if final_path.is_file() and final_path.stat().st_size > 0:
-        mime = mime_path.read_text().strip() if mime_path.exists() else "audio/mpeg"
-        return send_file(final_path, mimetype=mime or "audio/mpeg", conditional=True,
-                         etag=True, max_age=1800, download_name=f"track-{int(track_id)}.audio")
-
-    # A cold byte-range request cannot be satisfied safely by the progressive
-    # Telegram generator: WebViews expect a real Content-Range/Content-Length
-    # response and may otherwise receive a tiny or incomplete 206 response.
-    # Populate the seekable file cache first, then let send_file handle ranges.
-    if request.headers.get("Range"):
-        return mini_track_audio(track_id)
-
-    with _MINI_AUDIO_FILE_LOCKS_GUARD:
-        lock = _MINI_AUDIO_FILE_LOCKS.setdefault(int(track_id), threading.Lock())
-    lock.acquire()
-    if final_path.is_file() and final_path.stat().st_size > 0:
-        lock.release()
-        mime = mime_path.read_text().strip() if mime_path.exists() else "audio/mpeg"
-        return send_file(final_path, mimetype=mime or "audio/mpeg", conditional=True,
-                         etag=True, max_age=1800, download_name=f"track-{int(track_id)}.audio")
-
-    # Resolve metadata before headers so the browser gets the correct MIME type.
-    try:
-        future = asyncio.run_coroutine_threadsafe(
-            client.get_messages(int(row["channel_id"]), ids=int(row["message_id"])), tele_loop
-        )
-        message = future.result(timeout=35)
-        if not message or not message.media:
-            raise RuntimeError("Telegram media not found")
-        obj = getattr(message, "audio", None) or getattr(message, "document", None)
-        mime_value = getattr(obj, "mime_type", None) if obj else None
-        mime = str(mime_value).lower().strip() if mime_value and str(mime_value).lower().strip().startswith("audio/") else "audio/mpeg"
-        if mime in ("audio/m4a", "audio/x-m4a"):
-            mime = "audio/mp4"
-    except Exception as exc:
-        lock.release()
-        log.exception("Mini App audio stream metadata failed track=%s", track_id)
-        return jsonify({"error": "Audio file unavailable", "detail": str(exc)[:180]}), 502
-
-    chunks = queue.Queue(maxsize=8)
-    partial = cache_dir / f"{int(track_id)}.part"
-    sentinel = object()
-
-    async def pump():
-        try:
-            with open(partial, "wb") as fh:
-                async for chunk in client.iter_download(message.media, request_size=1 * 1024 * 1024):
-                    if chunk:
-                        # Telethon may return memoryview/bytearray buffers. WSGI
-                        # requires an actual bytes object for every yielded chunk.
-                        chunk = bytes(chunk)
-                        fh.write(chunk)
-                        await asyncio.to_thread(chunks.put, chunk)
-            if not partial.is_file() or partial.stat().st_size <= 0:
-                raise RuntimeError("Telegram audio stream returned no data")
-            os.replace(partial, final_path)
-            mime_path.write_text(mime)
-        except Exception as exc:
-            log.exception("Mini App audio stream failed track=%s", track_id)
-            try:
-                if partial.exists():
-                    partial.unlink()
-            except Exception:
-                pass
-            await asyncio.to_thread(chunks.put, exc)
-        finally:
-            await asyncio.to_thread(chunks.put, sentinel)
-
-    asyncio.run_coroutine_threadsafe(pump(), tele_loop)
-
-    def generate():
-        try:
-            while True:
-                try:
-                    item = chunks.get(timeout=75)
-                except queue.Empty:
-                    break
-                if item is sentinel:
-                    break
-                if isinstance(item, Exception):
-                    break
-                # Final WSGI boundary: never yield a memoryview/bytearray/object.
-                yield item if isinstance(item, bytes) else bytes(item)
-        finally:
-            lock.release()
-
-    response = Response(generate(), mimetype=mime, direct_passthrough=True)
-    response.headers["Cache-Control"] = "public, max-age=1800"
-    response.headers["Accept-Ranges"] = "bytes"
-    response.headers["X-Audio-Delivery"] = "telegram-stream-cache"
-    return response
 
 @app.route("/api/track/<int:track_id>/feedback", methods=["POST"])
 def mini_feedback(track_id):
@@ -8066,10 +7536,6 @@ async def scan_all():
 
 async def periodic_scan():
 
-    if SCAN_INTERVAL <= 0:
-        log.info("periodic channel rescan disabled; startup scan and watcher remain active")
-        return
-
     while True:
 
         await asyncio.sleep(SCAN_INTERVAL)
@@ -8101,6 +7567,31 @@ async def periodic_scan():
 
 
 # =========================================================
+# INTEGRATED AUDIO ANALYZER
+# =========================================================
+
+def _run_analyzer_worker(shared_client, shared_loop):
+    try:
+        from audio_analyzer import run_integrated_worker
+        run_integrated_worker(shared_client, shared_loop, ANALYZER_LIMIT, ANALYZER_WATCH_INTERVAL, analyzer_stop_event)
+    except Exception:
+        log.exception("integrated analyzer stopped unexpectedly")
+
+
+def start_analyzer():
+    global analyzer_thread
+    if not ANALYZER_ENABLED or client is None or tele_loop is None:
+        return
+    with analyzer_lock:
+        if analyzer_thread and analyzer_thread.is_alive():
+            return
+        analyzer_stop_event.clear()
+        analyzer_thread = threading.Thread(target=_run_analyzer_worker, args=(client, tele_loop), name="audio-analyzer-worker", daemon=True)
+        analyzer_thread.start()
+        log.info("integrated audio analyzer started")
+
+
+# =========================================================
 # TELETHON WORKER
 # =========================================================
 
@@ -8108,14 +7599,6 @@ def tele_worker():
 
     global client
     global tele_loop
-
-    log.info(
-        "Telethon config presence API_ID=%s API_HASH=%s SESSION=%s SESSION_LEN=%d",
-        bool(API_ID),
-        bool(API_HASH),
-        bool(SESSION),
-        len(SESSION),
-    )
 
     if not (
         API_ID
@@ -8250,6 +7733,7 @@ def tele_worker():
                     )
 
                     await scan_all()
+                    start_analyzer()
 
                     await client.run_until_disconnected()
 
@@ -8288,6 +7772,8 @@ def tele_worker():
 
             with contextlib.suppress(asyncio.CancelledError):
                 await rescan_task
+
+            analyzer_stop_event.set()
 
     asyncio.run(
         run()
@@ -8421,19 +7907,17 @@ def startup():
 
         return False
 
-    for attempt in range(1, DB_INIT_RETRIES + 1):
-        try:
-            init_db()
-            break
-        except Exception:
-            log.exception(
-                "Database initialization failed (attempt %s/%s)",
-                attempt,
-                DB_INIT_RETRIES,
-            )
-            if attempt >= DB_INIT_RETRIES:
-                return False
-            time.sleep(DB_INIT_RETRY_DELAY * attempt)
+    try:
+
+        init_db()
+
+    except Exception:
+
+        log.exception(
+            "Database initialization failed"
+        )
+
+        return False
 
     webhook_setup()
     configure_mini_app()
