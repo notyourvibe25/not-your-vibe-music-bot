@@ -672,6 +672,26 @@ def register(u):
             )
 
 
+def ensure_mini_app_user(u):
+    """Upsert an authenticated WebApp user without counting an API request as a play/request."""
+    uid = int(u["id"])
+    now = int(time.time())
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                INSERT INTO users(user_id,username,first_name,last_name,first_seen,last_seen,total_requests)
+                VALUES(%s,%s,%s,%s,%s,%s,0)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=EXCLUDED.username,
+                    first_name=EXCLUDED.first_name,
+                    last_name=EXCLUDED.last_name,
+                    last_seen=EXCLUDED.last_seen
+            """, (uid, u.get("username"), u.get("first_name"), u.get("last_name"), now, now))
+            x.execute("""
+                INSERT INTO daily_activity(user_id,day)
+                VALUES(%s,%s) ON CONFLICT DO NOTHING
+            """, (uid, datetime.now(ZoneInfo("Asia/Yangon")).date()))
+
 # =========================================================
 # PER-USER MUSIC MODE / GENERATION
 # =========================================================
@@ -6816,6 +6836,13 @@ def _mini_app_user():
 
         user = json.loads(pairs.get("user", "{}"))
         uid = int(user.get("id"))
+        if uid <= 0:
+            return None, ("Invalid Telegram initData", 401)
+        try:
+            ensure_mini_app_user(user)
+        except Exception:
+            log.exception("Mini App user upsert failed uid=%s", uid)
+            return None, ("Mini App user data unavailable", 503)
         return user, None
     except Exception:
         return None, ("Invalid Telegram initData", 401)
@@ -6830,6 +6857,9 @@ def _mini_track(row):
     d["message_id"] = int(d["message_id"])
     if "musical_key" in d:
         d["key"] = d.pop("musical_key")
+    # Analyzer metadata is internal Radio input and must never reach clients.
+    d.pop("analyzer_mood", None)
+    d.pop("analyzed", None)
     d["cover_url"] = f"/share/track/{d['id']}/cover"
     return d
 
@@ -7038,6 +7068,176 @@ def mini_action():
     if not row:
         return jsonify({"error": "Selected track is unavailable"}), 404
     return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": _mini_track(row)})
+
+
+@app.route("/api/comments")
+def mini_comments():
+    """Cursor-paginated public comments with batched threaded replies."""
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    try:
+        limit = max(1, min(int(request.args.get("limit", 10)), 20))
+    except (TypeError, ValueError):
+        limit = 10
+    before = request.args.get("before")
+    try:
+        before_id = int(before) if before else None
+    except (TypeError, ValueError):
+        before_id = None
+    with db() as c:
+        with cur(c) as x:
+            where = "WHERE c.id < %s" if before_id else ""
+            params = (before_id, limit + 1) if before_id else (limit + 1,)
+            x.execute(f"""
+                SELECT c.id,c.broadcast_id,c.user_id,c.comment,c.created_at,
+                       u.username,u.first_name,u.last_name
+                FROM broadcast_comments c LEFT JOIN users u ON u.user_id=c.user_id
+                {where} ORDER BY c.id DESC LIMIT %s
+            """, params)
+            rows = x.fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            replies_by_comment = {int(row["id"]): [] for row in rows}
+            if replies_by_comment:
+                x.execute("""
+                    SELECT r.id,r.comment_id,r.reply,r.created_at
+                    FROM broadcast_comment_replies r
+                    WHERE r.comment_id = ANY(%s)
+                    ORDER BY r.created_at ASC,r.id ASC
+                """, (list(replies_by_comment),))
+                for reply in x.fetchall():
+                    replies_by_comment[int(reply["comment_id"])].append({
+                        "id": int(reply["id"]), "comment_id": int(reply["comment_id"]),
+                        "reply": reply["reply"], "created_at": int(reply["created_at"]),
+                    })
+            items = []
+            for row in rows:
+                name = " ".join(v for v in (row.get("first_name") or "", row.get("last_name") or "") if v).strip()
+                items.append({
+                    "id": int(row["id"]), "broadcast_id": int(row["broadcast_id"]),
+                    "name": name[:80] or row.get("username") or "Listener",
+                    "username": row.get("username"), "comment": row["comment"],
+                    "created_at": int(row["created_at"]), "replies": replies_by_comment[int(row["id"])],
+                })
+    return jsonify({"items": items, "has_more": has_more, "next_before": items[-1]["id"] if has_more and items else None})
+@app.route("/api/profile")
+def mini_profile():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT t.id,t.title,t.mood,t.genre,h.sent_at
+                FROM user_history h JOIN tracks t
+                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                WHERE h.user_id=%s AND h.action='served'
+                ORDER BY h.sent_at DESC,h.id DESC LIMIT 10
+            """, (uid,))
+            recent = [dict(r) for r in x.fetchall()]
+            x.execute("""
+                SELECT t.mood AS name, COUNT(*) AS plays
+                FROM user_history h JOIN tracks t
+                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                WHERE h.user_id=%s AND h.action='served'
+                GROUP BY t.mood ORDER BY plays DESC, t.mood ASC LIMIT 3
+            """, (uid,))
+            moods = [{"name": str(r["name"] or "unknown"), "score": int(r["plays"])} for r in x.fetchall()]
+            x.execute("""
+                SELECT COALESCE(NULLIF(t.genre,''), NULLIF(t.subgenre,''), 'Uncategorized') AS name, COUNT(*) AS plays
+                FROM user_history h JOIN tracks t
+                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                WHERE h.user_id=%s AND h.action='served'
+                GROUP BY name ORDER BY plays DESC, name ASC LIMIT 3
+            """, (uid,))
+            genres = [{"name": str(r["name"]), "score": int(r["plays"])} for r in x.fetchall()]
+    return jsonify({"top_moods": moods, "genres": genres, "subgenres": [], "recent": recent})
+@app.route("/api/leaderboard")
+def mini_leaderboard():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    cutoff = int(time.time()) - 7 * 86400
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT h.user_id, COUNT(*) AS plays,
+                       u.username,u.first_name,u.last_name
+                FROM user_history h LEFT JOIN users u ON u.user_id=h.user_id
+                WHERE h.action='served' AND h.sent_at >= %s
+                GROUP BY h.user_id,u.username,u.first_name,u.last_name
+                ORDER BY plays DESC,h.user_id ASC LIMIT 5
+            """, (cutoff,))
+            items=[]
+            for r in x.fetchall():
+                name=" ".join(v for v in (r.get("first_name") or "", r.get("last_name") or "") if v).strip() or r.get("username") or "Listener"
+                items.append({"name": name[:80], "username": r.get("username"), "plays": int(r["plays"])})
+    return jsonify({"items": items, "window": "7d"})
+
+
+@app.route("/api/stats")
+def mini_stats():
+    """Return the authenticated listener's personal dashboard data."""
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute("""
+                    SELECT COUNT(*) AS plays,
+                           COUNT(DISTINCT DATE(to_timestamp(sent_at))) AS active_days,
+                           COUNT(DISTINCT channel_id || ':' || message_id) AS unique_tracks
+                    FROM user_history
+                    WHERE user_id=%s AND action='served'
+                """, (uid,))
+                totals = x.fetchone() or {}
+                x.execute("""
+                    SELECT t.mood, COUNT(*) AS plays
+                    FROM user_history h JOIN tracks t
+                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                    WHERE h.user_id=%s AND h.action='served'
+                    GROUP BY t.mood ORDER BY plays DESC, t.mood ASC LIMIT 8
+                """, (uid,))
+                moods = [{"name": str(r["mood"] or "unknown"), "plays": int(r["plays"])} for r in x.fetchall()]
+                x.execute("""
+                    SELECT COALESCE(NULLIF(t.genre,''), NULLIF(t.subgenre,''), 'Uncategorized') AS name,
+                           COUNT(*) AS plays
+                    FROM user_history h JOIN tracks t
+                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                    WHERE h.user_id=%s AND h.action='served'
+                    GROUP BY name ORDER BY plays DESC, name ASC LIMIT 6
+                """, (uid,))
+                genres = [{"name": str(r["name"]), "plays": int(r["plays"])} for r in x.fetchall()]
+                x.execute("""
+                    SELECT COUNT(*) AS count FROM track_feedback
+                    WHERE user_id=%s AND feedback='like'
+                """, (uid,))
+                likes = int((x.fetchone() or {}).get("count") or 0)
+                x.execute("""
+                    SELECT COUNT(*) AS count FROM track_feedback
+                    WHERE user_id=%s AND feedback='not_for_me'
+                """, (uid,))
+                dislikes = int((x.fetchone() or {}).get("count") or 0)
+        state = get_state(uid)
+        top_mood = moods[0]["name"] if moods else (state.get("mood") or "Discovering")
+        return jsonify({
+            "plays": int(totals.get("plays") or 0),
+            "unique_tracks": int(totals.get("unique_tracks") or 0),
+            "active_days": int(totals.get("active_days") or 0),
+            "likes": likes,
+            "dislikes": dislikes,
+            "top_mood": top_mood,
+            "radio": bool(state.get("radio")),
+            "moods": moods,
+            "genres": genres,
+        })
+    except Exception:
+        log.exception("Mini App stats failed")
+        return jsonify({"error": "Listening stats unavailable"}), 500
 
 
 @app.route("/api/discover")
