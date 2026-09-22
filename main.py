@@ -167,6 +167,8 @@ TRENDING_DAYS = geti(
 
 # Radio mood balancing.  These are environment-configurable so the live
 # recommendation mix can be tuned without changing application code.
+RADIO_CANDIDATE_LIMIT = geti("RADIO_CANDIDATE_LIMIT", 2500, 200, 10000)
+
 RADIO_MOOD_TEMPERATURE = getf("RADIO_MOOD_TEMPERATURE", 1.5, 0.1, 10.0)
 RADIO_MOOD_MAX_RATIO = getf("RADIO_MOOD_MAX_RATIO", 0.40, 0.05, 1.0)
 RADIO_BASELINE_MOOD_MULTIPLIER = getf(
@@ -543,12 +545,17 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_user ON user_history(user_id,sent_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_track ON user_history(user_id,channel_id,message_id,sent_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_hist_track_action ON user_history(channel_id,message_id,action);
+    CREATE INDEX IF NOT EXISTS idx_hist_user_action_sent ON user_history(user_id,action,sent_at DESC);
     CREATE INDEX IF NOT EXISTS idx_hist_recent ON user_history(sent_at DESC,channel_id,message_id);
     CREATE INDEX IF NOT EXISTS idx_fb_user ON track_feedback(user_id);
+    CREATE INDEX IF NOT EXISTS idx_fb_user_feedback_created ON track_feedback(user_id,feedback,created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_fb_track_feedback ON track_feedback(channel_id,message_id,feedback);
     CREATE INDEX IF NOT EXISTS idx_fb_recent ON track_feedback(created_at DESC,feedback);
     CREATE INDEX IF NOT EXISTS idx_daily_day ON daily_activity(day);
     CREATE INDEX IF NOT EXISTS idx_bc_broadcast ON broadcast_comments(broadcast_id);
+    CREATE INDEX IF NOT EXISTS idx_bc_broadcast_recent ON broadcast_comments(broadcast_id,id DESC);
+    CREATE INDEX IF NOT EXISTS idx_bcr_comment_recent ON broadcast_comment_replies(comment_id,created_at DESC);
 
     ALTER TABLE tracks ADD COLUMN IF NOT EXISTS title TEXT;
 
@@ -1646,73 +1653,74 @@ def _radio_last_seed(uid):
 
 
 def _radio_candidates(uid):
+    """Fetch a bounded, index-friendly candidate pool for Python scoring.
+
+    Detailed rule-based scoring remains in Python.  The database only returns
+    a reasonable pool and per-track global counters, avoiding full-table
+    global aggregation on every Radio request as the library grows.
+    """
     with db() as c:
         with cur(c) as x:
             x.execute(
                 """
+                WITH candidate_pool AS (
+                    SELECT
+                        t.id,
+                        t.mood,
+                        t.message_id,
+                        t.channel_id,
+                        t.title,
+                        t.created_at,
+                        t.bpm,
+                        t.musical_key,
+                        t.energy,
+                        t.danceability,
+                        t.loudness,
+                        t.genre,
+                        t.subgenre,
+                        t.genre_tags,
+                        t.analyzer_mood
+                    FROM tracks t
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM track_feedback f
+                        WHERE f.user_id=%s
+                          AND f.channel_id=t.channel_id
+                          AND f.message_id=t.message_id
+                          AND f.feedback='not_for_me'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM user_history failed
+                        WHERE failed.user_id=%s
+                          AND failed.channel_id=t.channel_id
+                          AND failed.message_id=t.message_id
+                          AND failed.action='delivery_failed'
+                    )
+                    ORDER BY t.id ASC
+                    LIMIT %s
+                )
                 SELECT
-                    t.id,
-                    t.mood,
-                    t.message_id,
-                    t.channel_id,
-                    t.title,
-                    t.created_at,
-                    t.bpm,
-                    t.musical_key,
-                    t.energy,
-                    t.danceability,
-                    t.loudness,
-                    t.genre,
-                    t.subgenre,
-                    t.genre_tags,
-                    t.analyzer_mood,
-                    COALESCE(gl.global_likes,0) AS global_likes,
-                    COALESCE(gs.global_served,0) AS global_served
-                FROM tracks t
-                LEFT JOIN (
-                    SELECT
-                        channel_id,
-                        message_id,
-                        COUNT(*) AS global_likes
-                    FROM track_feedback
-                    WHERE feedback='like'
-                    GROUP BY channel_id,message_id
-                ) gl
-                  ON gl.channel_id=t.channel_id
-                 AND gl.message_id=t.message_id
-                LEFT JOIN (
-                    SELECT
-                        channel_id,
-                        message_id,
-                        COUNT(*) AS global_served
-                    FROM user_history
-                    WHERE action='served'
-                    GROUP BY channel_id,message_id
-                ) gs
-                  ON gs.channel_id=t.channel_id
-                 AND gs.message_id=t.message_id
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM track_feedback f
-                    WHERE f.user_id=%s
-                      AND f.channel_id=t.channel_id
-                      AND f.message_id=t.message_id
-                      AND f.feedback='not_for_me'
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM user_history failed
-                    WHERE failed.user_id=%s
-                      AND failed.channel_id=t.channel_id
-                      AND failed.message_id=t.message_id
-                      AND failed.action='delivery_failed'
-                )
-                ORDER BY t.id ASC
+                    p.*,
+                    COALESCE((
+                        SELECT COUNT(*)
+                        FROM track_feedback gl
+                        WHERE gl.channel_id=p.channel_id
+                          AND gl.message_id=p.message_id
+                          AND gl.feedback='like'
+                    ),0) AS global_likes,
+                    COALESCE((
+                        SELECT COUNT(*)
+                        FROM user_history gs
+                        WHERE gs.channel_id=p.channel_id
+                          AND gs.message_id=p.message_id
+                          AND gs.action='served'
+                    ),0) AS global_served
+                FROM candidate_pool p
                 """,
-                (uid, uid),
+                (uid, uid, RADIO_CANDIDATE_LIMIT),
             )
             return x.fetchall()
-
 
 def _radio_harmonic_transition_score(candidate_key, last_key):
     """Prefer Camelot-compatible keys and avoid large harmonic jumps."""
@@ -7241,6 +7249,117 @@ def mini_action():
     return jsonify({"ok": True, "action": action, "state": get_state(uid), "track": payload})
 
 
+@app.route("/api/comments")
+def mini_comments():
+    """Cursor-paginated public comments with lightweight threaded replies."""
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 50))
+    except (TypeError, ValueError):
+        limit = 20
+    before = request.args.get("before")
+    try:
+        before_id = int(before) if before else None
+    except (TypeError, ValueError):
+        before_id = None
+    with db() as c:
+        with cur(c) as x:
+            where = "WHERE c.id < %s" if before_id else ""
+            params = (before_id, limit + 1) if before_id else (limit + 1,)
+            x.execute(f"""
+                SELECT c.id,c.broadcast_id,c.user_id,c.comment,c.created_at,
+                       u.username,u.first_name,u.last_name
+                FROM broadcast_comments c
+                LEFT JOIN users u ON u.user_id=c.user_id
+                {where}
+                ORDER BY c.id DESC LIMIT %s
+            """, params)
+            rows = x.fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            reply_map = {}
+            comment_ids = [int(row["id"]) for row in rows]
+            if comment_ids:
+                x.execute("""
+                    SELECT r.id,r.comment_id,r.admin_id,r.reply,r.created_at,
+                           u.username,u.first_name,u.last_name
+                    FROM broadcast_comment_replies r
+                    LEFT JOIN users u ON u.user_id=r.admin_id
+                    WHERE r.comment_id = ANY(%s)
+                    ORDER BY r.created_at ASC,r.id ASC
+                """, (comment_ids,))
+                for reply in x.fetchall():
+                    reply_map.setdefault(int(reply["comment_id"]), []).append({
+                        "id": int(reply["id"]), "comment_id": int(reply["comment_id"]),
+                        "reply": reply["reply"], "created_at": int(reply["created_at"]),
+                        "username": reply.get("username"),
+                        "name": " ".join(v for v in (reply.get("first_name") or "", reply.get("last_name") or "") if v).strip(),
+                    })
+            items=[]
+            for row in rows:
+                replies = reply_map.get(int(row["id"]), [])
+                items.append({
+                    "id": int(row["id"]), "broadcast_id": int(row["broadcast_id"]),
+                    "user_id": int(row["user_id"]), "comment": row["comment"],
+                    "created_at": int(row["created_at"]),
+                    "username": row.get("username"),
+                    "name": " ".join(v for v in (row.get("first_name") or "", row.get("last_name") or "") if v).strip(),
+                    "replies": replies,
+                })
+    return jsonify({"items": items, "has_more": has_more,
+                    "next_before": items[-1]["id"] if has_more and items else None})
+
+
+@app.route("/api/profile")
+def mini_profile():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = int(user["id"])
+    profile = _radio_profile(uid)
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT t.id,t.title,t.mood,t.genre,h.sent_at
+                FROM user_history h JOIN tracks t
+                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                WHERE h.user_id=%s AND h.action='served'
+                ORDER BY h.sent_at DESC,h.id DESC LIMIT 10
+            """, (uid,))
+            recent = [dict(r) for r in x.fetchall()]
+    def top(values, n=3):
+        return [{"name": k, "score": round(float(v), 3)} for k,v in sorted(values.items(), key=lambda item: item[1], reverse=True)[:n]]
+    return jsonify({"top_moods": top(profile.get("analyzer_moods") or profile.get("genres") or {}),
+                    "genres": top(profile.get("genres", {})),
+                    "subgenres": top(profile.get("subgenres", {})),
+                    "recent": recent})
+
+
+@app.route("/api/leaderboard")
+def mini_leaderboard():
+    user, err = _mini_app_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    cutoff = int(time.time()) - 7 * 86400
+    with db() as c:
+        with cur(c) as x:
+            x.execute("""
+                SELECT h.user_id, COUNT(*) AS plays,
+                       u.username,u.first_name,u.last_name
+                FROM user_history h LEFT JOIN users u ON u.user_id=h.user_id
+                WHERE h.action='served' AND h.sent_at >= %s
+                GROUP BY h.user_id,u.username,u.first_name,u.last_name
+                ORDER BY plays DESC,h.user_id ASC LIMIT 5
+            """, (cutoff,))
+            items=[]
+            for r in x.fetchall():
+                name=" ".join(v for v in (r.get("first_name") or "", r.get("last_name") or "") if v).strip() or r.get("username") or "Listener"
+                items.append({"user_id": int(r["user_id"]), "name": name[:80], "username": r.get("username"), "plays": int(r["plays"])})
+    return jsonify({"items": items, "window": "7d"})
+
+
 @app.route("/api/stats")
 def mini_stats():
     """Return the authenticated listener's personal dashboard data."""
@@ -7534,6 +7653,13 @@ def mini_track_audio_stream(track_id):
         mime = mime_path.read_text().strip() if mime_path.exists() else "audio/mpeg"
         return send_file(final_path, mimetype=mime or "audio/mpeg", conditional=True,
                          etag=True, max_age=1800, download_name=f"track-{int(track_id)}.audio")
+
+    # A cold byte-range request cannot be satisfied safely by the progressive
+    # Telegram generator: WebViews expect a real Content-Range/Content-Length
+    # response and may otherwise receive a tiny or incomplete 206 response.
+    # Populate the seekable file cache first, then let send_file handle ranges.
+    if request.headers.get("Range"):
+        return mini_track_audio(track_id)
 
     with _MINI_AUDIO_FILE_LOCKS_GUARD:
         lock = _MINI_AUDIO_FILE_LOCKS.setdefault(int(track_id), threading.Lock())
