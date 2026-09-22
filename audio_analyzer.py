@@ -329,7 +329,7 @@ def get_pending_tracks(limit: int):
             COALESCE(analyzed,FALSE)=FALSE
             AND (
                 ai_error IS NULL
-                OR ai_error NOT LIKE 'PERMANENT:%'
+                OR ai_error NOT LIKE 'PERMANENT:%%'
             )
             AND (analyzer_retry_after IS NULL OR analyzer_retry_after <= NOW())
         ORDER BY
