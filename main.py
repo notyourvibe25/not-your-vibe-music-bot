@@ -672,25 +672,39 @@ def register(u):
             )
 
 
+_MINI_USER_TOUCH_TTL = 60
+_MINI_USER_TOUCH = {}
+_MINI_USER_TOUCH_LOCK = threading.Lock()
+
 def ensure_mini_app_user(u):
-    """Upsert an authenticated WebApp user without counting an API request as a play/request."""
+    """Authenticate every request, but touch the user row at most once per minute."""
     uid = int(u["id"])
     now = int(time.time())
-    with db() as c:
-        with cur(c) as x:
-            x.execute("""
-                INSERT INTO users(user_id,username,first_name,last_name,first_seen,last_seen,total_requests)
-                VALUES(%s,%s,%s,%s,%s,%s,0)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username=EXCLUDED.username,
-                    first_name=EXCLUDED.first_name,
-                    last_name=EXCLUDED.last_name,
-                    last_seen=EXCLUDED.last_seen
-            """, (uid, u.get("username"), u.get("first_name"), u.get("last_name"), now, now))
-            x.execute("""
-                INSERT INTO daily_activity(user_id,day)
-                VALUES(%s,%s) ON CONFLICT DO NOTHING
-            """, (uid, datetime.now(ZoneInfo("Asia/Yangon")).date()))
+    with _MINI_USER_TOUCH_LOCK:
+        last_touch = int(_MINI_USER_TOUCH.get(uid, 0))
+        if now - last_touch < _MINI_USER_TOUCH_TTL:
+            return
+        _MINI_USER_TOUCH[uid] = now
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute("""
+                    INSERT INTO users(user_id,username,first_name,last_name,first_seen,last_seen,total_requests)
+                    VALUES(%s,%s,%s,%s,%s,%s,0)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        username=EXCLUDED.username,
+                        first_name=EXCLUDED.first_name,
+                        last_name=EXCLUDED.last_name,
+                        last_seen=EXCLUDED.last_seen
+                """, (uid, u.get("username"), u.get("first_name"), u.get("last_name"), now, now))
+                x.execute("""
+                    INSERT INTO daily_activity(user_id,day)
+                    VALUES(%s,%s) ON CONFLICT DO NOTHING
+                """, (uid, datetime.now(ZoneInfo("Asia/Yangon")).date()))
+    except Exception:
+        with _MINI_USER_TOUCH_LOCK:
+            _MINI_USER_TOUCH.pop(uid, None)
+        raise
 
 # =========================================================
 # PER-USER MUSIC MODE / GENERATION
@@ -7101,8 +7115,10 @@ def mini_comments():
             replies_by_comment = {int(row["id"]): [] for row in rows}
             if replies_by_comment:
                 x.execute("""
-                    SELECT r.id,r.comment_id,r.reply,r.created_at
+                    SELECT r.id,r.comment_id,r.reply,r.created_at,
+                           u.username,u.first_name,u.last_name
                     FROM broadcast_comment_replies r
+                    LEFT JOIN users u ON u.user_id=r.admin_id
                     WHERE r.comment_id = ANY(%s)
                     ORDER BY r.created_at ASC,r.id ASC
                 """, (list(replies_by_comment),))
@@ -7110,6 +7126,8 @@ def mini_comments():
                     replies_by_comment[int(reply["comment_id"])].append({
                         "id": int(reply["id"]), "comment_id": int(reply["comment_id"]),
                         "reply": reply["reply"], "created_at": int(reply["created_at"]),
+                        "author_name": " ".join(v for v in (reply.get("first_name") or "", reply.get("last_name") or "") if v).strip() or reply.get("username") or "Moderator",
+                        "author_username": reply.get("username"),
                     })
             items = []
             for row in rows:
@@ -7127,33 +7145,80 @@ def mini_profile():
     if err:
         return jsonify({"error": err[0]}), err[1]
     uid = int(user["id"])
-    with db() as c:
-        with cur(c) as x:
-            x.execute("""
-                SELECT t.id,t.title,t.mood,t.genre,h.sent_at
-                FROM user_history h JOIN tracks t
-                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
-                WHERE h.user_id=%s AND h.action='served'
-                ORDER BY h.sent_at DESC,h.id DESC LIMIT 10
-            """, (uid,))
-            recent = [dict(r) for r in x.fetchall()]
-            x.execute("""
-                SELECT t.mood AS name, COUNT(*) AS plays
-                FROM user_history h JOIN tracks t
-                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
-                WHERE h.user_id=%s AND h.action='served'
-                GROUP BY t.mood ORDER BY plays DESC, t.mood ASC LIMIT 3
-            """, (uid,))
-            moods = [{"name": str(r["name"] or "unknown"), "score": int(r["plays"])} for r in x.fetchall()]
-            x.execute("""
-                SELECT COALESCE(NULLIF(t.genre,''), NULLIF(t.subgenre,''), 'Uncategorized') AS name, COUNT(*) AS plays
-                FROM user_history h JOIN tracks t
-                  ON t.channel_id=h.channel_id AND t.message_id=h.message_id
-                WHERE h.user_id=%s AND h.action='served'
-                GROUP BY name ORDER BY plays DESC, name ASC LIMIT 3
-            """, (uid,))
-            genres = [{"name": str(r["name"]), "score": int(r["plays"])} for r in x.fetchall()]
-    return jsonify({"top_moods": moods, "genres": genres, "subgenres": [], "recent": recent})
+    try:
+        with db() as c:
+            with cur(c) as x:
+                x.execute("""
+                    SELECT COUNT(*) AS plays,
+                           COUNT(DISTINCT DATE(to_timestamp(sent_at))) AS active_days,
+                           COUNT(DISTINCT channel_id || ':' || message_id) AS unique_tracks
+                    FROM user_history WHERE user_id=%s AND action='served'
+                """, (uid,))
+                totals = x.fetchone() or {}
+                x.execute("""
+                    SELECT t.mood AS name, COUNT(*) AS plays
+                    FROM user_history h JOIN tracks t
+                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                    WHERE h.user_id=%s AND h.action='served'
+                    GROUP BY t.mood ORDER BY plays DESC, t.mood ASC LIMIT 8
+                """, (uid,))
+                top_moods = [{"name": str(r["name"] or "unknown"), "plays": int(r["plays"])} for r in x.fetchall()]
+                x.execute("""
+                    SELECT NULLIF(TRIM(t.genre),'') AS name, COUNT(*) AS plays
+                    FROM user_history h JOIN tracks t
+                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                    WHERE h.user_id=%s AND h.action='served'
+                      AND NULLIF(TRIM(t.genre),'') IS NOT NULL
+                    GROUP BY name ORDER BY plays DESC, name ASC LIMIT 8
+                """, (uid,))
+                top_genres = [{"name": str(r["name"]), "plays": int(r["plays"])} for r in x.fetchall()]
+                x.execute("""
+                    SELECT COUNT(*) AS count FROM track_feedback
+                    WHERE user_id=%s AND feedback='like'
+                """, (uid,))
+                likes = int((x.fetchone() or {}).get("count") or 0)
+                x.execute("""
+                    SELECT COUNT(*) AS count FROM track_feedback
+                    WHERE user_id=%s AND feedback='not_for_me'
+                """, (uid,))
+                dislikes = int((x.fetchone() or {}).get("count") or 0)
+                x.execute("""
+                    SELECT t.id,t.title,t.mood,t.genre,h.sent_at
+                    FROM user_history h JOIN tracks t
+                      ON t.channel_id=h.channel_id AND t.message_id=h.message_id
+                    WHERE h.user_id=%s AND h.action='served'
+                    ORDER BY h.sent_at DESC,h.id DESC LIMIT 10
+                """, (uid,))
+                recent = [dict(r) for r in x.fetchall()]
+                x.execute("""
+                    SELECT t.id,t.mood,t.channel_id,t.message_id,t.title,t.bpm,t.musical_key,
+                           t.energy,t.danceability,t.loudness,t.genre,t.subgenre,t.analyzer_mood,t.analyzed
+                    FROM tracks t JOIN track_feedback f
+                      ON f.channel_id=t.channel_id AND f.message_id=t.message_id
+                    WHERE f.user_id=%s AND f.feedback='like'
+                    ORDER BY f.created_at DESC,t.id DESC LIMIT 30
+                """, (uid,))
+                liked_tracks = [_mini_track(row) for row in x.fetchall()]
+        state = get_state(uid)
+        payload_user = {
+            "id": uid, "first_name": user.get("first_name", ""),
+            "last_name": user.get("last_name", ""), "username": user.get("username", ""),
+        }
+        return jsonify({
+            "user": payload_user, "id": uid,
+            "first_name": payload_user["first_name"], "last_name": payload_user["last_name"],
+            "username": payload_user["username"],
+            "plays": int(totals.get("plays") or 0),
+            "unique_tracks": int(totals.get("unique_tracks") or 0),
+            "likes": likes, "dislikes": dislikes,
+            "active_days": int(totals.get("active_days") or 0),
+            "current_mood": state.get("mood"), "radio": bool(state.get("radio")),
+            "top_moods": top_moods, "top_genres": top_genres,
+            "recent": recent, "liked_tracks": liked_tracks,
+        })
+    except Exception:
+        log.exception("Mini App profile failed")
+        return jsonify({"error": "Profile data unavailable"}), 500
 @app.route("/api/leaderboard")
 def mini_leaderboard():
     user, err = _mini_app_user()
@@ -7204,11 +7269,12 @@ def mini_stats():
                 """, (uid,))
                 moods = [{"name": str(r["mood"] or "unknown"), "plays": int(r["plays"])} for r in x.fetchall()]
                 x.execute("""
-                    SELECT COALESCE(NULLIF(t.genre,''), NULLIF(t.subgenre,''), 'Uncategorized') AS name,
+                    SELECT NULLIF(TRIM(t.genre),'') AS name,
                            COUNT(*) AS plays
                     FROM user_history h JOIN tracks t
                       ON t.channel_id=h.channel_id AND t.message_id=h.message_id
                     WHERE h.user_id=%s AND h.action='served'
+                    AND NULLIF(TRIM(t.genre),'') IS NOT NULL
                     GROUP BY name ORDER BY plays DESC, name ASC LIMIT 6
                 """, (uid,))
                 genres = [{"name": str(r["name"]), "plays": int(r["plays"])} for r in x.fetchall()]
