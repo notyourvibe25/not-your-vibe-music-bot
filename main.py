@@ -102,7 +102,7 @@ RENDER_EXTERNAL_URL = env("RENDER_EXTERNAL_URL") or (
 # Set MINI_APP_URL only if you want a custom URL; otherwise /mini-app is used.
 MINI_APP_URL = (
     env("MINI_APP_URL")
-    or (RENDER_EXTERNAL_URL.rstrip("/") + "/mini-app" if RENDER_EXTERNAL_URL else "")
+    or "https://not-your-vibe-music-bot-5dkn.onrender.com"
 )
 
 WEBHOOK_SECRET = env("TELEGRAM_WEBHOOK_SECRET")
