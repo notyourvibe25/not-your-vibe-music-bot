@@ -130,7 +130,7 @@ function fallbackCover(t={}){const title=String(t?.title||'NOT YOUR VIBE');const
 function resolveApiUrl(path){if(!path)return API_BASE;if(/^https?:\/\//i.test(path))return path;return API_BASE+'/'+String(path).replace(/^\/+/, '')}
 function cover(t){const url=t?.cover_url;return url?resolveApiUrl(url):fallbackCover(t)}
 document.addEventListener('error',e=>{const img=e.target;if(img?.tagName==='IMG'&&img.classList.contains('cover')){img.onerror=null;img.src=fallbackCover({title:img.alt||'NOT YOUR VIBE'})}},true)
-function audioUrl(id){const base=`${API_BASE}/api/track/${encodeURIComponent(Number(id))}/audio-stream`;return tg?.initData?`${base}?initData=${encodeURIComponent(tg.initData)}`:base}
+function audioUrl(id){const base=`${API_BASE}/api/track/${encodeURIComponent(Number(id))}/audio`;return tg?.initData?`${base}?initData=${encodeURIComponent(tg.initData)}`:base}
 function stableAudioUrl(id){const base=`${API_BASE}/api/track/${encodeURIComponent(Number(id))}/audio`;return tg?.initData?`${base}?initData=${encodeURIComponent(tg.initData)}`:base}
 function allTracks(){const r=state.data?.recommendations||{};const d=state.data||{};return [r.daily_vibe,r.radio,r.for_you,r.track_of_day,d.discover?.surprise,...(d.discover?.trending||[]),...(d.discover?.top_liked||[]),...(d.liked||[])].filter(Boolean)}
 function uniqueTracks(list){const seen=new Set();return list.filter(t=>{if(seen.has(t.id))return false;seen.add(t.id);return true})}
